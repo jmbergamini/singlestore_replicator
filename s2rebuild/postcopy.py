@@ -2,21 +2,38 @@
 
 Author: John Bergamini
 
-Section 10.11 and 10.10 of the architecture. Views are created from the captured definitions
-with the DEFINER clause removed (the executing account becomes the definer; the original is
-recorded per view). For every AUTO_INCREMENT column the replacement counter is set to MAX plus
-one and synced across aggregators when rows exist. Statements issued through the runner guard
-naming the replacement: USE, CREATE VIEW, SELECT MAX and COUNT, SHOW CREATE TABLE, ALTER TABLE
-AUTO_INCREMENT, AGGREGATOR SYNC AUTO_INCREMENT, and the SELECT statements of the stale check.
+Section 10.11 and 10.10 of the architecture. Views run under their definer and C4 removes the
+runner, so the runner never creates them. With the owner profile they are created through the
+owner session in rounds, until a round creates none: the original DEFINER is kept when that
+account still exists and is not the runner, else the clause is removed and the owner account
+becomes the definer; the choice is recorded per view. Without the owner profile O7 prints and
+writes the O7 block for the admin, runs the stale check and the counters, and ends pending
+until a rerun finds the views. A view whose definition names the source database is refused
+before any view statement. For every AUTO_INCREMENT column the replacement counter is set to the
+larger of the source counter and MAX plus one and synced on every aggregator (ALL), after the last
+re-copy of the stale check, so a re-copy never leaves a counter computed before it. A re-copy
+round that completes (every chunk done, count proof all match) marks O6 passed again. Before an O7 or O8 re-copy mark, the
+O10 block files of the database get a STOP (ownersql.retire_o10_blocks). An O7 re-copy round
+holds the copy lock (copy.copy_lock) from its mark through its copy, so it never runs while an
+O10 of another process waits for its go. Statements issued
+through the owner guard of O7 naming the replacement: USE and CREATE VIEW, with SELECT on
+information_schema.VIEWS and USER_PRIVILEGES. Through the runner guard naming the replacement:
+SELECT MAX and COUNT, SHOW CREATE TABLE, ALTER TABLE AUTO_INCREMENT, AGGREGATOR SYNC
+AUTO_INCREMENT ... ALL, SELECT on information_schema.VIEWS and the SELECT statements of the stale check.
 """
 import json
+import re
 
 from . import copy as copy_module
-from . import estimate, inventory, report_md, report_xlsx, steps, verify
-from .common import EXIT_INCOMPLETE, EXIT_MISMATCH, EXIT_REFUSED, KitError
-from .sqlutil import ident, qualified, read_guard, runner_guard
+from . import estimate, inventory, ownersql, report_md, report_xlsx, steps, verify
+from .common import EXIT_GATE, EXIT_INCOMPLETE, EXIT_MISMATCH, EXIT_REFUSED, KitError
+from .sqlutil import ident, qualified, read_guard, runner_guard, strip_literals, strip_quoted
 
 STALE_CHECK_ROUNDS = 3  # re-copy rounds before O7 gives up; the check itself runs once more after the last round
+KEPT, OWNER_DEFINER, FOUND = 'kept', 'owner', 'found'  # the definer choice recorded per view
+COUNTER_MAX, COUNTER_SOURCE = 'MAX+1', 'source counter'  # the counter decision recorded per table
+VIEW_DEFINER_SQL = 'SELECT DEFINER FROM information_schema.VIEWS WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s'
+_CAPTURED_DEFINER = re.compile(r'^`([^`]*)`@`([^`]*)`$')
 
 
 def view_exists_sql():
@@ -24,9 +41,13 @@ def view_exists_sql():
     return 'SELECT COUNT(*) AS n FROM information_schema.VIEWS WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s'
 
 
-def view_statement(view, target_db):
-    """CREATE VIEW in the replacement from the captured text: DEFINER removed, the view name qualified."""
-    text = inventory.strip_definer(view['definition'])
+def view_statement(view, target_db, keep_definer=False):
+    """CREATE VIEW in the replacement from the captured text, the view name qualified.
+
+    keep_definer keeps the captured DEFINER clause where the server wrote it; otherwise the
+    clause is removed and the account that executes the statement becomes the definer.
+    """
+    text = view['definition'] if keep_definer else inventory.strip_definer(view['definition'])
     name = view['name']
     text = text.replace('VIEW %s' % ident(name), 'VIEW %s' % qualified(target_db, name), 1)
     if 'VIEW %s' % qualified(target_db, name) not in text:
@@ -34,22 +55,197 @@ def view_statement(view, target_db):
     return text
 
 
-def create_views(session, target_db, views, journal, log):
-    """Create every captured view that does not exist in the replacement; returns the names created."""
+def names_database(text, database):
+    """True when a statement names database as a qualifier (`database`. or database.) outside its string literals. Issues nothing."""
+    if re.search(r'`%s`\s*\.' % re.escape(database), strip_literals(text or '')):
+        return True
+    return bool(re.search(r'(?<![A-Za-z0-9_$.])%s\s*\.' % re.escape(database), strip_quoted(text or '')))
+
+
+def dependency_order(views):
+    """The views with each one after the captured views its definition names; capture order otherwise. Issues nothing.
+
+    The printed O7 block runs in order and stops at the first error, so a view on another view
+    must come after it. A name that only looks like a reference (a column alias) or a cycle
+    keeps capture order; the kit route also creates in rounds (create_views).
+    """
+    names = [v['name'] for v in views]
+    needs = {}
+    for v in views:
+        text = strip_literals(v.get('definition') or '')
+        needs[v['name']] = {n for n in names if n != v['name'] and re.search(r'(?<![A-Za-z0-9_$])%s(?![A-Za-z0-9_$])' % re.escape(n), text)}
+    ordered, placed, left = [], set(), list(views)
+    while left:
+        ready = [v for v in left if needs[v['name']] <= placed] or left
+        ordered.extend(ready)
+        placed.update(v['name'] for v in ready)
+        left = [v for v in left if v['name'] not in placed]
+    return ordered
+
+
+def definer_account(definer):
+    """(user, host) of a captured DEFINER value such as `app`@`%`, or None. Issues nothing."""
+    m = _CAPTURED_DEFINER.match(str(definer or ''))
+    return (m.group(1), m.group(2)) if m else None
+
+
+def _count(rows):
+    if not rows:
+        return 0
+    row = rows[0]
+    return int((row['n'] if isinstance(row, dict) else row[0]) or 0)
+
+
+def definer_choice(session, view, runner_user):
+    """(KEPT or OWNER_DEFINER, reason) for one captured view; issues the USER_PRIVILEGES COUNT for the captured definer.
+
+    The original DEFINER is kept when that account still exists in the workspace and is not the
+    runner, which C4 removes; otherwise the clause is removed and the owner session that runs
+    the CREATE becomes the definer. Existence is read from information_schema.USER_PRIVILEGES
+    (the rows of 'user'@'host') through the owner session, which sees every account. To be
+    confirmed on the first live test: every account has a row there, and the owner may name
+    another account as DEFINER. An account without a row gets the owner, which stays.
+    """
+    account = definer_account(view.get('definer'))
+    if account is None:
+        return OWNER_DEFINER, 'no definer captured; the owner account is the definer'
+    if account[0] == runner_user:
+        return OWNER_DEFINER, 'the original definer is the runner, which C4 removes; the owner account is the definer'
+    if _count(session.query(ownersql.privileges_count_sql(), ("'%s'@'%s'" % account,))) > 0:
+        return KEPT, 'original definer kept'
+    return OWNER_DEFINER, 'the original definer no longer exists; the owner account is the definer'
+
+
+def _exists(session, target_db, name):
+    return _count(session.query(view_exists_sql(), (target_db, name))) > 0
+
+
+def _recorded_views(journal):
+    """The view names the journal holds a definer choice for."""
+    return {json.loads(d).get('view') for d in journal.events('view')}
+
+
+def record_found(session, target_db, view, journal):
+    """Record a view found in the replacement with the DEFINER the server shows; issues the information_schema.VIEWS read."""
+    rows = session.query(VIEW_DEFINER_SQL, (target_db, view['name']))
+    row = rows[0] if rows else None
+    observed = (row['DEFINER'] if isinstance(row, dict) else row[0]) if row else None
+    journal.event('view', json.dumps({'view': view['name'], 'original_definer': view.get('definer'), 'definer': FOUND,
+                                      'observed_definer': observed, 'reason': 'found in the replacement; definer %s' % observed}))
+
+
+def _error_text(exc):
+    args = getattr(exc, 'args', ())
+    return 'server error %s (%s)' % (args[0] if args and isinstance(args[0], int) else 'unknown', type(exc).__name__)
+
+
+def create_views(session, target_db, views, journal, log, runner_user=None):
+    """Create every captured view missing from the replacement, in rounds until a round creates none; returns the names created.
+
+    Issues USE of the replacement, then per view the existence COUNT on information_schema.VIEWS,
+    the USER_PRIVILEGES COUNT of definer_choice, CREATE VIEW naming the replacement and the
+    existence COUNT again as its check after (a view the server does not list refuses O7); session
+    is the owner session of O7. A view that exists is skipped; when the journal holds no choice
+    for it (the reply to its CREATE was lost, or the process stopped before the journal write),
+    record_found records the DEFINER the server shows. A server error on one view keeps its error
+    number only and the view is tried again in the next round, so a view on a later-named view is
+    created once the other exists. Raises KitError naming every view still missing with its last
+    error when a round creates none. journal None (dry run) records nothing.
+    """
     created = []
     if not views:
         return created
     session.execute('USE ' + ident(target_db))
-    for view in views:
-        rows = session.query(view_exists_sql(), (target_db, view['name']))
-        if rows and int(rows[0]['n'] if isinstance(rows[0], dict) else rows[0][0]):
-            log('view %s already exists in %s; skipped' % (view['name'], target_db))
-            continue
-        session.execute(view_statement(view, target_db))
-        journal.event('view', json.dumps({'view': view['name'], 'definer_removed': view.get('definer')}))
-        log('created view %s%s' % (view['name'], (' (definer %s removed)' % view['definer']) if view.get('definer') else ''))
-        created.append(view['name'])
+    recorded = _recorded_views(journal) if journal is not None else set()
+    pending, errors, rounds = list(views), {}, 0
+    while pending:
+        rounds += 1
+        left = []
+        for view in pending:
+            name = view['name']
+            if _exists(session, target_db, name):
+                log('view %s already exists in %s; skipped' % (name, target_db))
+                if journal is not None and name not in recorded:
+                    record_found(session, target_db, view, journal)
+                    recorded.add(name)
+                continue
+            choice, reason = definer_choice(session, view, runner_user)
+            try:
+                session.execute(view_statement(view, target_db, keep_definer=(choice == KEPT)))
+            except KitError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - one view's server error is kept and that view is tried again next round
+                errors[name] = _error_text(exc)
+                log('view %s not created in round %d: %s; it is tried again after the others' % (name, rounds, errors[name]))
+                if journal is not None:
+                    journal.event('view_failed', json.dumps({'view': name, 'round': rounds, 'error': errors[name]}))
+                left.append(view)
+                continue
+            found = _exists(session, target_db, name)
+            if journal is not None and not found:  # a dry run prints the check and creates nothing
+                raise KitError('O7 stopped at check "view %s exists": CREATE VIEW returned without an error, but information_schema.VIEWS of %s '
+                               'does not list it; inspect the replacement before any further statement' % (name, target_db))
+            if journal is not None:
+                journal.event('view', json.dumps({'view': name, 'original_definer': view.get('definer'), 'definer': choice, 'reason': reason}))
+                recorded.add(name)
+            log('created view %s (%s)' % (name, reason))
+            created.append(name)
+        if len(left) == len(pending):
+            raise KitError('O7 stopped before the stale check: round %d created none of the views still missing: %s. Fix the cause, then '
+                           'rerun O7; views already created are skipped' % (rounds, ', '.join('%s (%s)' % (v['name'], errors[v['name']]) for v in left)))
+        pending = left
     return created
+
+
+def view_block(views, target_db):
+    """The O7 block for the admin without the owner profile: USE, then per view in dependency order a CREATE VIEW and its check.
+
+    Each CREATE is skipped when the view exists and followed by a check that it does, so the
+    block can be run again. The DEFINER clause is removed, so the admin account that runs the
+    block becomes the definer (the runner cannot see whether the original account still
+    exists, and C4 removes the runner). Issues nothing (the block is printed).
+    """
+    block = ownersql.Block('O7', 'Create the views in the replacement as the admin')
+    block.note('Run this block as the admin, then rerun O7. Each view is created without its DEFINER clause, so the admin account that '
+               'runs the block becomes the definer.')
+    block.statement('USE %s' % ident(target_db), 'work inside the replacement')
+    for view in dependency_order(views):
+        params = (target_db, view['name'])
+        block.statement(view_statement(view, target_db), 'create view %s' % view['name'], skip_if=(view_exists_sql(), params))
+        block.check('view %s exists' % view['name'], view_exists_sql(), params, ownersql.Expect('column_equals', 'n', 1))
+    return block
+
+
+def place_views(ctx, views, reader):
+    """Create the views with the owner profile, or print the O7 block without it; returns the names still missing.
+
+    With the owner profile create_views runs through the owner guard of O7. Without it the
+    runner (reader) reads which views are missing and records a view found without a journal
+    choice; when any is missing, the O7 block is printed and written to owner-sql/O7.sql. A dry
+    run prints the statements of the configured route and records nothing.
+    """
+    if not views:
+        return []
+    journal = None if ctx.dry_run else ctx.journal
+    if ctx.owner_configured:
+        owner = ctx.owner_session(steps.guard_for('O7', ctx.db, steps.OWNER))
+        try:
+            create_views(owner, ctx.db.replacement, views, journal, ctx.log, ctx.config.runner.user)
+        finally:
+            owner.close()
+        return []
+    recorded = _recorded_views(journal) if journal is not None else set()
+    missing = []
+    for view in views:
+        if not _exists(reader, ctx.db.replacement, view['name']):
+            missing.append(view['name'])
+        elif journal is not None and view['name'] not in recorded:
+            record_found(reader, ctx.db.replacement, view, journal)
+    if missing:
+        block = view_block(views, ctx.db.replacement)
+        ownersql.guard_check_block(block, ctx)
+        ownersql.print_block(block, ctx, ownersql.owner_sql_path(ctx, 'O7'))
+    return missing
 
 
 def max_count_sql(db, table, column):
@@ -63,8 +259,22 @@ def alter_counter_sql(db, table, value):
 
 
 def sync_counter_sql(db, table):
-    """AGGREGATOR SYNC AUTO_INCREMENT ON the table."""
-    return 'AGGREGATOR SYNC AUTO_INCREMENT ON ' + qualified(db, table)
+    """AGGREGATOR SYNC AUTO_INCREMENT ON the table ALL: the sync runs on every aggregator, not only the one of the session."""
+    return 'AGGREGATOR SYNC AUTO_INCREMENT ON %s ALL' % qualified(db, table)
+
+
+def counter_value(source_counter, max_plus_one):
+    """(value, decision) for one counter: the larger of the source counter and MAX plus one. Issues nothing.
+
+    decision is COUNTER_SOURCE when the source counter is above MAX plus one (rows deleted at the
+    top of the source, or an empty table with a counter), else COUNTER_MAX. Either may be None
+    (no counter captured, or no rows); (None, None) when both are.
+    """
+    if source_counter is not None and (max_plus_one is None or int(source_counter) > max_plus_one):
+        return int(source_counter), COUNTER_SOURCE
+    if max_plus_one is not None:
+        return max_plus_one, COUNTER_MAX
+    return None, None
 
 
 def _counter_of(session, db, table):
@@ -76,9 +286,13 @@ def _counter_of(session, db, table):
 
 
 def set_counters(session, target_db, tables, journal, log):
-    """For every table with an AUTO_INCREMENT column: MAX plus one, then sync; empty tables keep the default.
+    """For every table with an AUTO_INCREMENT column: the larger of the source counter and MAX plus one, then the sync on every aggregator.
 
-    tables are the inventory table dicts. Returns the list of actions recorded in the journal.
+    Issues per table SELECT MAX and COUNT, SHOW CREATE TABLE, ALTER TABLE ... AUTO_INCREMENT and
+    AGGREGATOR SYNC AUTO_INCREMENT ... ALL, then SHOW CREATE TABLE again. The source counter is the
+    one the inventory captured (auto_increment.counter). An empty table without a source counter
+    keeps the default. tables are the inventory table dicts. Returns the list of actions recorded
+    in the journal: both values, the decision and the counter before and after.
     """
     actions = []
     for t in tables:
@@ -91,17 +305,19 @@ def set_counters(session, target_db, tables, journal, log):
         m = row['m'] if isinstance(row, dict) else row[0]
         n = int((row['n'] if isinstance(row, dict) else row[1]) or 0)
         before = _counter_of(session, target_db, t['name'])
+        max_plus_one = None if n == 0 or m is None else int(m) + 1
+        value, decision = counter_value(auto.get('counter'), max_plus_one)
         action = {'table': t['name'], 'column': column, 'source_counter': auto.get('counter'), 'target_before': before,
-                  'rows': n}
-        if n == 0 or m is None:
+                  'rows': n, 'max_value': None if max_plus_one is None else int(m), 'max_plus_one': max_plus_one, 'decision': decision}
+        if value is None:
             action.update(target_after=before, action='table empty, counter left at default')
         else:
-            session.execute(alter_counter_sql(target_db, t['name'], int(m) + 1))
+            session.execute(alter_counter_sql(target_db, t['name'], value))
             session.execute(sync_counter_sql(target_db, t['name']))
-            action.update(target_after=_counter_of(session, target_db, t['name']), action='counter set to MAX+1 and synced',
-                          max_value=int(m))
+            action.update(target_after=_counter_of(session, target_db, t['name']),
+                          action='counter set to %s and synced on every aggregator' % ('the source counter' if decision == COUNTER_SOURCE else 'MAX+1'))
         journal.event('counter', json.dumps(action))
-        log('%s: %s (%d rows, MAX(%s)=%s)' % (t['name'], action['action'], n, column, m))
+        log('%s: %s (%d rows, MAX(%s)=%s, source counter %s)' % (t['name'], action['action'], n, column, m, auto.get('counter')))
         actions.append(action)
     return actions
 
@@ -115,8 +331,25 @@ def _write_final_reports(ctx, data, plans, baseline):
     return xlsx
 
 
+def reopen_copy_step(journal, round_number, log):
+    """Mark O6 passed again after a completed re-copy round of the stale check.
+
+    mark_recopy set O6 pending; the round redid the O6 work for the marked buckets and ended with
+    every chunk done and the count proof all matching, which is the O6 gate. Writes the journal only.
+    """
+    if journal.step_status('O6') == 'passed':
+        return
+    journal.step_end('O6', 'passed', 'every chunk done; per-table count proof all match (re-copy round %d of the O7 stale check)' % round_number)
+    log('O6 passed again: re-copy round %d completed with every chunk done and the count proof all matching' % round_number)
+
+
 def handle_o7(step, ctx):
-    """O7 handler: views, counters, then the stale check with re-copy of mismatching tables until zero mismatches."""
+    """O7 handler: views (place_views), the stale check with re-copy of mismatching tables until zero mismatches, then the counters.
+
+    A view whose definition names the source database refuses the step before any statement.
+    Without the owner profile the step ends pending while a view is missing, after the stale
+    check and the counters ran.
+    """
     try:
         data, plans, directory = copy_module.load_plans(ctx)
     except KitError as exc:
@@ -124,23 +357,25 @@ def handle_o7(step, ctx):
     statements = copy_module.statements_for(ctx.db)
     if not ctx.dry_run and ctx.journal.is_empty():
         return steps.Outcome(steps.REFUSED, 'the copy has not run in this journal; run O5 and O6 first', EXIT_REFUSED)
+    views = data.get('views') or []
+    named = sorted(v['name'] for v in views if names_database(v.get('definition'), ctx.db.source))
+    if named:
+        return steps.Outcome(steps.REFUSED, 'view(s) %s name the source database %s in their definition; no view statement was issued. Edit each '
+                             'definition in the capture so it names no database, then rerun O7' % (', '.join(named), ctx.db.source), EXIT_REFUSED)
     guard = runner_guard(ctx.db.replacement, 'runner O7')
     session = ctx.runner_session(guard)
     try:
         if ctx.dry_run:
-            if data.get('views'):
-                session.execute('USE ' + ident(ctx.db.replacement))
-                for view in data['views']:
-                    session.execute(view_statement(view, ctx.db.replacement))
+            place_views(ctx, views, session)
             for t in data['tables']:
                 if (t.get('auto_increment') or {}).get('column'):
                     session.query(max_count_sql(ctx.db.replacement, t['name'], t['auto_increment']['column']))
-                    ctx.log.plain('    DRY RUN: %s' % alter_counter_sql(ctx.db.replacement, t['name'], 0).replace('= 0', '= <MAX+1>'))
+                    ctx.log.plain('    DRY RUN: %s' % alter_counter_sql(ctx.db.replacement, t['name'], 0).replace('= 0', '= <larger of source counter and MAX+1>'))
                     ctx.log.plain('    DRY RUN: %s' % sync_counter_sql(ctx.db.replacement, t['name']))
             verify.dry_run_statements(session, ctx.db.source, ctx.db.replacement, plans, ctx.config, tiers=[verify.TIER_COUNT, verify.TIER_NEWEST])
             return steps.Outcome(steps.PASSED, 'dry run: view, counter and stale check statements printed')
         ctx.journal.check_plan(plans, statements.source_db, statements.target_db)
-        create_views(session, ctx.db.replacement, data.get('views') or [], ctx.journal, ctx.log)
+        missing = place_views(ctx, views, session)
         baseline = estimate.load_baseline(ctx.config.resolve(ctx.config.estimate.baseline) if ctx.config.estimate.baseline else None)
         recopies = 0
         while True:
@@ -155,18 +390,29 @@ def handle_o7(step, ctx):
             if recopies >= STALE_CHECK_ROUNDS:
                 return steps.Outcome(steps.MISMATCH, 'stale check still finds mismatches after %d re-copy rounds: %s; investigate the writers, then rerun O7' % (
                     STALE_CHECK_ROUNDS, ', '.join(sorted({t for t, _ in targets}))), EXIT_MISMATCH)
-            for table, bucket in targets:
-                ctx.journal.mark_recopy(table, bucket)
-            recopies += 1
-            ctx.log('stale check: %d table(s) marked for re-copy (round %d): %s' % (len(targets), recopies, ', '.join(sorted({t for t, _ in targets}))))
-            with copy_module.copy_lock(ctx.journal_path):
+            tables = sorted({t for t, _ in targets})
+            # the round holds the copy lock from its mark through its copy, so no O10 of another process waits for its go meanwhile
+            with copy_module.copy_lock(ctx.journal_path, 'O7'):
+                for line in ownersql.retire_o10_blocks(ctx, tables, 'the O7 stale check re-copies %s; O8 must verify again' % ', '.join(tables)):
+                    ctx.log(line)
+                for table, bucket in targets:
+                    ctx.journal.mark_recopy(table, bucket)
+                recopies += 1
+                ctx.log('stale check: %d table(s) marked for re-copy (round %d): %s' % (len(targets), recopies, ', '.join(tables)))
                 runner = copy_module.Runner(plans, statements, ctx.journal, ctx.runner_connector(), ctx.log, ctx.config.copy,
                                             abort_at=copy_module.resolve_abort_at(ctx.journal, ctx.config, copy_module.longest_chunk_seconds(plans, ctx.config)),
                                             stop_file=copy_module.stop_file_for(ctx.journal_path), retry_failed=True)
                 complete = runner.copy()
             if not complete:
-                return steps.Outcome(steps.INCOMPLETE, 're-copy after the stale check did not complete; rerun O7', EXIT_INCOMPLETE)
+                return steps.Outcome(steps.INCOMPLETE, 're-copy after the stale check did not complete; O6 stays pending: rerun O6 to finish '
+                                     'the marked buckets, then O7 (s2rebuild run --from O6)', EXIT_INCOMPLETE)
+            reopen_copy_step(ctx.journal, recopies, ctx.log)
+        # the one counter pass, after the last re-copy round, so every counter follows the rows now in the replacement
         set_counters(session, ctx.db.replacement, data['tables'], ctx.journal, ctx.log)
+        if missing:
+            return steps.Outcome(steps.PENDING, 'stale check 0 mismatches after %d re-copy round(s), counters set; view(s) %s not created: no owner '
+                                 'profile. Run the O7 block in %s as the admin, then rerun O7 (s2rebuild step O7); the rerun finds the views and passes'
+                                 % (recopies, ', '.join(missing), ownersql.owner_sql_path(ctx, 'O7')), EXIT_GATE)
         return steps.Outcome(steps.PASSED, 'views created, stale check 0 mismatches after %d re-copy round(s), counters set' % recopies)
     finally:
         session.close()
@@ -195,14 +441,19 @@ def handle_o8(step, ctx):
         _write_final_reports(ctx, data, plans, baseline)
         targets = verify.recopy_targets(results, plans)
         if targets:
+            tables = sorted({t for t, _ in targets})
+            for line in ownersql.retire_o10_blocks(ctx, tables, 'O8 found a mismatch and marks %s for re-copy; rerun O6 to O8 '
+                                                   '(s2rebuild run --from O6)' % ', '.join(tables)):
+                ctx.log(line)
             for table, bucket in targets:
                 ctx.journal.mark_recopy(table, bucket)
             hint = '; '.join('mark-recopy %s%s' % (t, '' if b is None else ' --bucket %d' % b) for t, b in targets)
-            return steps.Outcome(steps.MISMATCH, 'verification mismatch; buckets marked for re-copy (%s); rerun O6 then O8' % hint, EXIT_MISMATCH)
+            return steps.Outcome(steps.MISMATCH, 'verification mismatch; buckets marked for re-copy (%s); rerun O6 to O8 '
+                                 '(s2rebuild run --from O6): the re-copy reopens O7 for the counters and the stale check' % hint, EXIT_MISMATCH)
         sampled = summary.get(verify.TIER_FINGERPRINT, {}).get('sampled', [])
         if sampled and not ctx.yes:
-            return steps.Outcome(steps.PENDING, 'tier 1 and 2 pass; tier 3 was sampled beyond the budget on %s; rerun step O8 --yes to accept, '
-                                 'or raise verify.fingerprint_budget_minutes' % ', '.join(sampled), steps.EXIT_GATE)
+            return steps.Outcome(steps.PENDING, 'tier 1 and 2 pass; tier 3 was sampled beyond the budget on %s; rerun step O8 --yes%s to accept, '
+                                 'or raise verify.fingerprint_budget_minutes' % (', '.join(sampled), steps.run_flag(ctx.run_id)), steps.EXIT_GATE)
         return steps.Outcome(steps.PASSED, 'every tier passed (%d tables%s)' % (len(plans), ('; sampled accepted: ' + ', '.join(sampled)) if sampled else ''))
     finally:
         session.close()

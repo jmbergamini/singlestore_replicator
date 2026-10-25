@@ -122,9 +122,10 @@ SCHEMA = {
         'detach_wait_seconds': Field('int', 120, minimum=0),
         'detach_kill': Field('bool', True),
         'write_probe': Field('bool', True),
+        'quiet_max_age_seconds': Field('int', 60, minimum=1),
         'lockout': {
             'connections': Field('int', 6, minimum=1),
-            'interval_seconds': Field('int', 0, minimum=0),
+            'interval_seconds': Field('int', 5, minimum=0),
             'protected_accounts': Field('list', []),
             'quiet_passes_required': Field('int', 3, minimum=1),
         },
@@ -138,6 +139,7 @@ SCHEMA = {
         'lock_probe_timeout_seconds': Field('int', 5, minimum=1),
         'lock_retry_seconds': Field('int', 120, minimum=1),
         'max_attempts': Field('int', 3, minimum=1),
+        'max_lock_waits': Field('int', 10, minimum=1),
         'progress_seconds': Field('int', 60, minimum=1),
     },
     'verify': {
@@ -162,6 +164,11 @@ SCHEMA = {
     },
     'paths': {
         'runs_dir': Field('str', 'customer/runs'),
+    },
+    'objects': {
+        'routines': {
+            'ignore': Field('list', []),
+        },
     },
 }
 
@@ -386,6 +393,7 @@ class Config:
     estimate: Section
     closeout: Section
     paths: Section
+    objects: Section = None
 
     def database(self, name):
         """The DatabaseSpec whose source is name. Raises KitError when it is not configured."""
@@ -511,12 +519,16 @@ def build_config(data, path=None, run_date=None, root=None):
     for key, value in raw['pipelines']['retention_hours'].items():
         if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0:
             raise KitError('pipelines.retention_hours.%s must be a number of hours' % key)
+    for entry in raw['objects']['routines']['ignore']:
+        if not isinstance(entry, str) or not 1 <= len(entry.split('.')) <= 2 or not all(IDENT.fullmatch(p) for p in entry.split('.')):
+            raise KitError('objects.routines.ignore entries must be routine names or database.routine names of letters, '
+                           'digits and underscores')
     root = Path(root) if root is not None else Path.cwd()
     return Config(path=Path(path) if path is not None else None, root=root, raw=raw, customer=raw['customer'],
                   workspace=Section(raw['workspace']), runner=runner, owner=owner, databases=databases, window=window,
                   freeze=Section(raw['freeze']), copy=Section(copy), verify=Section(raw['verify']),
                   pipelines=Section(raw['pipelines']), estimate=Section(raw['estimate']),
-                  closeout=Section(raw['closeout']), paths=Section(raw['paths']))
+                  closeout=Section(raw['closeout']), paths=Section(raw['paths']), objects=Section(raw['objects']))
 
 
 def config_path(explicit=None, env=None):

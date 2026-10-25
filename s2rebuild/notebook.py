@@ -8,10 +8,13 @@ credentials placeholder, and the O9 cell reads each CREDENTIALS JSON with getpas
 in the notebook) and deletes the variable after the call. The notebook connects with
 singlestoredb through portal.connection_url and checks the workspace id (when workspace.id is
 configured) and the host before running anything. The O2 result carries the pipeline capture
-after the stop, which s2rebuild gate O2 --evidence imports; the lockout cell enumerates the
-write-capable accounts at run time and prints its snapshot for s2rebuild gate O3 --evidence.
-The file holds definitions, so it is written with mode 0600. Statements issued by this module:
-none.
+after the stop, which s2rebuild gate O2 --evidence imports. The O3 cell runs the O3-reentry
+block (from ownersql.companion_blocks) when the whole block stopped at its first check because
+no database carries the source name. The lockout cell enumerates the write-capable accounts at
+run time and prints its snapshot for s2rebuild gate O3 --evidence; it ends at the quiet passes and
+does not hold, so on Path B the O10 cell checks before its DETACH that every privilege of the
+recorded snapshot is still revoked (switch.forward_block). The file holds definitions,
+so it is written with mode 0600. Statements issued by this module: none.
 """
 import json
 import os
@@ -62,7 +65,8 @@ if not snapshot:
     print("no write-capable account outside the protected set; nothing to lock out (check freeze.lockout.protected_accounts)")
 else:
     print(json.dumps({"step": "O3", "run_id": RUN["run_id"], "grant_snapshot": snapshot}, indent=1))
-    print("save the JSON above and record it: s2rebuild gate O3 --pass --note TEXT --evidence <file>; O11 restores from it")
+    print("save the JSON above and record it: s2rebuild gate O3 --pass --note TEXT --evidence <file>; O11 restores from it, and the "
+          "O10 cell of a notebook generated after that checks before its DETACH that these privileges are still revoked")
     revoke(snapshot)
     users = {g.split("@")[0].strip("'") for g in snapshot}
     quiet = 0
@@ -152,7 +156,7 @@ def first_cell_compiles(path):
 
 
 def blocks_for_run(ctx, items=None, grant_snapshot=None):
-    """Every admin block of the run keyed by step id, plus the O10 rollback; returns (names, blocks, inputs)."""
+    """Every admin block of the run keyed by step id, plus the O3 re-entry and the O10 rollback; returns (names, blocks, inputs)."""
     names = ownersql.names_for(ctx)
     inputs = ownersql.block_inputs(ctx)
     if items is not None:
@@ -164,6 +168,8 @@ def blocks_for_run(ctx, items=None, grant_snapshot=None):
     for step_id in ('O2', 'O9', 'O11', 'C3', 'C4'):
         blocks[step_id] = ownersql.block_for(step_id, names, ctx.config, **inputs)
     blocks['O3'] = ownersql.block_for('O3', names, None, **inputs)
+    for variant, b in ownersql.companion_blocks('O3', names):
+        blocks['O3-' + variant] = b
     blocks['O10'] = ownersql.block_for('O10', names, ctx.config, **inputs)
     blocks['O10-rollback'] = ownersql.block_for('O10', names, ctx.config, rollback=True, **inputs)
     return names, blocks, inputs

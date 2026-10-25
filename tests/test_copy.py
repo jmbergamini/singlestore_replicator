@@ -23,11 +23,13 @@ import sqlite3
 import sys
 import tempfile
 import threading
+import time
 import types
 import unittest
 from pathlib import Path
 
 from s2rebuild import copy as C
+from s2rebuild import estimate as E
 from s2rebuild import inventory as I
 from s2rebuild import steps
 from s2rebuild.common import EXIT_DONE, EXIT_GATE, EXIT_INCOMPLETE, EXIT_MISMATCH, EXIT_REFUSED, KitError
@@ -36,7 +38,7 @@ from s2rebuild.connect import Log, Redactor, Secrets, SessionFactory
 from s2rebuild.journal import Journal
 from s2rebuild.sqlutil import GuardError, classify, ident, runner_guard
 from tests.fakedb import FakeDB, SimulatedCrash, evaluate_predicate, multiset
-from tests.helpers import ROOT, RUN_DATE, fixture_data
+from tests.helpers import FAULT_POINTS, ROOT, RUN_DATE, crash_journal, fixture_data
 
 SRC, TGT = 'example_orders_db', 'example_orders_db_rebuild_20261101'
 REFERENCE_JOURNAL = ROOT / 'tests' / 'fixtures' / 'reference-run' / 'copy-journal.sqlite'
@@ -239,6 +241,7 @@ class GuardTests(unittest.TestCase):
 
     def test_copy_source_has_no_forbidden_statements(self):
         text = (ROOT / 's2rebuild' / 'copy.py').read_text().lower()
+        text = text.replace(C.HARD_STOP_HINT.lower(), '')  # the hint names the operating system kill; copy issues no KILL statement
         for word in ('detach', 'attach', 'truncate', 'pipeline', 'grant', 'revoke', 'kill'):
             self.assertNotIn(word, text, word)
         self.assertNotIn('drop database', text)
@@ -573,7 +576,7 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual([s for s, _ in h.states().values()], ['done'] * 7)
         self.assertEqual(h.step('O6', options={'fresh_table': 'nope'}).status, steps.REFUSED)
         writes = [w for w in h.fake.writes if 't_single__fresh' in w]
-        self.assertTrue(writes[0].startswith('CREATE TABLE `%s`.`t_single__fresh` LIKE' % TGT))
+        self.assertEqual(writes[0], 'CREATE TABLE `%s`.`t_single__fresh` LIKE `%s`.`t_single`' % (TGT, TGT), 'the checked replacement definition')
         self.assertTrue(any(w.startswith('ALTER TABLE `%s`.`t_single__fresh` RENAME TO `t_single`' % TGT) for w in writes))
 
     def test_count_proof_mismatch_exits_3(self):
@@ -632,7 +635,9 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(C.resolve_abort_at(h.journal, h.config, longest), window_deadline, 'an O1 record without the allowance is tightened')
         h.journal.set_meta('abort_deadline', '2026-11-01T10:00:00Z')
         self.assertEqual(C.resolve_abort_at(h.journal, h.config, longest), dt.datetime(2026, 11, 1, 10, tzinfo=dt.timezone.utc), 'an earlier record wins')
-        self.assertEqual(h.step('O1', redo=True).status, steps.PENDING)
+        h.journal.record_gate('P1', True, 'account in place')
+        h.journal.step_end('P2', 'passed', 'preflight passed')
+        self.assertEqual(h.step('O1', redo=True, options={'no_rehearsal': 'copy test'}).status, steps.PENDING)
         self.assertIn('longest modeled chunk', h.text())
 
     def test_serialization_survives_a_resume_and_configured_limits_are_kept(self):
@@ -663,18 +668,21 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(multiset(h.fake.rows(TGT, 't_single')), multiset(h.fake.rows(SRC, 't_single')))
         h2 = Harness(self)
         self.assertEqual(h2.step('O5').status, steps.PASSED)
-        del h2.fake.databases[TGT]['tables']['t_single']
-        h2.fake.databases[TGT]['tables']['t_single__fresh'] = {'create': FIXTURE_TABLES['t_single'][3], 'rows': [dict(r) for r in h2.fake.rows(SRC, 't_single')], 'auto_increment': None}
+        h2.fake.fail_statement(r'^ALTER TABLE `%s`\.`t_single__fresh` RENAME' % TGT, 'before')
+        self.assertEqual(h2.step('O6', options={'fresh_table': 't_single'}).status, steps.INCOMPLETE, 'the base table is dropped, the rename lost')
+        self.assertNotIn('t_single', h2.fake.databases[TGT]['tables'])
+        writes = len(h2.fake.writes)
         self.assertEqual(h2.step('O6', options={'fresh_table': 't_single'}).status, steps.INCOMPLETE)
-        self.assertTrue(any(w.startswith('ALTER TABLE `%s`.`t_single__fresh` RENAME TO `t_single`' % TGT) for w in h2.fake.writes))
-        self.assertFalse(any(w.startswith('DROP TABLE') for w in h2.fake.writes), 'rename only when the base table is already gone')
+        self.assertTrue(any(w.startswith('ALTER TABLE `%s`.`t_single__fresh` RENAME TO `t_single`' % TGT) for w in h2.fake.writes[writes:]))
+        self.assertFalse(any(w.startswith(('DROP TABLE', 'CREATE TABLE', 'INSERT')) for w in h2.fake.writes[writes:]),
+                         'rename only when the base table is already gone')
 
     def test_dry_run_with_fresh_table_prints_the_fallback_statements(self):
         h = Harness(self)
         outcome = h.step('O6', dry_run=True, options={'fresh_table': 't_single'})
         self.assertEqual(outcome.status, steps.PASSED)
         text = h.text()
-        self.assertIn('DRY RUN: CREATE TABLE `%s`.`t_single__fresh` LIKE `%s`.`t_single`' % (TGT, SRC), text)
+        self.assertIn('DRY RUN: CREATE TABLE `%s`.`t_single__fresh` LIKE `%s`.`t_single`' % (TGT, TGT), text)
         self.assertIn('DRY RUN: ALTER TABLE `%s`.`t_single__fresh` RENAME TO `t_single`' % TGT, text)
         self.assertNotIn('MOD 3 =', text)
 
@@ -727,6 +735,254 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(h.fake.writes, [])
         self.assertTrue(h.journal.is_empty())
         self.assertIn('7 INSERT statements over 4 tables printed', text)
+
+
+# ---------------------------------------------------------------------------
+# F13: copy stop safety
+# ---------------------------------------------------------------------------
+FRESH = {'fresh_table': 't_single'}
+
+
+class StopSafetyTests(unittest.TestCase):
+    def test_f13_lock_that_never_clears_ends_incomplete_with_the_fresh_table_hint(self):
+        """A lock that never clears: the chunk fails at its copy.max_lock_waits-th lock wait with the fresh-table command, O6 ends
+        INCOMPLETE on its own with that command in the note, and the fresh-table load it names completes the copy.
+
+        Failure point: the INSERT, then the probe DELETE, raise error 1205 before the server applies them (the before point); the
+        journal write the cap guards is the chunk's mark_failed, which keeps the attempt.
+        """
+        h = Harness(self, mutate=lambda d: d['copy'].update(max_lock_waits=2, lock_retry_seconds=1, min_rows_for_chunking=10 ** 9))
+        self.assertEqual(h.step('O5').status, steps.PASSED)
+        h.fake.lock_tables.add((TGT, 't_single'))
+        outcome = h.step('O6')
+        self.assertEqual((outcome.status, outcome.exit_code), (steps.INCOMPLETE, EXIT_INCOMPLETE), h.text())
+        hint = 's2rebuild step O6 --fresh-table t_single'
+        self.assertIn(hint, outcome.note)
+        self.assertEqual(h.fake.lock_hits, 2, 'two lock waits, then the chunk fails')
+        chunk = h.journal.chunks('t_single')[0]
+        self.assertEqual((chunk['state'], chunk['attempts']), ('failed', 1), 'the last lock wait consumes the attempt')
+        self.assertIn(hint, chunk['error'])
+        self.assertIn('FAILED t_single bucket 0', h.text())
+        self.assertEqual({s for (t, _), (s, _) in h.states().items() if t != 't_single'}, {'done'})
+        self.assertEqual(h.step('O6', options=FRESH).status, steps.PASSED, h.text())
+        self.assertEqual(multiset(h.fake.rows(TGT, 't_single')), multiset(h.fake.rows(SRC, 't_single')))
+
+    def test_f13_second_interrupt_does_not_kill_the_workers(self):
+        """Two Ctrl-C while the workers sit between their INSERT and its journal update (mark_done): the second prints the hard-stop
+        hint and the wait goes on, so every chunk a worker started finishes and is journaled done; a rerun completes the copy."""
+        h = Harness(self)
+        self.assertEqual(h.step('O5').status, steps.PASSED)
+        caller = threading.current_thread()
+        in_chunk, release = threading.Event(), threading.Event()
+        hooked, interrupts = [], {'n': 0}
+
+        def hook(table, bucket):
+            hooked.append((table, bucket))
+            in_chunk.set()
+            release.wait(10)
+
+        def sleep(seconds):
+            if threading.current_thread() is not caller:
+                time.sleep(0.001)
+                return
+            in_chunk.wait(10)
+            interrupts['n'] += 1
+            if interrupts['n'] <= 2:
+                raise KeyboardInterrupt()
+            release.set()
+            time.sleep(0.001)
+        runner = C.Runner(h.plans(), C.statements_for(h.db), h.journal, h.fake.connect, h.log, h.config.copy, workers=2,
+                          after_insert_hook=hook, sleep=sleep)
+        self.assertFalse(runner.copy(), 'the interrupt stops new chunks, so the copy is incomplete')
+        self.assertTrue(runner.interrupted)
+        self.assertGreaterEqual(interrupts['n'], 3, 'the wait went on after the second interrupt')
+        self.assertIn('Interrupted again', h.text())
+        self.assertIn(C.HARD_STOP_HINT, h.text())
+        states = h.states()
+        self.assertNotIn('started', {s for s, _ in states.values()}, 'no chunk is left started by the interrupts')
+        self.assertTrue(hooked)
+        for key in hooked:
+            self.assertEqual(states[key][0], 'done', key)
+        self.assertEqual(h.step('O6').status, steps.PASSED, h.text())
+        for name in FIXTURE_TABLES:
+            self.assertEqual(multiset(h.fake.rows(TGT, name)), multiset(h.fake.rows(SRC, name)), name)
+
+    def test_f13_fresh_table_refused_past_the_deadline(self):
+        """Past the abort deadline the fresh-table load is refused before a connection opens: no statement, no journal write."""
+        h = Harness(self, mutate=lambda d: d['window'].update(start='2000-01-01T00:00:00Z', end='2000-01-01T08:00:00Z'))
+        self.assertEqual(h.step('O5').status, steps.PASSED)
+        connections, writes = len(h.fake.connections), len(h.fake.writes)
+        outcome = h.step('O6', options=FRESH)
+        self.assertEqual((outcome.status, outcome.exit_code), (steps.REFUSED, EXIT_REFUSED), h.text())
+        self.assertIn('Abort deadline', outcome.note)
+        self.assertEqual((len(h.fake.connections), len(h.fake.writes)), (connections, writes))
+        self.assertEqual(h.journal.events('evidence_reopened'), [])
+        self.assertIsNone(h.journal.get_meta(C.FRESH_META + 't_single'))
+
+    def test_f13_fresh_table_refused_while_the_stop_file_exists(self):
+        """The stop file refuses the fresh-table load with nothing written; once it is removed the load runs."""
+        h = Harness(self)
+        self.assertEqual(h.step('O5').status, steps.PASSED)
+        stop = C.stop_file_for(h.journal_path)
+        stop.write_text('stop')
+        writes = len(h.fake.writes)
+        outcome = h.step('O6', options=FRESH)
+        self.assertEqual((outcome.status, outcome.exit_code), (steps.REFUSED, EXIT_REFUSED), h.text())
+        self.assertIn('s2rebuild resume', outcome.note)
+        self.assertEqual(len(h.fake.writes), writes)
+        self.assertEqual(h.journal.events('evidence_reopened'), [])
+        stop.unlink()
+        self.assertEqual(h.step('O6', options=FRESH).status, steps.INCOMPLETE, 'other tables are still pending')
+        self.assertEqual(multiset(h.fake.rows(TGT, 't_single')), multiset(h.fake.rows(SRC, 't_single')))
+
+    def test_f13_fresh_name_over_64_characters_or_in_the_plan_is_refused(self):
+        """A fresh name over 64 characters, or one that is a planned table, is refused in a dry run and a real run, with nothing written."""
+        cols, pk, est, create = FIXTURE_TABLES['t_comp']
+        long_name = 't_' + 'x' * 56
+        cases = {
+            'over 64': ({long_name: (cols, pk, est, create.replace('`t_comp`', '`%s`' % long_name))}, long_name, '65 characters'),
+            'planned': ({'t_comp': FIXTURE_TABLES['t_comp'], 't_comp__fresh': (cols, pk, est, create.replace('`t_comp`', '`t_comp__fresh`'))},
+                        't_comp', 'is a planned table'),
+        }
+        for label, (tables, table, words) in cases.items():
+            with self.subTest(label):
+                h = Harness(self, tables=tables)
+                self.assertEqual(h.step('O5').status, steps.PASSED, h.text())
+                writes = len(h.fake.writes)
+                for dry_run in (True, False):
+                    outcome = h.step('O6', dry_run=dry_run, options={'fresh_table': table})
+                    self.assertEqual(outcome.status, steps.REFUSED, (dry_run, h.text()))
+                    self.assertIn(words, outcome.note)
+                self.assertEqual(len(h.fake.writes), writes)
+                self.assertEqual(h.journal.events('evidence_reopened'), [])
+        self.assertEqual(C.fresh_name(types.SimpleNamespace(name='t_' + 'x' * 55)), 't_' + 'x' * 55 + '__fresh', '64 characters are allowed')
+
+    def test_f13_unrecorded_fresh_table_or_missing_replacement_table_is_refused(self):
+        """A t__fresh this journal did not record is neither reused nor dropped; a replacement table that is gone, with no complete
+        recorded fresh table, is not recreated from the source definition. Both refuse before any write."""
+        h = Harness(self)
+        self.assertEqual(h.step('O5').status, steps.PASSED)
+        stray = [dict(r) for r in h.fake.rows(SRC, 't_single')]
+        h.fake.databases[TGT]['tables']['t_single__fresh'] = {'create': FIXTURE_TABLES['t_single'][3], 'rows': stray, 'auto_increment': None}
+        writes = len(h.fake.writes)
+        outcome = h.step('O6', options=FRESH)
+        self.assertEqual((outcome.status, outcome.exit_code), (steps.REFUSED, EXIT_REFUSED), h.text())
+        self.assertIn('did not record creating it', outcome.note)
+        self.assertEqual(len(h.fake.writes), writes)
+        self.assertEqual(len(h.fake.rows(TGT, 't_single__fresh')), len(stray), 'the stray table is left as it was')
+        self.assertEqual(h.journal.events('evidence_reopened'), [])
+        h2 = Harness(self)
+        self.assertEqual(h2.step('O5').status, steps.PASSED)
+        del h2.fake.databases[TGT]['tables']['t_single']
+        writes = len(h2.fake.writes)
+        outcome = h2.step('O6', options=FRESH)
+        self.assertEqual(outcome.status, steps.REFUSED, h2.text())
+        self.assertIn('does not recreate it from the source definition', outcome.note)
+        self.assertEqual(len(h2.fake.writes), writes)
+        self.assertNotIn('t_single', h2.fake.databases[TGT]['tables'])
+
+    def test_f13_fresh_table_faults_rerun_without_a_duplicate_load(self):
+        """Failure points around the fresh-table INSERT, DROP TABLE and RENAME: before the statement, after it, and a crash before
+        the journal update that follows it (the loaded record after the INSERT, mark_done after the DROP and the RENAME). Each time
+        a rerun of step O6 --fresh-table completes the load with one whole-table INSERT on the server and every bucket done."""
+        patterns = {'INSERT': r'^INSERT INTO `%s`\.`t_single__fresh`' % TGT, 'DROP': r'^DROP TABLE `%s`\.`t_single`$' % TGT,
+                    'RENAME': r'^ALTER TABLE `%s`\.`t_single__fresh` RENAME' % TGT}
+        for statement, pattern in patterns.items():
+            for point in FAULT_POINTS:
+                with self.subTest(statement=statement, point=point):
+                    h = Harness(self)
+                    self.assertEqual(h.step('O5').status, steps.PASSED)
+                    if point == 'journal':
+                        if statement == 'INSERT':
+                            crash_journal(self, h.journal, 'set_meta',
+                                          match=lambda key, value: key == C.FRESH_META + 't_single' and value.split(' ')[1] == C.FRESH_LOADED)
+                        else:
+                            crash_journal(self, h.journal, 'mark_done')
+                        with self.assertRaises(SimulatedCrash):
+                            h.step('O6', options=FRESH)
+                    else:
+                        h.fake.fail_statement(pattern, point)
+                        outcome = h.step('O6', options=FRESH)
+                        self.assertEqual(outcome.status, steps.INCOMPLETE, h.text())
+                        self.assertIn('fresh-table load of t_single failed', outcome.note)
+                    outcome = h.step('O6', options=FRESH)
+                    self.assertEqual(outcome.status, steps.INCOMPLETE, h.text())
+                    self.assertIn('4 chunks still pending on other tables', outcome.note)
+                    loads = [w for w in h.fake.writes if w.startswith('INSERT INTO `%s`.`t_single__fresh`' % TGT)]
+                    self.assertEqual(len(loads), 1, 'one whole-table load reached the server')
+                    self.assertEqual(multiset(h.fake.rows(TGT, 't_single')), multiset(h.fake.rows(SRC, 't_single')))
+                    self.assertNotIn('t_single__fresh', h.fake.databases[TGT]['tables'])
+                    chunks = h.journal.chunks('t_single')
+                    self.assertEqual({(c['state'], c['error']) for c in chunks}, {('done', E.FRESH_LOAD_ERROR)})
+                    self.assertEqual(sum(c['rows_inserted'] for c in chunks), len(h.fake.rows(SRC, 't_single')))
+                    self.assertEqual(h.journal.get_meta(C.FRESH_META + 't_single'), 't_single__fresh done')
+                    self.assertEqual(h.step('O6').status, steps.PASSED, h.text())
+
+    def test_f13_stale_loaded_record_is_never_taken_for_a_load(self):
+        """A crash on the done record, the journal write after the RENAME: Journal.mark_loaded writes it with the chunk rows, so
+        they roll back together and the record still reads loaded.
+
+        Failure point: journal, after the RENAME and before the done record. Rerun at once: a plain O6 refuses and the fresh-table
+        rerun records the load with no second INSERT. A plain O6 that redid the table's failed bucket, or a re-copy mark, makes the
+        loaded record stale: with one row of the replacement table changed (count unchanged) the rerun loads the table again, so
+        it never reports a load it did not do.
+        """
+        done = lambda key, value: key == C.FRESH_META + 't_single' and value.endswith(' ' + C.FRESH_DONE)
+        for route in ('rerun', 'plain O6', 'mark-recopy'):
+            with self.subTest(route):
+                if route == 'plain O6':
+                    h = Harness(self, mutate=lambda d: d['copy'].update(max_lock_waits=1, lock_retry_seconds=1, min_rows_for_chunking=10 ** 9))
+                    self.assertEqual(h.step('O5').status, steps.PASSED)
+                    h.fake.lock_tables.add((TGT, 't_single'))
+                    self.assertEqual(h.step('O6').status, steps.INCOMPLETE, h.text())
+                    h.fake.lock_tables.clear()
+                else:
+                    h = Harness(self)
+                    self.assertEqual(h.step('O5').status, steps.PASSED)
+                before = {c['bucket']: (c['state'], c['attempts']) for c in h.journal.chunks('t_single')}
+                crash_journal(self, h.journal, 'set_meta', match=done)
+                with self.assertRaises(SimulatedCrash):
+                    h.step('O6', options=FRESH)
+                self.assertEqual({c['bucket']: (c['state'], c['attempts']) for c in h.journal.chunks('t_single')}, before,
+                                 'the chunk rows rolled back with the done record')
+                self.assertEqual(C.fresh_record(h.journal, 't_single')[1], C.FRESH_LOADED)
+                self.assertNotIn('t_single__fresh', h.fake.databases[TGT]['tables'], 'the RENAME was applied')
+                if route == 'rerun':
+                    outcome = h.step('O6')
+                    self.assertEqual(outcome.status, steps.REFUSED, 'a plain O6 does not pass over the load it cannot account for')
+                    self.assertIn('does not account for', outcome.note)
+                elif route == 'plain O6':
+                    self.assertEqual(h.step('O6').status, steps.PASSED, h.text())
+                else:
+                    h.journal.mark_recopy('t_single')
+                if route != 'rerun':
+                    h.fake.rows(TGT, 't_single')[0]['payload'] = 'changed by hand'
+                outcome = h.step('O6', options=FRESH)
+                self.assertIn(outcome.status, (steps.PASSED, steps.INCOMPLETE), h.text())
+                loads = [w for w in h.fake.writes if w.startswith('INSERT INTO `%s`.`t_single__fresh`' % TGT)]
+                if route == 'rerun':
+                    self.assertEqual(len(loads), 1, 'the load the crashed attempt did is recorded, not repeated')
+                    self.assertIn('t_single__fresh was already renamed to t_single', h.text())
+                else:
+                    self.assertEqual(len(loads), 2, 'a stale loaded record is not taken for a load')
+                    self.assertIn('t_single__fresh was recorded loaded, but t_single', h.text())
+                self.assertEqual(multiset(h.fake.rows(TGT, 't_single')), multiset(h.fake.rows(SRC, 't_single')))
+                self.assertNotIn('t_single__fresh', h.fake.databases[TGT]['tables'])
+                self.assertEqual({(c['state'], c['error']) for c in h.journal.chunks('t_single')}, {('done', E.FRESH_LOAD_ERROR)})
+                self.assertEqual(h.journal.get_meta(C.FRESH_META + 't_single'), 't_single__fresh done')
+                self.assertEqual(h.step('O6').status, steps.PASSED, h.text())
+
+    def test_f13_calibrate_skips_fresh_table_rows(self):
+        """The chunk rows of a fresh-table load (bucket 0 holds every row, zero duration) carry the fresh-table error, and the
+        chunk reader of calibrate skips them."""
+        h = Harness(self)
+        self.assertEqual(h.step('O5').status, steps.PASSED)
+        self.assertEqual(h.step('O6', options=FRESH).status, steps.INCOMPLETE)
+        self.assertEqual(h.step('O6').status, steps.PASSED, h.text())
+        self.assertEqual({c['error'] for c in h.journal.chunks('t_single')}, {E.FRESH_LOAD_ERROR})
+        for first_pass_only in (True, False):
+            points = E.read_chunks(h.journal_path, first_pass_only=first_pass_only)
+            self.assertEqual(sorted({p[-1] for p in points}), ['t_comp', 't_empty', 't_nokey'], first_pass_only)
 
 
 if __name__ == '__main__':

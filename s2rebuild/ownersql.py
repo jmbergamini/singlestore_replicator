@@ -9,9 +9,12 @@ the kit writes owner-sql/<step>.sql and prints the same block, and a person reco
 The same gate logic ships as OWNERLIB_SOURCE, a single-file, dependency-free module for the
 owner notebook that works with any DB-API cursor. Statements issued here: only those of the
 block, through the owner guard of the step (section 10.4); the P1 and C4 account blocks
-(CREATE USER, GRANT, DROP USER) and the C3 cleanup block (DROP DATABASE) are built in this
-module. A DETACH that waits longer than freeze.detach_wait_seconds is cancelled with KILL QUERY
-on the kit's own connection and issued again WITH KILL when freeze.detach_kill is set.
+(CREATE USER, GRANT, DROP USER; C4 first checks that no view in the live database has the
+runner as its definer) and the C3 cleanup block (DROP DATABASE, by the recorded STORAGE_ID
+and attach type) are built in this module. A DETACH that waits longer than
+freeze.detach_wait_seconds is cancelled with KILL QUERY on the kit's own connection and issued
+again WITH KILL when freeze.detach_kill is set. Before a re-copy reopens the copy evidence,
+retire_o10_blocks rewrites the O10 block files already written so each starts with a STOP.
 """
 import json
 import os
@@ -28,6 +31,7 @@ RUNNER_PRIVILEGES = ('SELECT', 'INSERT', 'DELETE', 'CREATE', 'DROP', 'ALTER', 'C
 PASSWORD_PLACEHOLDER = '<password>'
 PLACEHOLDER_SID = re.compile(r'<[a-z_]+_sid>')
 CANCEL_JOIN_SECONDS = 30
+CLEANUP_ATTACH_TYPES = {'retained': 'READONLY', 'replacement': 'READWRITE'}
 
 
 class Expect:
@@ -316,7 +320,7 @@ def detach_with_escalation(open_session, guard, database, wait_seconds, kill, lo
     return 'kill'
 
 
-def execute_block(block, session, log, journal=None, substitute=None, open_session=None, guard=None):
+def execute_block(block, session, log, journal=None, substitute=None, open_session=None, guard=None, before_first_statement=None):
     """Run the block through a guarded session: every check must pass before the next statement runs.
 
     substitute(sql) may rewrite a statement just before execution (credential or password
@@ -327,8 +331,20 @@ def execute_block(block, session, log, journal=None, substitute=None, open_sessi
     settings escalates through detach_with_escalation when open_session is given. Raises
     KitError at the first failed check with the observed state. Returns the list of
     (label, observed) check results.
+
+    before_first_statement() runs once, when the first statement is about to execute or is
+    found already done by its skip_if count: every earlier check passed and the session is
+    open. A block that stops at a check, or fails before that point, never calls it.
     """
     results = []
+    hook = before_first_statement
+
+    def _first_statement():
+        nonlocal hook
+        if hook is not None:
+            due, hook = hook, None
+            due()
+
     for item in block.items:
         if item.kind == 'note':
             log('    note: ' + item.label)
@@ -354,6 +370,7 @@ def execute_block(block, session, log, journal=None, substitute=None, open_sessi
             continue
         if item.skip_if:
             count = _first_value(session.query(item.skip_if[0], item.skip_if[1] or None))
+            _first_statement()
             if count is not None and int(count) > 0:
                 log('    skipped: %s (already done)' % _statement_label(block, item))
                 if journal is not None:
@@ -362,12 +379,14 @@ def execute_block(block, session, log, journal=None, substitute=None, open_sessi
         if item.detach and open_session is not None and guard is not None:
             m = re.match(r'DETACH DATABASE `([A-Za-z0-9_]+)`$', item.sql)
             if m:
+                _first_statement()
                 form = detach_with_escalation(open_session, guard, m.group(1), int(item.detach.get('wait', 120)),
                                               bool(item.detach.get('kill')), log, journal)
                 if journal is not None:
                     journal.event('owner_statement', '%s %s (%s)' % (block.step_id, _statement_label(block, item), form))
                 continue
         sql = substitute(item.sql) if substitute else item.sql
+        _first_statement()
         _run_statement(session, sql, block, item, sql != item.sql, journal)
         if journal is not None:
             journal.event('owner_statement', '%s %s' % (block.step_id, _statement_label(block, item)))
@@ -379,7 +398,7 @@ def execute_block(block, session, log, journal=None, substitute=None, open_sessi
 # Names and blocks
 # ---------------------------------------------------------------------------
 def names_for(ctx):
-    """Everything a block needs about the run: names, storage ids, users, layout and settings."""
+    """Everything a block needs about the run: names, storage ids, users, layout, settings and the planned table counts (rollback proof)."""
     journal = ctx.journal
     att = {role: journal.attachment(role) for role in ('source', 'replacement', 'retained', 'live')}
     return {
@@ -391,10 +410,37 @@ def names_for(ctx):
         'partitions': ctx.db.layout.partitions, 'sub_partitions': ctx.db.layout.sub_partitions,
         'runner_user': ctx.config.runner.user, 'owner_user': ctx.config.owner.user if ctx.config.owner else None,
         'freeze_mode': ctx.config.freeze.mode, 'detach_wait_seconds': ctx.config.freeze.detach_wait_seconds,
-        'detach_kill': ctx.config.freeze.detach_kill, 'flexible_parallelism': ctx.config.closeout.flexible_parallelism,
+        'detach_kill': ctx.config.freeze.detach_kill, 'quiet_max_age_seconds': ctx.config.freeze.quiet_max_age_seconds,
+        'flexible_parallelism': ctx.config.closeout.flexible_parallelism,
         'retain_days': ctx.config.closeout.retain_days, 'run_id': ctx.run_id, 'freeze_time': journal.get_meta('freeze_time'),
-        'workspace_id': ctx.config.workspace.get('id'),
+        'workspace_id': ctx.config.workspace.get('id'), 'table_counts': table_counts(journal),
     }
+
+
+def table_counts(journal):
+    """[(table, target_count)] for every planned table of the journal, by name; target_count is None until the O6 count proof."""
+    return [(t['table_name'], t.get('target_count')) for t in sorted(journal.tables(), key=lambda t: t['table_name'])]
+
+
+def withheld_privileges(journal):
+    """The lockout snapshot rows O11 has not given back yet, as {grantee: {scope: [privileges]}} (grants.unrestored_snapshot)."""
+    from . import grants
+    return grants.unrestored_snapshot(journal)
+
+
+def withheld_checks(snapshot, db_name):
+    """[(grantee, scope, sql, params)]: COUNT of the snapshot's write privileges a grantee holds now, per scope (the rollback proof).
+
+    Every count must be 0 until O11 gives the privileges back; a privilege back on the live
+    name means the release began, so the rollback is refused. Issues nothing (reads only).
+    """
+    from . import grants
+    checks = []
+    for user, scopes in sorted(grants.normalize(snapshot).items()):
+        for scope, privs in sorted(scopes.items()):
+            sql, params = grants.privilege_count_check(user, scope, privs, db_name)
+            checks.append((user, scope, sql, params))
+    return checks
 
 
 def placeholders(text):
@@ -418,13 +464,21 @@ def expected_counts(ctx):
 
 
 def block_inputs(ctx):
-    """The journal and capture state every block builder needs: pipelines, grants, counts, capture step, route, release."""
-    from . import grants, pipelines
+    """The journal and capture state every block builder needs: pipelines, grants, counts, capture step, route, release.
+
+    released is True once O11 started releasing writers (switch.writers_released): the
+    rollback block then carries a STOP. grants (the lockout snapshot not given back yet) also
+    feeds the rollback proof's privilege checks and, on Path B, the forward block's S1 privilege
+    checks. s0_problems (switch.s0_journal_problems) puts
+    a STOP at the head of the O10 forward block while S0 would refuse on the journal.
+    """
+    from . import grants, pipelines, switch
     cap = pipelines.capture_for(ctx)
     return {'pipelines': cap['items'], 'capture_step': cap['step'], 'grants': grants.unrestored_snapshot(ctx.journal),
             'counts': expected_counts(ctx), 'route': ctx.config.pipelines.route,
-            'released': bool(ctx.journal.get_meta('released_utc')) or ctx.journal.step_status('O11') in ('running', 'passed'),
-            'app_writes_seen': ctx.journal.get_meta('app_writes_seen')}
+            'released': switch.writers_released(ctx.journal),
+            'app_writes_seen': ctx.journal.get_meta('app_writes_seen'),
+            's0_problems': switch.s0_journal_problems(ctx.journal)}
 
 
 def grantee(user):
@@ -437,12 +491,24 @@ def privileges_count_sql():
     return 'SELECT COUNT(*) AS n FROM information_schema.USER_PRIVILEGES WHERE GRANTEE = %s'
 
 
+def definer_views_sql():
+    """COUNT of the views of a database whose DEFINER is an account name, on any host (parameters: database, user name).
+
+    information_schema.VIEWS gives DEFINER as user@host text, so the user part before the @ is
+    compared. A view whose definer is gone can no longer be executed, so C4 expects 0 for the
+    runner before DROP USER. Issues nothing (reads only).
+    """
+    return "SELECT COUNT(*) AS n FROM information_schema.VIEWS WHERE TABLE_SCHEMA = %s AND SUBSTRING_INDEX(DEFINER, '@', 1) = %s"
+
+
 def account_block(names, drop=False):
-    """P1: CREATE USER and GRANT for the runner; C4 (drop=True): DROP USER and the zero-privilege check."""
+    """P1: CREATE USER and GRANT for the runner; C4 (drop=True): no live view defined by the runner, DROP USER and the zero-privilege check."""
     user = names['runner_user']
     if drop:
         block = Block('C4', 'Remove the migration account')
         block.check('runner account still has privileges', privileges_count_sql(), (grantee(user),), Expect('column_at_least', 'n', 1))
+        block.check('no view in the live database has the runner as its definer', definer_views_sql(), (names['source'], user),
+                    Expect('column_equals', 'n', 0))
         block.statement("DROP USER %s" % grantee(user), 'drop the runner account')
         block.check('zero privileges remain', privileges_count_sql(), (grantee(user),), Expect('column_equals', 'n', 0))
         block.note('Delete the Keychain item that held the runner password.')
@@ -455,17 +521,80 @@ def account_block(names, drop=False):
     return block
 
 
+def attached_otherwise_sql():
+    """COUNT of databases attached under a name with another STORAGE_ID or ATTACH_TYPE (parameters: name, STORAGE_ID, ATTACH_TYPE).
+
+    0 when the name holds the recorded database or nothing, so the C3 identity check also
+    passes on a rerun after that name was dropped. Issues nothing (reads only).
+    """
+    return ('SELECT COUNT(*) AS n FROM information_schema.MV_CLOUD_ATTACHED_DATABASES '
+            'WHERE DATABASE_NAME = %s AND (STORAGE_ID <> %s OR ATTACH_TYPE <> %s)')
+
+
+def attached_elsewhere_sql():
+    """COUNT of attachments of a STORAGE_ID under any other name (parameters: STORAGE_ID, name).
+
+    0 when the recorded database is attached under its own name or nowhere. A positive count
+    means the database was moved or the name in the block is not the recorded one, so C3
+    refuses before any DROP. Issues nothing (reads only).
+    """
+    return 'SELECT COUNT(*) AS n FROM information_schema.MV_CLOUD_ATTACHED_DATABASES WHERE STORAGE_ID = %s AND DATABASE_NAME <> %s'
+
+
+def storage_attached_sql():
+    """COUNT of attachments of a STORAGE_ID under any name (parameter: STORAGE_ID): the C3 gate that the database is gone.
+
+    Issues nothing (reads only).
+    """
+    return 'SELECT COUNT(*) AS n FROM information_schema.MV_CLOUD_ATTACHED_DATABASES WHERE STORAGE_ID = %s'
+
+
+def recorded_absent_sql():
+    """1 unless a name holds the recorded database, else 0 (parameters: name, STORAGE_ID, ATTACH_TYPE): the skip_if of a C3 DROP DATABASE.
+
+    The DROP is skipped when its name holds nothing or another database, so a database that
+    appears under the name after the identity check is never dropped; the checks after the
+    DROP then refuse. Issues nothing (reads only).
+    """
+    return ('SELECT COUNT(*) = 0 AS n FROM information_schema.MV_CLOUD_ATTACHED_DATABASES '
+            'WHERE DATABASE_NAME = %s AND STORAGE_ID = %s AND ATTACH_TYPE = %s')
+
+
 def cleanup_block(names):
-    """C3: drop the retained branch and the replacement after retain_days; the detached original is deleted in the Portal."""
+    """C3: drop the retained branch and the replacement after retain_days; the detached original is deleted in the Portal.
+
+    Issues DROP DATABASE on the retained and replacement names only, each only while its name
+    holds the database the run recorded: the retained branch (STORAGE_ID from O10 S2, READONLY)
+    and the replacement (STORAGE_ID from O5, READWRITE). Both identities are checked before the
+    first DROP: the name holds the recorded database or nothing, and the recorded STORAGE_ID is
+    attached under no other name. The retained check sits directly before its DROP and the
+    replacement is checked again just before its own DROP. Another database under either name,
+    a recorded database under another name, or a name in the block that is not the recorded one
+    stops the block with nothing dropped. A DROP is skipped unless its name holds the recorded
+    database, so a rerun after a partial cleanup finishes it. After each DROP the name must be
+    free and the recorded STORAGE_ID attached nowhere. The live name is checked first and last.
+    """
+    retained = (names['retained'], names['retained_sid'], CLEANUP_ATTACH_TYPES['retained'])
+    replacement = (names['replacement'], names['replacement_sid'], CLEANUP_ATTACH_TYPES['replacement'])
+    replacement_label = 'the recorded replacement %s, or nothing' % replacement[2]
     block = Block('C3', 'Retention cleanup')
     block.note('Run only after %s retention days have passed since O11 and the customer has accepted the live database.' % names['retain_days'])
     block.check('live name resolves to the live branch', inventory_attachment_sql(), (names['source'],), Expect('column_equals', 'STORAGE_ID', names['live_sid']))
-    block.check('retained attached', inventory_attachment_sql(), (names['retained'],), Expect('some_rows'))
-    block.statement('DROP DATABASE %s' % ident(names['retained']), 'drop the retained read-only branch')
+    block.check('replacement name holds ' + replacement_label, attached_otherwise_sql(), replacement, Expect('column_equals', 'n', 0))
+    block.check('recorded replacement attached under no other name', attached_elsewhere_sql(), (replacement[1], replacement[0]),
+                Expect('column_equals', 'n', 0))
+    block.check('recorded retained branch attached under no other name', attached_elsewhere_sql(), (retained[1], retained[0]),
+                Expect('column_equals', 'n', 0))
+    block.check('retained name holds the recorded retained branch %s, or nothing' % retained[2], attached_otherwise_sql(), retained,
+                Expect('column_equals', 'n', 0))
+    block.statement('DROP DATABASE %s' % ident(names['retained']), 'drop the retained read-only branch', skip_if=(recorded_absent_sql(), retained))
     block.check('retained is gone', inventory_attachment_sql(), (names['retained'],), Expect('no_rows'))
-    block.check('replacement attached under its own name', inventory_attachment_sql(), (names['replacement'],), Expect('some_rows'))
-    block.statement('DROP DATABASE %s' % ident(names['replacement']), 'drop the replacement (the live branch is independent of it)')
+    block.check('recorded retained branch attached nowhere', storage_attached_sql(), (retained[1],), Expect('column_equals', 'n', 0))
+    block.check('replacement name still holds ' + replacement_label, attached_otherwise_sql(), replacement, Expect('column_equals', 'n', 0))
+    block.statement('DROP DATABASE %s' % ident(names['replacement']), 'drop the replacement (the live branch is independent of it)',
+                    skip_if=(recorded_absent_sql(), replacement))
     block.check('replacement is gone', inventory_attachment_sql(), (names['replacement'],), Expect('no_rows'))
+    block.check('recorded replacement attached nowhere', storage_attached_sql(), (replacement[1],), Expect('column_equals', 'n', 0))
     block.check('live name still resolves to the live branch', inventory_attachment_sql(), (names['source'],), Expect('column_equals', 'STORAGE_ID', names['live_sid']))
     block.note('Delete the detached original storage %s in the Portal by STORAGE_ID. Keep the evidence folder.' % names['source_sid'])
     return block
@@ -478,11 +607,12 @@ def inventory_attachment_sql():
 
 
 def block_for(step_id, names, config=None, rollback=False, pipelines=None, grants=None, counts=None, capture_step=None, route='kit',
-              released=False, app_writes_seen=None):
+              released=False, app_writes_seen=None, s0_problems=None):
     """The Block for an admin step id (O2, O3, O9, O10, O11, C3, C4, P1); O10 with rollback=True gives R1 to R3.
 
     The keyword inputs come from block_inputs(ctx); O3 gives the Path B lockout plan when
-    freeze.mode is lockout.
+    freeze.mode is lockout; the O10 forward block starts with a STOP while s0_problems is not empty,
+    and on Path B checks before S1 that no account holds again the write privileges the lockout took (the snapshot not given back).
     """
     from . import freeze, lockout, pipelines as pipeline_module, switch
     key = str(step_id).upper()
@@ -504,16 +634,81 @@ def block_for(step_id, names, config=None, rollback=False, pipelines=None, grant
         return pipeline_module.replay_block(names, pipelines or [], capture_step)
     if key == 'O10':
         if rollback:
-            return switch.rollback_block(names, released=released, app_writes_seen=app_writes_seen)
-        return switch.forward_block(names, counts)
+            return switch.rollback_block(names, released=released, app_writes_seen=app_writes_seen, withheld=grants)
+        return switch.forward_block(names, counts, s0_problems, withheld=grants)
     if key == 'O11':
         return pipeline_module.release_block(names, pipelines or [], grants or {}, config)
     raise KitError('%s is not an admin step with an owner SQL block (owner-sql covers %s)' % (step_id, ', '.join(steps.OWNER_SQL_STEPS)))
 
 
-def owner_sql_path(ctx, step_id, rollback=False):
-    """customer/runs/<run>/<db>/owner-sql/<step>.sql."""
-    return ctx.config.runs_dir() / (ctx.run_id or 'dry-run') / ctx.db.source / 'owner-sql' / ('%s%s.sql' % (step_id, '-rollback' if rollback else ''))
+def companion_blocks(step_id, names, config=None, rollback=False):
+    """The blocks printed beside a step's block, as (variant, Block): O3 Path A has the re-entry block (O3-reentry).
+
+    owner-sql opens no session, so it cannot see whether an earlier run stopped between DETACH
+    and ATTACH; it writes both blocks, and the checks of each refuse the wrong state.
+    """
+    from . import freeze
+    if str(step_id).upper() == 'O3' and not rollback and (config is None or config.freeze.mode != 'lockout'):
+        return [('reentry', freeze.reentry_block(names))]
+    return []
+
+
+def owner_sql_path(ctx, step_id, rollback=False, variant=None):
+    """customer/runs/<run>/<db>/owner-sql/<step>.sql (<step>-rollback.sql, or <step>-<variant>.sql for a companion block)."""
+    suffix = '-rollback' if rollback else ('-%s' % variant if variant else '')
+    return ctx.config.runs_dir() / (ctx.run_id or 'dry-run') / ctx.db.source / 'owner-sql' / ('%s%s.sql' % (step_id, suffix))
+
+
+def notebook_paths(ctx):
+    """The owner notebooks owner-notebook wrote for the run that can hold this database: owner-steps.ipynb and owner-steps-<db>.ipynb."""
+    run_dir = ctx.config.runs_dir() / (ctx.run_id or 'dry-run')
+    return [p for p in (run_dir / 'owner-steps.ipynb', run_dir / ('owner-steps-%s.ipynb' % ctx.db.source)) if p.is_file()]
+
+
+def retire_o10_blocks(ctx, tables, reason):
+    """Rewrite the O10 block files already written for this database so that neither can run; returns the lines to log.
+
+    Called just before the journal reopens the copy evidence of tables (mark-recopy, an O7 or O8
+    re-copy mark, a fresh-table load). The forward block gets a STOP naming reason, since the
+    reopen is not in the journal yet; the rollback block is built with the target counts of
+    tables cleared, as the reopen clears them, so it stops too. Written before the journal write,
+    a crash after it never leaves a block without a STOP; a crash before the journal write leaves
+    a STOP on an unchanged copy, and owner-sql O10 writes a valid block again. A block that cannot
+    be built is replaced by a STOP alone. A notebook holds its blocks from when it was generated
+    and an uploaded copy is out of reach, so the last line says not to run its O10 cells, when a
+    notebook of the run exists or S0's journal part passed until now (a notebook generated then has
+    no STOP). A dry run writes nothing. Issues nothing (files only).
+    """
+    from . import switch
+    if ctx.dry_run or not ctx.journal_path:
+        return []
+    open_until_now = not switch.s0_journal_problems(ctx.journal)
+    lines = []
+    for rollback in (False, True):
+        path = owner_sql_path(ctx, 'O10', rollback=rollback)
+        if not path.is_file():
+            continue
+        try:
+            names, inputs = names_for(ctx), block_inputs(ctx)
+            if rollback:
+                names['table_counts'] = [(t, None if t in tables else n) for t, n in names['table_counts']]
+            else:
+                inputs['s0_problems'] = list(inputs['s0_problems']) + [reason]
+            block = block_for('O10', names, ctx.config, rollback=rollback, **inputs)
+            guard_check_block(block, ctx)
+        except KitError:
+            block = Block('O10', 'Rollback R1 to R3 (before O11 only)' if rollback else 'Switch forward')
+            block.refuse('%s; this block was written before that and cannot be built again now; generate it again with s2rebuild '
+                         'owner-sql O10%s' % (reason, ' --rollback' if rollback else ''))
+        write_block(block, path)
+        lines.append('O10 %s block %s rewritten with a STOP: %s' % ('rollback' if rollback else 'forward', path,
+                                                                  block.refusals[0] if block.refusals else reason))
+    notebooks = notebook_paths(ctx)
+    if notebooks or open_until_now:
+        lines.append('owner notebook: a notebook generated before now must not run its O10 cells, forward or rollback%s; after O8 passes '
+                     'again, generate it again with s2rebuild owner-notebook and use only the new one' % (
+                         ' (%s)' % ', '.join(str(p) for p in notebooks) if notebooks else ''))
+    return lines
 
 
 def print_block(block, ctx, path=None):
@@ -546,14 +741,18 @@ def refuse_placeholders(block):
                        'retained and live at O10)' % (block.step_id, ', '.join(m.strip('<>') for m in missing)))
 
 
-def handle_admin(step, ctx, block, after=None, substitute=None):
+def handle_admin(step, ctx, block, after=None, substitute=None, before_first_statement=None, path=None):
     """Shared admin step flow: print the block; execute it with the owner profile when configured; else wait for the gate.
 
-    after(results) runs after a successful execution (python postconditions such as the write
-    probe or recording freeze_time). Returns the step Outcome.
+    before_first_statement() goes to execute_block: it runs inside the open owner session once
+    every check ahead of the first statement passed, just before that statement (O11 records
+    release_started_utc there). after(results) runs after a successful execution (python
+    postconditions such as the write probe or recording freeze_time). path overrides the block
+    file (the O3 re-entry block goes to owner-sql/O3-reentry.sql). Returns the step Outcome.
     """
     guard_check_block(block, ctx)
-    path = owner_sql_path(ctx, step.id, rollback=(block.title.lower().startswith('rollback')))
+    if path is None:
+        path = owner_sql_path(ctx, step.id, rollback=(block.title.lower().startswith('rollback')))
     print_block(block, ctx, path)
     if ctx.dry_run or not ctx.owner_configured:
         lines = ['identity: %s' % step.identity_label,
@@ -566,7 +765,8 @@ def handle_admin(step, ctx, block, after=None, substitute=None):
     guard = steps.guard_for(step.id, ctx.db, steps.OWNER)
     session = ctx.owner_session(guard)
     try:
-        results = execute_block(block, session, ctx.log, ctx.journal, substitute, open_session=ctx.owner_session, guard=guard)
+        results = execute_block(block, session, ctx.log, ctx.journal, substitute, open_session=ctx.owner_session, guard=guard,
+                                before_first_statement=before_first_statement)
     finally:
         session.close()
     if after is not None:
@@ -589,7 +789,7 @@ def handle_c3(step, ctx):
 
 
 def handle_c4(step, ctx):
-    """C4 handler: DROP USER for the runner and the zero-privilege check."""
+    """C4 handler: the check that no view in the live database has the runner as its definer, DROP USER and the zero-privilege check."""
     return handle_admin(step, ctx, account_block(names_for(ctx), drop=True))
 
 

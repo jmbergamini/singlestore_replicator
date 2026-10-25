@@ -15,6 +15,7 @@ IDENT = re.compile(r'^[A-Za-z0-9_]+$')
 _BT = r'`([A-Za-z0-9_]+)`'
 _QUAL = _BT + r'\.' + _BT
 _ID_LITERAL = r"'[A-Za-z0-9_-]+'"
+_DEFINER_CLAUSE = r"(?:DEFINER ?= ?(?:`[^`]*`|'[^']*')@(?:`[^`]*`|'[^']*') )?"
 
 READ_KINDS = frozenset({'SELECT', 'SHOW', 'EXPLAIN', 'DESCRIBE', 'SET SESSION'})
 RUNNER_KINDS = frozenset({'CREATE DATABASE', 'CREATE TABLE', 'INSERT', 'DELETE', 'CREATE VIEW',
@@ -205,12 +206,15 @@ def classify(sql):
     m = _match(r'DELETE FROM ' + _QUAL + r'(?: |$)', text)
     if m:
         return Statement('DELETE', (m.group(1),), m.group(2), text)
-    m = _match(r'CREATE (?:OR REPLACE )?(?:ALGORITHM=[A-Za-z]+ )?(?:SCHEMA_BINDING=(?:ON|OFF) )?(?:SQL SECURITY [A-Za-z]+ )?VIEW ' + _QUAL + r'(?: |$)', text)
+    # a DEFINER clause names an account, never a database: the captured `user`@`host` form or 'user'@'host'
+    m = _match(r'CREATE (?:OR REPLACE )?(?:ALGORITHM=[A-Za-z]+ )?' + _DEFINER_CLAUSE + r'(?:SCHEMA_BINDING=(?:ON|OFF) )?(?:SQL SECURITY [A-Za-z]+ )?VIEW '
+               + _QUAL + r'(?: |$)', text)
     if m:
         return Statement('CREATE VIEW', (m.group(1),), m.group(2), text)
-    m = _match(r'AGGREGATOR SYNC AUTO_INCREMENT ON ' + _QUAL + r'$', text)
+    # ALL runs the sync on every aggregator; without it only the aggregator of the session syncs
+    m = _match(r'AGGREGATOR SYNC AUTO_INCREMENT ON ' + _QUAL + r'( ALL)?$', text)
     if m:
-        return Statement('AGGREGATOR SYNC AUTO_INCREMENT', (m.group(1),), m.group(2), text)
+        return Statement('AGGREGATOR SYNC AUTO_INCREMENT', (m.group(1),), 'ALL' if m.group(3) else '', text)
     m = _match(r'(CREATE(?: OR REPLACE)?(?: AGGREGATOR)?|ALTER|STOP|START|DROP) PIPELINE (?:' + _QUAL + '|' + _BT + r')(?: |$)', text)
     if m:
         verb = m.group(1).upper().split(' ')[0]
@@ -283,6 +287,8 @@ class Guard:
             raise GuardError('%s guard refuses %s' % (self.name, st.kind))
         if st.kind == 'ALTER TABLE' and st.detail not in ('AUTO_INCREMENT', 'RENAME'):
             raise GuardError('%s guard refuses ALTER TABLE other than AUTO_INCREMENT or RENAME TO' % self.name)
+        if st.kind == 'AGGREGATOR SYNC AUTO_INCREMENT' and st.detail != 'ALL':
+            raise GuardError('%s guard refuses AGGREGATOR SYNC AUTO_INCREMENT without ALL' % self.name)
         if st.kind == 'DETACH DATABASE' and st.detail == 'FORCE':
             raise GuardError('DETACH DATABASE FORCE is never issued by the kit')
         want = self.required_detail.get(st.kind)

@@ -6,7 +6,30 @@ Rows live in Python lists; hash-bucket predicates are evaluated with zlib.crc32 
 form of each value, which matches the server's CRC32 for the values the tests use. Fault
 injection: fail_insert[(table, predicate)] = 'before' | 'after' | 'lock'; lock_tables holds
 (database, table) pairs whose INSERT and DELETE raise error 1205 until removed; the crash hook
-of the runner stands in for kill -9.
+of the runner stands in for kill -9. fail_statement(pattern, when) fails any statement: 'before'
+raises before the server sees it, 'after' raises once the server applied it (the client lost the
+reply); crash=True raises SimulatedCrash instead of a lost connection. The third failure point,
+after the statement and before the journal update, is tests.helpers.crash_journal.
+fail_connect(user) fails the next connection opened for user (the server unreachable as a
+session opens). change_before(pattern, action) changes the state just before a matching
+statement reaches the server (another actor between two reads of the kit). deny(user, pattern)
+refuses matching statements on that account's connections with error 1142 (a missing privilege).
+admin_only_storage holds STORAGE_IDs whose attachment and branch rows only the admin sees (an
+account without privileges on another database). DROP DATABASE of a name that is neither
+attached nor created raises error 1008, as the server does, so a second DROP of the same name
+shows up as a failure (it is still listed in writes). The capture reads of P3 and O4 (objects,
+routines, columns, keys, row estimates, sizes) are answered from the tables, so a live profile
+can run on the fake through the command line (tests.helpers.fake_driver). CREATE VIEW records
+the definer (its DEFINER clause, else the account of the connection) and raises error 1146 when
+its body reads a table or view that does not exist yet; information_schema.VIEWS answers DEFINER
+as user@host text. information_schema.TABLES lists tables and views by name, and SHOW CREATE
+VIEW answers in the server form: the view name unqualified, the recorded definer as a DEFINER
+clause, and the body as it was created. AGGREGATOR SYNC AUTO_INCREMENT ... ALL records the
+table's counter as the one every aggregator holds (synced_counter, and the name in synced); the
+form without ALL syncs only the aggregator of the session, so it changes neither. aggregators =
+N spreads the connections over N aggregators (connection id modulo N); a processlist row with an
+AGGREGATOR value is listed and killed only from a connection on that aggregator, since thread
+ids are per aggregator.
 """
 import re
 import threading
@@ -31,6 +54,33 @@ class LockWait(Exception):
 
 class SimulatedCrash(BaseException):
     """Stands in for kill -9: not an Exception, so the worker cannot journal it."""
+
+
+class FakeView(str):
+    """The CREATE VIEW text the fake stored, with the definer the server records (user@host)."""
+
+    def __new__(cls, text, definer):
+        obj = super().__new__(cls, text)
+        obj.definer = definer
+        return obj
+
+
+def view_definer(view):
+    """The user@host definer of a stored view: the one recorded at CREATE, else the DEFINER clause of its text, else None."""
+    if getattr(view, 'definer', None):
+        return view.definer
+    m = re.search(r"DEFINER ?= ?[`']([^`']*)[`']@[`']([^`']*)[`']", str(view))
+    return '%s@%s' % m.groups() if m else None
+
+
+def show_create_view(name, view):
+    """The SHOW CREATE VIEW text of a stored view: CREATE ALGORITHM=UNDEFINED DEFINER=`u`@`h` SQL SECURITY DEFINER VIEW `name` AS body."""
+    m = re.search(r'VIEW (?:`[^`]+`\.)?`[^`]+` AS (.*)$', str(view))
+    if not m:
+        return str(view)
+    definer = view_definer(view)
+    clause = 'DEFINER=`%s`@`%s` ' % tuple(definer.split('@', 1)) if definer and '@' in definer else ''
+    return 'CREATE ALGORITHM=UNDEFINED %sSQL SECURITY DEFINER VIEW `%s` AS %s' % (clause, name, m.group(1))
 
 
 def mysql_str(v):
@@ -129,6 +179,9 @@ class FakeCursor:
     def execute(self, sql, args=None):
         args = tuple(args) if args else ()
         s = ' '.join(sql.split())
+        self.db.run_changes(s)
+        self.db.fault(s, 'before')
+        self.db.check_denied(s, self.conn.user)
         if self.db.insert_delay and s.startswith('INSERT INTO'):
             time.sleep(self.db.insert_delay)
         m = re.match(r'DETACH DATABASE `([^`]+)`$', s)
@@ -143,7 +196,12 @@ class FakeCursor:
             raise FakeDisconnect(1317, 'Query execution was interrupted')
         with self.db.lock:
             self.db.statements.append((s, args))
-            return self._execute(s, args)
+            self._execute(s, args)
+        self.db.fault(s, 'after')
+
+    def _sees_storage(self, row):
+        """The attachment and branch views hide the rows of admin_only_storage from every account but the admin."""
+        return self.conn.is_admin or row.get('STORAGE_ID') not in self.db.admin_only_storage
 
     def _sees_grantee(self, grantee):
         """The privilege views show other accounts only to the admin (section 5)."""
@@ -163,7 +221,7 @@ class FakeCursor:
                 and (pipeline is None or o['PIPELINE_NAME'] == pipeline)]
 
     def _processlist(self, s, args):
-        rows = list(self.db.processlist)
+        rows = [r for r in self.db.processlist if r.get('AGGREGATOR', self.conn.aggregator) == self.conn.aggregator]
         if 'WHERE' in s and args:
             needle = str(args[1]).strip('%') if len(args) > 1 else None
             rows = [r for r in rows if r.get('DB') == args[0] or (needle and needle in str(r.get('INFO') or ''))]
@@ -263,7 +321,8 @@ class FakeCursor:
             tdb, tt, sdb, st = m.groups()
             src = db.databases[sdb]['tables'][st]
             create = src['create'].replace('`%s`' % st, '`%s`' % tt, 1) if tt != st else src['create']
-            db.databases[tdb]['tables'][tt] = {'create': create, 'rows': [], 'auto_increment': src.get('auto_increment')}
+            # Helios fact 14: LIKE copies the AUTO_INCREMENT attribute but not the counter
+            db.databases[tdb]['tables'][tt] = {'create': create, 'rows': [], 'auto_increment': None}
             return
         m = re.match(r'SHOW CREATE TABLE `([^`]+)`\.`([^`]+)`$', s)
         if m:
@@ -275,6 +334,8 @@ class FakeCursor:
             return
         m = re.match(r'SELECT COUNT\(\*\) AS n FROM `([^`]+)`\.`([^`]+)`(?: WHERE (.*))?$', s)
         if m:
+            if m.group(1) not in db.databases:
+                raise FakeDisconnect(1049, "Unknown database '%s'" % m.group(1))
             t = db.databases[m.group(1)]['tables'][m.group(2)]
             pred = m.group(3)
             self.rows = [{'n': sum(1 for r in t['rows'] if pred is None or evaluate_predicate(pred, r))}]
@@ -376,25 +437,72 @@ class FakeCursor:
             db.writes.append(s)
             db.databases[m.group(1)]['tables'][m.group(2)]['auto_increment'] = int(m.group(3))
             return
-        m = re.match(r'AGGREGATOR SYNC AUTO_INCREMENT ON `([^`]+)`\.`([^`]+)`$', s)
+        m = re.match(r'AGGREGATOR SYNC AUTO_INCREMENT ON `([^`]+)`\.`([^`]+)`( ALL)?$', s)
         if m:
             db.writes.append(s)
-            db.synced.append(m.group(2))
+            if m.group(3):  # every aggregator takes the counter; without ALL only the session's aggregator syncs
+                t = db.databases[m.group(1)]['tables'][m.group(2)]
+                t['synced_counter'] = t.get('auto_increment')
+                db.synced.append(m.group(2))
             return
-        m = re.match(r'CREATE VIEW `([^`]+)`\.`([^`]+)` AS (.*)$', s)
+        m = re.match(r"CREATE (?:ALGORITHM=\w+ )?(?:DEFINER ?= ?(`[^`]*`|'[^']*')@(`[^`]*`|'[^']*') )?(?:SCHEMA_BINDING=\w+ )?"
+                     r"(?:SQL SECURITY \w+ )?VIEW `([^`]+)`\.`([^`]+)` AS (.*)$", s)
         if m:
             db.writes.append(s)
-            if self.conn.current_db != m.group(1):
+            user, host, vdb, name, body = m.groups()
+            if self.conn.current_db != vdb:
                 raise FakeDisconnect('view body resolves against the current database; USE the replacement first')
-            db.databases[m.group(1)]['views'][m.group(2)] = s
+            for qual, ref in re.findall(r'\b(?:FROM|JOIN)\s+(?:`([^`]+)`\.)?`([^`]+)`', body, re.I):
+                target = db.databases.get(qual or vdb) or {'tables': {}, 'views': {}}
+                if ref not in target['tables'] and ref not in target['views']:
+                    raise FakeDisconnect(1146, "Table '%s.%s' doesn't exist" % (qual or vdb, ref))
+            definer = '%s@%s' % (user.strip("`'"), host.strip("`'")) if user else '%s@%%' % (self.conn.user or db.current_user)
+            db.databases[vdb]['views'][name] = FakeView(s, definer)
+            return
+        m = re.match(r'SELECT DEFINER FROM information_schema\.VIEWS WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s$', s)
+        if m:
+            d = db.databases.get(args[0])
+            self.rows = [{'DEFINER': view_definer(d['views'][args[1]])}] if d and args[1] in d['views'] else []
+            return
+        if s == 'SELECT TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA = %s ORDER BY TABLE_NAME':
+            d = db.databases.get(args[0]) or {'tables': {}, 'views': {}}
+            objects = [(t, 'BASE TABLE') for t in d['tables']] + [(v, 'VIEW') for v in d['views']]
+            self.rows = [{'TABLE_NAME': n, 'TABLE_TYPE': kind} for n, kind in sorted(objects)]
+            return
+        m = re.match(r'SHOW CREATE VIEW `([^`]+)`\.`([^`]+)`$', s)
+        if m:
+            view = db.databases[m.group(1)]['views'][m.group(2)]
+            self.rows = [{'View': m.group(2), 'Create View': show_create_view(m.group(2), view)}]
+            return
+        m = re.match(r"SELECT COUNT\(\*\) AS n FROM information_schema\.VIEWS WHERE TABLE_SCHEMA = %s AND SUBSTRING_INDEX\(DEFINER, '@', 1\) = %s$", s)
+        if m:
+            d = db.databases.get(args[0])
+            self.rows = [{'n': sum(1 for v in (d['views'].values() if d else ()) if str(view_definer(v)).split('@', 1)[0] == args[1])}]
             return
         m = re.match(r'SELECT DATABASE_NAME, ATTACH_TYPE, STORAGE_ID, COMPUTE_ID, ATTACH_SYNTAX FROM information_schema\.MV_CLOUD_ATTACHED_DATABASES WHERE DATABASE_NAME = %s$', s)
         if m:
-            self.rows = [dict(a) for a in db.attachments if a['DATABASE_NAME'] == args[0]]
+            self.rows = [dict(a) for a in db.attachments if a['DATABASE_NAME'] == args[0] and self._sees_storage(a)]
+            return
+        m = re.match(r'SELECT COUNT\(\*\) AS n FROM information_schema\.MV_CLOUD_ATTACHED_DATABASES WHERE DATABASE_NAME = %s '
+                     r'AND \(STORAGE_ID <> %s OR ATTACH_TYPE <> %s\)$', s)
+        if m:
+            self.rows = [{'n': sum(1 for a in db.attachments if a['DATABASE_NAME'] == args[0] and self._sees_storage(a)
+                                   and (a['STORAGE_ID'] != args[1] or a['ATTACH_TYPE'] != args[2]))}]
+            return
+        m = re.match(r'SELECT COUNT\(\*\) = 0 AS n FROM information_schema\.MV_CLOUD_ATTACHED_DATABASES '
+                     r'WHERE DATABASE_NAME = %s AND STORAGE_ID = %s AND ATTACH_TYPE = %s$', s)
+        if m:
+            self.rows = [{'n': int(not any(a['DATABASE_NAME'] == args[0] and a['STORAGE_ID'] == args[1] and a['ATTACH_TYPE'] == args[2]
+                                           and self._sees_storage(a) for a in db.attachments))}]
+            return
+        m = re.match(r'SELECT COUNT\(\*\) AS n FROM information_schema\.MV_CLOUD_ATTACHED_DATABASES WHERE STORAGE_ID = %s( AND DATABASE_NAME <> %s)?$', s)
+        if m:
+            self.rows = [{'n': sum(1 for a in db.attachments if a['STORAGE_ID'] == args[0] and self._sees_storage(a)
+                                   and (not m.group(1) or a['DATABASE_NAME'] != args[1]))}]
             return
         m = re.match(r'SELECT STORAGE_ID, DATABASE_NAME, IS_DETACHED, .* FROM information_schema\.MV_CLOUD_BRANCHES WHERE STORAGE_ID = %s$', s)
         if m:
-            self.rows = [dict(b) for b in db.branches if b['STORAGE_ID'] == args[0]]
+            self.rows = [dict(b) for b in db.branches if b['STORAGE_ID'] == args[0] and self._sees_storage(b)]
             return
         m = re.match(r'DETACH DATABASE `([^`]+)`( KILL)?$', s)
         if m:
@@ -470,6 +578,8 @@ class FakeCursor:
         if m:
             db.writes.append(s)
             att = db.attachment(m.group(1))
+            if att is None and m.group(1) not in db.databases:
+                raise FakeDisconnect(1008, "Can't drop database '%s'; database doesn't exist" % m.group(1))
             if att is not None:
                 db.attachments.remove(att)
             db.databases.pop(m.group(1), None)
@@ -492,8 +602,8 @@ class FakeCursor:
         if s.startswith('SELECT PIPELINE_NAME, STATE FROM information_schema.PIPELINES WHERE DATABASE_NAME = %s'):
             self.rows = [{'PIPELINE_NAME': p['PIPELINE_NAME'], 'STATE': p['STATE']} for p in self._pipes(args[0])]
             return
-        if s == "SELECT COUNT(*) AS n FROM information_schema.PIPELINES WHERE DATABASE_NAME = %s AND PIPELINE_NAME = %s AND STATE <> 'Running'":
-            self.rows = [{'n': sum(1 for p in self._pipes(args[0]) if p['PIPELINE_NAME'] == args[1] and p['STATE'] != 'Running')}]
+        if s == "SELECT COUNT(*) AS n FROM information_schema.PIPELINES WHERE DATABASE_NAME = %s AND PIPELINE_NAME = %s AND STATE = 'Stopped'":
+            self.rows = [{'n': sum(1 for p in self._pipes(args[0]) if p['PIPELINE_NAME'] == args[1] and p['STATE'] == 'Stopped')}]
             return
         if s == "SELECT COUNT(*) AS n FROM information_schema.PIPELINES WHERE DATABASE_NAME = %s AND PIPELINE_NAME = %s AND STATE = 'Running'":
             self.rows = [{'n': sum(1 for p in self._pipes(args[0]) if p['PIPELINE_NAME'] == args[1] and p['STATE'] == 'Running')}]
@@ -510,10 +620,9 @@ class FakeCursor:
         if s.startswith('SELECT PIPELINE_NAME, SOURCE_TYPE, SOURCE_PARTITION_ID'):
             self.rows = [dict(o) for o in self._offsets(args[0])]
             return
-        if s.startswith('SELECT COUNT(*) AS partitions, SUM(LATEST_LOADED_OFFSET) AS loaded FROM information_schema.PIPELINES_OFFSETS'):
-            rows = self._offsets(args[0], args[1])
-            loaded = [o['LATEST_LOADED_OFFSET'] for o in rows if o.get('LATEST_LOADED_OFFSET') is not None]
-            self.rows = [{'partitions': len(rows), 'loaded': sum(loaded) if loaded else None}]
+        if s.startswith('SELECT LATEST_SUCCESSFUL_OFFSET AS successful, LATEST_LOADED_OFFSET AS loaded FROM information_schema.PIPELINES_OFFSETS'):
+            self.rows = [{'successful': o.get('LATEST_SUCCESSFUL_OFFSET'), 'loaded': o.get('LATEST_LOADED_OFFSET')}
+                         for o in self._offsets(args[0], args[1]) if str(o['SOURCE_PARTITION_ID']) == str(args[2])]
             return
         m = re.match(r'SELECT COUNT\(\*\) AS n FROM information_schema\.PIPELINES_OFFSETS WHERE DATABASE_NAME = %s AND PIPELINE_NAME = %s '
                      r'AND SOURCE_PARTITION_ID IN \(', s)
@@ -610,7 +719,7 @@ class FakeCursor:
             db.writes.append(s)
             tid = int(m.group(1))
             before = len(db.processlist)
-            db.processlist = [r for r in db.processlist if int(r['ID']) != tid]
+            db.processlist = [r for r in db.processlist if int(r['ID']) != tid or r.get('AGGREGATOR', self.conn.aggregator) != self.conn.aggregator]
             if len(db.processlist) == before:
                 raise FakeDisconnect(1094, 'Unknown thread id: %d' % tid)
             db.killed.append(tid)
@@ -666,7 +775,57 @@ class FakeCursor:
             d = db.databases.get(args[0])
             self.rows = [{'n': len(d['views']) if d else 0}]
             return
+        if s == 'SELECT ROUTINE_NAME, ROUTINE_TYPE FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA = %s ORDER BY ROUTINE_NAME':
+            self.rows = sorted(({'ROUTINE_NAME': r['ROUTINE_NAME'], 'ROUTINE_TYPE': r['ROUTINE_TYPE']} for r in db.routines
+                                if r.get('ROUTINE_SCHEMA', db.source) == args[0]), key=lambda r: r['ROUTINE_NAME'])
+            return
+        if self._capture(s, args):
+            return
         raise AssertionError('fake database does not understand: ' + s)
+
+    def _capture(self, s, args):
+        """The P3 and O4 capture reads (inventory.capture): objects, routines, columns and keys parsed from each CREATE TABLE
+        text, row estimates (the row count), sizes (none), SHOW CREATE VIEW. Returns True when s is one of them."""
+        db = self.db
+        d = db.databases.get(args[0]) if args else None
+        if s.startswith('SELECT TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA = %s'):
+            objects = [(t, 'BASE TABLE') for t in (d['tables'] if d else {})] + [(v, 'VIEW') for v in (d['views'] if d else {})]
+            self.rows = [{'TABLE_NAME': name, 'TABLE_TYPE': kind} for name, kind in sorted(objects)]
+            return True
+        if s.startswith('SELECT ROUTINE_NAME, ROUTINE_TYPE FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA = %s'):
+            self.rows = [dict(r) for r in db.routines if r.get('ROUTINE_SCHEMA', db.source) == args[0]]
+            return True
+        if s.startswith('SELECT TABLE_NAME, COLUMN_NAME, ORDINAL_POSITION') and 'information_schema.COLUMNS' in s:
+            self.rows = []
+            for table, spec in sorted((d['tables'] if d else {}).items()):
+                lines = [m for m in (re.match(r'\s*`([^`]+)` (\S+)(.*)$', line) for line in spec['create'].splitlines()) if m]
+                for i, m in enumerate(lines, 1):
+                    rest = m.group(3).upper()
+                    self.rows.append({'TABLE_NAME': table, 'COLUMN_NAME': m.group(1), 'ORDINAL_POSITION': i, 'COLUMN_DEFAULT': None,
+                                      'IS_NULLABLE': 'NO' if 'NOT NULL' in rest else 'YES', 'DATA_TYPE': m.group(2).split('(')[0],
+                                      'COLUMN_TYPE': m.group(2), 'EXTRA': 'auto_increment' if 'AUTO_INCREMENT' in rest else '',
+                                      'GENERATION_EXPRESSION': ''})
+            return True
+        if s.startswith('SELECT TABLE_NAME, NON_UNIQUE, INDEX_NAME') and 'information_schema.STATISTICS' in s:
+            self.rows = []
+            for table, spec in sorted((d['tables'] if d else {}).items()):
+                key = re.search(r'PRIMARY KEY \(([^)]*)\)', spec['create'])
+                for i, column in enumerate(re.findall(r'`([^`]+)`', key.group(1)) if key else [], 1):
+                    self.rows.append({'TABLE_NAME': table, 'NON_UNIQUE': 0, 'INDEX_NAME': 'PRIMARY', 'SEQ_IN_INDEX': i, 'COLUMN_NAME': column,
+                                      'INDEX_TYPE': 'HASH'})
+            return True
+        if s.startswith('SELECT TABLE_NAME, SUM(ROWS) AS estimated_rows FROM information_schema.TABLE_STATISTICS'):
+            self.rows = [{'TABLE_NAME': t, 'estimated_rows': len(spec['rows'])} for t, spec in sorted((d['tables'] if d else {}).items())]
+            return True
+        if s.startswith('SELECT f.TABLE_NAME, SUM(f.SIZE)'):
+            self.rows = []
+            return True
+        m = re.match(r'SHOW CREATE VIEW `([^`]+)`\.`([^`]+)`$', s)
+        if m:
+            view = db.databases[m.group(1)]['views'][m.group(2)]
+            self.rows = [{'View': m.group(2), 'Create View': view if isinstance(view, str) else str(view)}]
+            return True
+        return False
 
 
 class FakeConn:
@@ -675,6 +834,7 @@ class FakeConn:
         self.user = user
         self.is_admin = user is None or user in db.admin_users
         self.id = db.next_connection_id()
+        self.aggregator = self.id % db.aggregators
         self.kill_event = threading.Event()
         self.lock_wait_timeout = 60
         self.current_db = None
@@ -707,6 +867,7 @@ class FakeDB:
                            for p in ('SELECT', 'INSERT', 'DELETE', 'CREATE', 'DROP', 'ALTER', 'CREATE DATABASE', 'DROP DATABASE', 'PROCESS',
                                      'CREATE VIEW', 'SHOW VIEW')]
         self.processlist = []
+        self.aggregators = 1
         self.schema_privileges = []
         self.table_privileges = []
         self.admin_users = {'ops_owner', 'admin'}
@@ -720,6 +881,7 @@ class FakeDB:
         self.pipeline_offsets = []
         self.pipeline_errors = []
         self.pipeline_batches = []
+        self.routines = []  # {'ROUTINE_NAME', 'ROUTINE_TYPE', optional 'ROUTINE_SCHEMA' (default the source)}
         self.killed = []
         self.users = set()
         self.globals = {}
@@ -732,8 +894,74 @@ class FakeDB:
             name: {'create': spec['create'], 'rows': [dict(r) for r in spec.get('rows', [])], 'auto_increment': spec.get('auto_increment')}
             for name, spec in tables.items()}, 'views': dict(views or {})}}
         self.connections = []
+        self.faults = []
+        self.faults_fired = []
+        self.connect_faults = []
+        self.changes = []
+        self.denials = []
+        self.admin_only_storage = set()
+
+    def fail_statement(self, pattern, when='before', crash=False, times=1):
+        """Fail the next statement matching pattern (a regular expression searched in the normalized text).
+
+        when 'before': the server never sees the statement. when 'after': the server applied it
+        and the client lost the reply. crash=True raises SimulatedCrash (kill -9) instead of a
+        lost connection. The fault fires at most times times; faults_fired lists what fired.
+        """
+        if when not in ('before', 'after'):
+            raise AssertionError('when is before or after, not %r' % when)
+        self.faults.append({'pattern': re.compile(pattern), 'when': when, 'crash': crash, 'left': int(times)})
+
+    def fault(self, s, when):
+        """Raise the first armed fault for statement text s at point when ('before' or 'after')."""
+        with self.lock:
+            hit = next((f for f in self.faults if f['when'] == when and f['left'] > 0 and f['pattern'].search(s)), None)
+            if hit is None:
+                return
+            hit['left'] -= 1
+            self.faults_fired.append((when, s))
+        if hit['crash']:
+            raise SimulatedCrash('killed %s the statement: %s' % (when, s[:80]))
+        if when == 'before':
+            raise FakeDisconnect(2013, 'Lost connection to server before the statement ran (injected)')
+        raise FakeDisconnect(2013, 'Lost connection to server after the statement was applied (injected)')
+
+    def fail_connect(self, user, crash=False, times=1):
+        """Fail the next connection opened for user: error 2003 (server unreachable), or SimulatedCrash with crash=True."""
+        self.connect_faults.append({'user': user, 'crash': crash, 'left': int(times)})
+
+    def change_before(self, pattern, action, times=1):
+        """Call action(db) just before the next statement matching pattern reaches the server (another actor changed the state)."""
+        self.changes.append({'pattern': re.compile(pattern), 'action': action, 'left': int(times)})
+
+    def deny(self, user, pattern):
+        """Refuse every statement matching pattern on a connection of user with error 1142 (the account lacks the privilege)."""
+        self.denials.append((user, re.compile(pattern)))
+
+    def check_denied(self, s, user):
+        """Raise error 1142 when a denial covers statement text s for user; the server never runs it."""
+        if any(u == user and p.search(s) for u, p in self.denials):
+            raise FakeDisconnect(1142, 'command denied to user %s (injected)' % user)
+
+    def run_changes(self, s):
+        """Apply the first armed change for statement text s."""
+        with self.lock:
+            hit = next((c for c in self.changes if c['left'] > 0 and c['pattern'].search(s)), None)
+            if hit is None:
+                return
+            hit['left'] -= 1
+            hit['action'](self)
 
     def connect(self, user=None):
+        with self.lock:
+            hit = next((f for f in self.connect_faults if f['user'] == user and f['left'] > 0), None)
+            if hit is not None:
+                hit['left'] -= 1
+                self.faults_fired.append(('connect', user))
+        if hit is not None:
+            if hit['crash']:
+                raise SimulatedCrash('killed while connecting as %s' % user)
+            raise FakeDisconnect(2003, "Can't connect to the server (injected)")
         conn = FakeConn(self, user)
         self.connections.append(conn)
         return conn

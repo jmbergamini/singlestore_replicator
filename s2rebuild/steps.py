@@ -65,7 +65,7 @@ def _step(id_, title, kinds, identities, gate, module, milestone, pre=()):
 
 REGISTRY = {s.id: s for s in [
     _step('P1', 'Prerequisites', (HUMAN, ADMIN), (OWNER,),
-          'Kit installed, runner account created, Keychain items set, config written, s2rebuild check passes',
+          'Kit installed, runner account created, Keychain items set, config written',
           'cli', 'M2'),
     _step('P2', 'Preflight', (PYTHON,), (RUNNER, OWNER),
           'Connection, privileges, source layout, STORAGE_ID recorded, target names free, compute size fits the partition count',
@@ -79,7 +79,8 @@ REGISTRY = {s.id: s for s in [
           'Throwaway copy and switch completed, kill test resumed, timings recorded under customer/runs/',
           'rehearse', 'M4', ('P4',)),
     _step('O1', 'Start', (PYTHON, DECISION), (RUNNER,),
-          'Window and deadline recorded, P2 re-run clean, rehearsal evidence present, go recorded', 'steps', 'M1'),
+          'Window and deadline recorded, P2 passed in this run, rehearsal evidence present or waived with --no-rehearsal NOTE, '
+          'go recorded', 'steps', 'M1'),
     _step('O2', 'Stop pipelines', (ADMIN,), (OWNER,),
           'No pipeline in state Running; every definition captured with a credentials placeholder; offsets captured after the stop',
           'pipelines', 'M4', ('O1',)),
@@ -109,7 +110,8 @@ REGISTRY = {s.id: s for s in [
           'Writer watch shows the application on the live database; pipelines Running with offsets advancing; no pipeline errors',
           'watch', 'M4', ('O11',)),
     _step('C2', 'Report and calibrate', (PYTHON,), (RUNNER,),
-          'Final Excel and Markdown written; baseline recalibrated from the journal', 'report_xlsx', 'M5', ('C1',)),
+          'Final Excel and Markdown written; baseline recalibrated from the journal, or kept with a note when the journal cannot be fitted',
+          'report_xlsx', 'M5', ('C1',)),
     _step('C3', 'Retention cleanup', (ADMIN,), (OWNER,),
           'After retain_days: retained branch and replacement dropped, detached original storage deleted, evidence kept',
           'ownersql', 'M4', ('C2',)),
@@ -141,6 +143,7 @@ OWNER_ALLOWANCES = {
     'P1': (('CREATE USER', 'GRANT'), (), {}, {}),
     'O2': (('STOP PIPELINE',), ('source',), {}, {}),
     'O3': (('DETACH DATABASE', 'ATTACH DATABASE'), ('source',), {}, {'ATTACH DATABASE': 'READ ONLY'}),
+    'O7': (('USE', 'CREATE VIEW'), ('replacement',), {}, {}),
     'O9': (('USE', 'CREATE PIPELINE', 'ALTER PIPELINE'), ('replacement',), {}, {}),
     'O10': (('DETACH DATABASE', 'ATTACH DATABASE'), ('source', 'replacement', 'retained'), {'DROP DATABASE': ('retained',)}, {}),
     'O11': (('START PIPELINE', 'GRANT', 'SET GLOBAL'), ('source',), {}, {}),
@@ -232,12 +235,21 @@ class Outcome:
     exit_code: int = EXIT_DONE
 
 
+def run_flag(run_id):
+    """' --run ID' for a command the kit suggests, so the operator's next command lands in this run.
+
+    '' without a run id, and for the id a dry run uses when no run exists (dry-run, reserved by
+    common.check_run_id).
+    """
+    return ' --run %s' % run_id if run_id and run_id != 'dry-run' else ''
+
+
 def gate_pending(step, ctx, lines=()):
-    """Print what a person must do and record, then report the gate as pending."""
+    """Print what a person must do and record, with the --run form of this run, then report the gate as pending."""
     for line in lines:
         ctx.log.plain('    ' + line)
     ctx.log.plain('    gate: ' + step.gate)
-    ctx.log.plain('    record with: s2rebuild gate %s --pass --note TEXT [--evidence FILE]' % step.id)
+    ctx.log.plain('    record with: s2rebuild gate %s --pass --note TEXT%s [--evidence FILE]' % (step.id, run_flag(ctx.run_id)))
     return Outcome(PENDING, 'gate pending: ' + step.gate, EXIT_GATE)
 
 
@@ -270,8 +282,47 @@ def human_pending(step, ctx):
     return gate_pending(step, ctx, ['done by: %s' % step.identity_label])
 
 
+def o1_readiness(ctx):
+    """The O1 readiness lines and the problems a real run refuses on; returns (lines, problems, waiver).
+
+    P2 must be passed in this run's journal (s2rebuild check records it). Rehearsal evidence is P5
+    passed in this journal, or a rehearsal of any run whose timings record P5 passed
+    (_rehearsal_evidence). Without either, the operator may waive it with --no-rehearsal NOTE
+    (ctx.options['no_rehearsal']); waiver is that note, else None. Reads the journal and the
+    runs folder only.
+    """
+    journal = ctx.journal
+    lines, problems, waiver = [], [], None
+    p2 = journal.step('P2') or {}
+    if p2.get('status') == 'passed':
+        lines.append('P2 preflight: passed in this run at %s' % (p2.get('ended_utc') or 'an unrecorded time'))
+    else:
+        state = p2.get('status') or 'not run'
+        lines.append('P2 preflight: not passed in this run (%s)' % state)
+        problems.append('P2 is not passed in this run (%s); run s2rebuild check%s for this run first' % (state, run_flag(ctx.run_id)))
+    note = str(ctx.options.get('no_rehearsal') or '').strip()
+    if journal.step_status('P5') == 'passed':
+        lines.append('rehearsal evidence: P5 passed in this run')
+    elif _rehearsal_evidence(ctx):
+        lines.append('rehearsal evidence: a passed rehearsal under %s' % ctx.config.runs_dir())
+    elif note:
+        waiver = note
+        lines.append('rehearsal evidence: none found; waived with --no-rehearsal: %s' % note)
+    else:
+        lines.append('rehearsal evidence: none found')
+        problems.append('no rehearsal evidence (P5 passed in this run, or a passed rehearsal under %s); run s2rebuild rehearse, '
+                        'or waive it with --no-rehearsal NOTE' % ctx.config.runs_dir())
+    return lines, problems, waiver
+
+
 def o1_start(step, ctx):
-    """O1: record window and deadline, report the readiness checks, then wait for the go decision."""
+    """O1: check the window, P2 and the rehearsal evidence, record window and deadline, then wait for the go decision.
+
+    A missing window or a past deadline fails the gate. A real run then refuses, before any
+    journal write, when P2 is not passed in this run or there is no rehearsal evidence and no
+    --no-rehearsal NOTE (o1_readiness); a dry run reports both and goes on. A waiver is recorded
+    as a no_rehearsal event and in the O1 note.
+    """
     config = ctx.config
     if config.window is None:
         return Outcome(FAILED, 'window.start and window.end are not configured; record them at P4 first', EXIT_GATE)
@@ -291,8 +342,6 @@ def o1_start(step, ctx):
         'abort deadline: %s (end minus %d m restart allowance, %d m buffer; %s)' % (
             iso(deadline), window.restart_allowance_minutes, window.buffer_minutes, longest_note),
         'freeze path: %s' % ('A read-only attachment' if config.freeze.mode == 'readonly' else 'B lockout'),
-        'P2 re-run: s2rebuild check (milestone M5)',
-        'rehearsal evidence: %s' % ('found under %s' % ctx.config.runs_dir() if _rehearsal_evidence(ctx) else 'none found'),
     ]
     now = utc_now()
     if now >= deadline:
@@ -302,6 +351,15 @@ def o1_start(step, ctx):
             for line in lines:
                 ctx.log.plain('    ' + line)
             return Outcome(FAILED, 'abort deadline %s is already past' % iso(deadline), EXIT_GATE)
+    readiness, problems, waiver = o1_readiness(ctx)
+    lines.extend(readiness)
+    if problems:
+        if ctx.dry_run:
+            lines.append('a real run refuses here: ' + '; '.join(problems))
+        else:
+            for line in lines:
+                ctx.log.plain('    ' + line)
+            return Outcome(REFUSED, 'O1 refused: ' + '; '.join(problems), EXIT_REFUSED)
     if not ctx.dry_run:
         journal = ctx.journal
         journal.set_meta('run_id', ctx.run_id or '')
@@ -314,7 +372,12 @@ def o1_start(step, ctx):
         journal.set_meta('abort_deadline', iso(deadline))
         journal.set_meta('freeze_mode', config.freeze.mode)
         journal.event('window', 'start=%s end=%s deadline=%s' % (iso(window.start), iso(window.end), iso(deadline)))
-    return gate_pending(step, ctx, lines + ['go decision recorded by the operator'])
+        if waiver:
+            journal.event('no_rehearsal', 'O1 without rehearsal evidence: %s' % waiver)
+    outcome = gate_pending(step, ctx, lines + ['go decision recorded by the operator'])
+    if waiver:
+        outcome.note += '; rehearsal waived with --no-rehearsal: %s' % waiver
+    return outcome
 
 
 def _rehearsal_evidence(ctx):
@@ -384,10 +447,69 @@ def check_run_names(journal, db):
                                db.source, label, have, want))
 
 
+def config_change(journal, config):
+    """(recorded, current) configuration hashes when O1 recorded one and the configuration hashes differently now; else None.
+
+    Before O1 nothing is recorded, so the P4 decisions written into the configuration never count.
+    """
+    recorded, current = journal.get_meta('config_hash'), config.config_hash()
+    return (recorded, current) if recorded is not None and recorded != current else None
+
+
+def config_change_text(db, recorded, current):
+    """The refusal of a configuration that changed after O1, for one database."""
+    return ('Journal for %s records configuration hash %s from O1, but the configuration now hashes to %s: it changed after O1. '
+            'Put the configuration of this run back, or record the change with --accept-config-change NOTE, which keeps both '
+            'hashes and the note in the journal' % (db.source, recorded[:12], current[:12]))
+
+
+# The steps that refuse freeze.mode lockout with more than one configured database (path_b_single_database).
+PATH_B_SINGLE_DATABASE_STEPS = ('O3', 'O10', 'O11')
+
+
+def path_b_single_database(config):
+    """Refuse freeze.mode lockout with more than one configured database: Path B is single database in this pass.
+
+    Each database journal holds its own lockout snapshot and O11 gives it back per database, so
+    a global grant restored by the first O11 releases writers on a database still frozen. check
+    (P2), run, and step O3, O10 and O11 call this before anything is journaled; owner-sql O3, O10
+    and O11, owner-notebook, and gate O3, O10 and O11 --pass call it before a database is chosen,
+    a block is written or a gate is recorded; lockout (with or without --hold) calls it before a
+    snapshot is taken or a REVOKE is issued. Issues nothing.
+    """
+    if config.freeze.mode == 'lockout' and len(config.databases) > 1:
+        raise KitError('freeze.mode lockout (Path B) is single database in this pass, and the configuration has %d databases (%s); '
+                       'configure one database, or use freeze.mode readonly (Path A) for several' % (
+                           len(config.databases), ', '.join(db.source for db in config.databases)))
+
+
 def unmet_preconditions(step, journal):
-    """Precondition ids whose journal status is not passed or skipped."""
+    """Precondition ids whose journal status is not passed or skipped; every precondition when journal is None (nothing recorded yet)."""
+    if journal is None:
+        return all_preconditions(step)
     board = journal.steps_board()
     return [pre for pre in all_preconditions(step) if board.get(pre, {}).get('status') not in ('passed', 'skipped')]
+
+
+def precondition_refusal(step, journal, db, run_id=None):
+    """The refusal of a step whose preconditions are not all passed or skipped, with how each passes; None when they are.
+
+    run_step, check (P2) and profile (P3, O4) refuse with this text and gate warns with the same
+    list, so every entry point follows one rule. journal None stands for a run with nothing recorded.
+    run_id adds the --run form of the run to every command the hint names (missing_hint).
+    """
+    missing = unmet_preconditions(step, journal)
+    if not missing:
+        return None
+    passed_before = journal is not None and journal.step_status(step.id) == 'passed'
+    return 'Cannot run %s for database %s: earlier steps are not passed: %s%s. %s' % (
+        step.id, db.source, ', '.join(missing),
+        ' (%s passed earlier, but a result counts only while the steps before it are passed)' % step.id if passed_before else '',
+        missing_hint(missing, db, run_id=run_id))
+
+
+# The steps whose results the switch stands on (journal.RECOPY_REOPENS): refused once the switch may have begun.
+AFTER_SWITCH_REFUSED = ('O6', 'O7', 'O8')
 
 
 def outage_range(from_id='O1', to_id='O11'):
@@ -401,30 +523,110 @@ def outage_range(from_id='O1', to_id='O11'):
     return OUTAGE[i:j + 1]
 
 
+def interrupted_note(exc):
+    """The step note for an exception that is not a KitError: its type and error number only.
+
+    The exception text is never kept, since a driver message can echo a statement that carried
+    an injected secret.
+    """
+    args = getattr(exc, 'args', ())
+    number = args[0] if args and isinstance(args[0], int) else 'unknown'
+    return ('interrupted by %s (error %s); the message is not stored; rerun the step, it re-enters from the journal and the live state'
+            % (type(exc).__name__, number))
+
+
+def missing_hint(missing, db=None, restart=True, run_id=None):
+    """How to pass the missing steps, earliest first: a step that needs a person is recorded with gate, a python step is run
+    (run --from for consecutive outage steps, step for each P or C step); then 'or start from O1' when an outage step is missing.
+
+    The order matters: run --from stops at a step a person records, so that gate comes first.
+    db adds the --db flag of its database, run_id the --run form of the run (run_flag);
+    restart=False leaves out 'or start from O1'.
+    """
+    flag = (' --db %s' % db.source if db is not None else '') + run_flag(run_id)
+    groups = []
+    for step_id in missing:
+        step = REGISTRY[step_id]
+        kind = 'person' if step.needs_person else ('run' if step_id in OUTAGE else 'step')
+        if kind == 'run' and groups and groups[-1][0] == 'run':
+            groups[-1][1].append(step_id)
+        else:
+            groups.append((kind, [step_id]))
+    parts = []
+    for kind, ids in groups:
+        if kind == 'person':
+            parts.append('record %s with s2rebuild gate %s --pass --note TEXT%s' % (ids[0], ids[0], flag))
+        elif kind == 'run':
+            parts.append('run %s with s2rebuild run --from %s%s' % (', '.join(ids), ids[0], flag))
+        else:
+            parts.append('run %s with s2rebuild step %s%s' % (ids[0], ids[0], flag))
+    text = '; then '.join(parts)
+    return '%s%s%s.' % (text[:1].upper(), text[1:], ', or start from O1' if restart and any(m in OUTAGE for m in missing) else '')
+
+
+def _after_switch_refusal(step, ctx, began):
+    """The refusal of a step of AFTER_SWITCH_REFUSED once the switch may have begun (began is Journal.switch_began)."""
+    return ('Cannot run %s for database %s: the switch may have begun (%s). %s copies or verifies the replacement for the switch; '
+            'running it now would change the copy behind the live name or the evidence the rollback proof compares, so nothing was run '
+            'or journaled. Finish the switch or roll it back; a new copy is a new run.' % (step.id, ctx.db.source, began, step.id))
+
+
 def run_step(step, ctx, redo=False):
-    """Run one step for one database and return its Outcome. Journals the attempt unless dry run."""
+    """Run one step for one database and return its Outcome. Journals the attempt unless dry run.
+
+    The preconditions are checked before the "already passed" skip, so a passed step whose
+    earlier steps were reopened (a re-copy reopens O6 to O8) is refused like any other step,
+    never skipped on stale evidence; a dry run only reports them. A step of AFTER_SWITCH_REFUSED
+    that would run is refused once the switch may have begun (Journal.switch_began), before the
+    journal is touched, so its passed status and the copy behind the live name stay as they are.
+    The check is read again in the transaction that starts the step, so a go decision another
+    process commits in between refuses it, and a step started first refuses the go.
+    A KitError becomes a refusal. Any other exception (a driver error, KeyboardInterrupt, a crash
+    stand-in in the tests) records the step as failed with interrupted_note and is raised again,
+    so a step is never left running by an exception the kit sees.
+    """
     journal, log = ctx.journal, ctx.log
+    if step.id in PATH_B_SINGLE_DATABASE_STEPS:
+        path_b_single_database(ctx.config)
     header = '[%s] %s (%s; %s) database %s' % (step.id, step.title, step.kind_label, step.identity_label, ctx.db.source)
-    if journal.step_status(step.id) == 'passed' and not redo:
-        log(header + ': already passed, skipped (use --redo to run it again)')
-        return Outcome(SKIPPED, 'already passed')
+    passed_before = journal.step_status(step.id) == 'passed'
     missing = unmet_preconditions(step, journal)
     if missing:
         if ctx.dry_run:
             log(header + ': dry run; earlier steps without a passed gate: ' + ', '.join(missing))
         else:
-            raise KitError('Cannot run %s for database %s: earlier steps are not passed: %s. Record them with '
-                           's2rebuild gate ID --pass --db %s, or start from O1.' % (step.id, ctx.db.source, ', '.join(missing),
-                                                                                   ctx.db.source))
-    else:
+            raise KitError(precondition_refusal(step, journal, ctx.db, ctx.run_id))
+    if passed_before and not redo:
+        log(header + ': already passed, skipped (use --redo to run it again)')
+        return Outcome(SKIPPED, 'already passed')
+    after_switch = step.id in AFTER_SWITCH_REFUSED
+    began = journal.switch_began() if after_switch else None
+    if began:
+        if ctx.dry_run:
+            log(header + ': dry run; a real run refuses this step: the switch may have begun (%s)' % began)
+        else:
+            raise KitError(_after_switch_refusal(step, ctx, began))
+    if not missing and not began:
         log(header)
     if not ctx.dry_run:
-        journal.step_start(step.id)
+        # read again in the transaction that starts the step, so a go decision committed meanwhile refuses it (Journal.record_go)
+        began = journal.step_start(step.id, unless=journal.switch_began if after_switch else None)
+        if began:
+            raise KitError(_after_switch_refusal(step, ctx, began))
     handler = HANDLERS.get(step.id, not_yet)
     try:
         outcome = handler(step, ctx)
     except KitError as exc:
         outcome = Outcome(REFUSED, str(exc), exc.exit_code)
+    except BaseException as exc:
+        note = interrupted_note(exc)
+        log('    result: failed: ' + note)
+        if not ctx.dry_run:
+            try:
+                journal.step_end(step.id, 'failed', note)
+            except Exception:  # noqa: BLE001 - the handler's exception is the one the caller must see
+                log('    the failed status could not be journaled; status may still show %s running' % step.id)
+        raise
     log('    result: %s%s' % (outcome.status, (': ' + outcome.note) if outcome.note else ''))
     if not ctx.dry_run:
         recorded = {PASSED: 'passed', PENDING: 'pending', FAILED: 'failed', REFUSED: 'pending', STUB: 'pending',
@@ -451,22 +653,37 @@ def run_steps(config, databases, journals, log, run_id=None, from_id='O1', to_id
               yes=False, verbose=False, sessions=None, options=None):
     """Run the outage steps for the selected databases and return the exit code.
 
-    A real run stops at the first pending or failed gate (exit 4) or refusal (exit 1). A dry
-    run walks every step, prints the gates that need a person and returns 0.
+    A real run stops at the first pending or failed gate (exit 4) or refusal (exit 1). A pending
+    O1 stops the run only after O1 ran for every selected database, so each journal holds its
+    checks, names, configuration hash and window before the one go decision; a refused or failed
+    O1 still stops at once. A python step that ends pending (O7 without the owner profile, O8 over
+    its tier 3 budget) stops with its own instruction, since gate refuses python steps. A dry run
+    walks every step, prints the gates that need a person and returns 0.
     """
     step_ids = outage_range(from_id, to_id)
+    path_b_single_database(config)
     for db in databases:
         check_run_names(journals[db.source], db)
     pending, failed, stubs = [], [], []
+    go_pending = None
     for db, step_id in plan_order(databases, step_ids):
+        if go_pending is not None and step_id != 'O1':
+            break
         step = REGISTRY[step_id]
         ctx = StepContext(config, db, journals[db.source], run_id, log, dry_run, yes, verbose, options, sessions)
         outcome = run_step(step, ctx, redo)
         label = '%s %s' % (step_id, db.source)
         if outcome.status == PENDING:
             pending.append(label)
-            if not dry_run:
-                log('Stopped at %s: a person must record the gate before the run continues' % step_id)
+            if not dry_run and step_id == 'O1':
+                go_pending = outcome.exit_code  # O1 runs for every selected database before the run stops for the go
+            elif not dry_run and not step.needs_person:
+                # a python step (O7, O8) the kit records itself: gate refuses it, so the step's own instruction is the hint
+                log('Stopped at %s: %s' % (step_id, outcome.note))
+                return outcome.exit_code
+            elif not dry_run:
+                log('Stopped at %s: a person must record the gate before the run continues; then s2rebuild run%s continues it' % (
+                    step_id, run_flag(run_id)))
                 return outcome.exit_code
         elif outcome.status == FAILED:
             failed.append(label)
@@ -481,6 +698,9 @@ def run_steps(config, databases, journals, log, run_id=None, from_id='O1', to_id
             return outcome.exit_code
         elif outcome.status == STUB:
             stubs.append(label)
+    if go_pending is not None:
+        log('Stopped at O1: a person must record the gate before the run continues; then s2rebuild run%s continues it' % run_flag(run_id))
+        return go_pending
     if dry_run:
         log('DRY RUN complete: %d step runs walked for %d database(s); gates pending: %s; failed checks: %s; '
             'python steps not run (no implementation or no input yet): %s' % (
@@ -494,35 +714,60 @@ def run_steps(config, databases, journals, log, run_id=None, from_id='O1', to_id
 
 def run_one(config, databases, journals, log, step_id, run_id=None, redo=False, dry_run=False, yes=False, verbose=False,
             options=None, sessions=None):
-    """Run a single step (any phase) for the selected databases and return the exit code."""
+    """Run a single step (any phase) for the selected databases and return the exit code.
+
+    A pending O1 does not stop it before O1 ran for every selected database, as in run_steps.
+    """
     step = get_step(step_id)
     for db in databases:
         check_run_names(journals[db.source], db)
+    go_pending = None
     for db in databases:
         ctx = StepContext(config, db, journals[db.source], run_id, log, dry_run, yes, verbose, options, sessions)
         outcome = run_step(step, ctx, redo)
-        if outcome.status in (PENDING, FAILED, REFUSED, INCOMPLETE, MISMATCH) and not dry_run:
+        if step.id == 'O1' and outcome.status == PENDING and not dry_run:
+            go_pending = outcome.exit_code
+        elif outcome.status in (PENDING, FAILED, REFUSED, INCOMPLETE, MISMATCH) and not dry_run:
             return outcome.exit_code
+    if go_pending is not None:
+        return go_pending
     if dry_run:
         log('No connection was opened and nothing was written.')
     return EXIT_DONE
 
 
-def gate_step(step_id):
-    """The Step a person may gate: admin, human and decision steps only. Raises KitError otherwise."""
+# The python steps a person may still gate, with gate --override NOTE only: the close-out steps C3 and C4 need them passed.
+OVERRIDE_STEPS = ('C1', 'C2')
+
+
+def gate_step(step_id, override=None):
+    """The Step a person may gate: admin, human and decision steps, and C1 or C2 with an override note. Raises KitError otherwise."""
     step = get_step(step_id)
+    overriding = bool(str(override or '').strip())
+    if overriding and step.id in OVERRIDE_STEPS:
+        return step
+    if overriding:
+        raise KitError('--override records a gate for %s only, not for %s' % (' and '.join(OVERRIDE_STEPS), step.id))
     if not step.needs_person:
         raise KitError('%s %s is a python step the kit runs and records itself; gate records admin, human and decision '
-                       'steps only (%s)' % (step.id, step.title, ', '.join(s for s in ORDER if REGISTRY[s].needs_person)))
+                       'steps only (%s)%s' % (step.id, step.title, ', '.join(s for s in ORDER if REGISTRY[s].needs_person),
+                                             '; a %s the kit cannot pass is recorded with --override NOTE' % step.id
+                                             if step.id in OVERRIDE_STEPS else ''))
     return step
 
 
-def record_gate(journals, step_id, passed, note, evidence_path=None):
-    """Record a gate decision for every selected database journal. Returns the Step."""
-    step = gate_step(step_id)
+def record_gate(journals, step_id, passed, note, evidence_path=None, override=None):
+    """Record a gate decision for every selected database journal. Returns the Step.
+
+    A gate for C1 or C2 needs override, the reason a person records it instead of the kit; it is
+    journaled as a gate_override event just before the gate.
+    """
+    step = gate_step(step_id, override)
     if not note or not str(note).strip():
         raise KitError('A gate record needs --note TEXT with what was observed')
     for journal in journals.values():
+        if step.id in OVERRIDE_STEPS:
+            journal.event('gate_override', '%s %s: %s' % (step.id, 'pass' if passed else 'fail', str(override).strip()))
         journal.record_gate(step.id, passed, note, evidence_path)
         if passed and step.id == 'O11' and not journal.get_meta('released_utc'):
             # the release recorded by hand starts the C1 error window too

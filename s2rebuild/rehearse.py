@@ -12,9 +12,13 @@ process while a chunk is started (the leaf lock it leaves is waited out, as on t
 the resume must reconcile exactly the interrupted chunk. Every rehearsal name starts with
 s2rebuild_rehearsal_ and none may equal a configured database name; cleanup drops only what this
 invocation created (rehearse --cleanup drops the prefixed names after a confirmation). P5 passes
-only when the switch was rehearsed too (owner profile). Statements issued through a guard that
-permits the runner write kinds plus CREATE DATABASE and DROP DATABASE on the prefixed names only;
-the rehearsal steps themselves run through their own step guards.
+only when the switch was rehearsed too (owner profile). The view is created after USE of the source
+with an unqualified body, so its captured definition names no database (O7 refuses one that names
+the source). O7 creates it in the replacement through the owner session; without the owner profile
+O7 ends pending, the rehearsal records O7 skipped in its own journal so O8 runs, and P5 stays
+pending. Statements issued through a guard that permits the runner write kinds plus CREATE DATABASE,
+DROP DATABASE and USE on the prefixed names only; the rehearsal steps themselves run through their
+own step guards.
 """
 import dataclasses
 import json
@@ -48,7 +52,8 @@ TABLES = {
                     'SHARD KEY (`x`), SORT KEY (`x`))'),
     'nokey_empty': 'CREATE TABLE {db}.`nokey_empty` (`p` varchar(10) DEFAULT NULL, `q` int(11) DEFAULT NULL)',
 }
-VIEW = 'CREATE VIEW {db}.`keyed_counts` AS SELECT `a`, COUNT(*) AS `n` FROM {db}.`keyed_composite` GROUP BY `a`'
+# the body names no database: fill_statements issues USE of the source first, as an application view would be written
+VIEW = 'CREATE VIEW {db}.`keyed_counts` AS SELECT `a`, COUNT(*) AS `n` FROM `keyed_composite` GROUP BY `a`'
 SEED = 'CREATE TABLE {db}.`seed` (`k` int(11) NOT NULL, PRIMARY KEY (`k`))'
 
 
@@ -120,6 +125,7 @@ def fill_statements(db, rows):
         for _ in range(2):
             out.append("INSERT INTO %s.`nokey_dupes` (`x`, `y`, `z`) SELECT a.k * 1000 + b.k + %d, IF(b.k %% 7 = 0, NULL, CONCAT('y', b.k)), "
                        "IF(a.k %% 5 = 0, NULL, a.k / 3.0) FROM %s.`seed` a JOIN %s.`seed` b WHERE a.k * 1000 + b.k < %d" % (d, block * SEED_ROWS, d, d, n))
+    out.append('USE ' + d)
     out.append(VIEW.format(db=d))
     out.append('DROP TABLE %s.`seed`' % d)
     return out
@@ -305,8 +311,14 @@ def run(ctx, prefix, rows=SEED_ROWS, keep=False, kill_test='sigkill'):
         if reconciled != len(interrupted):
             raise KitError('Rehearsal kill test: %d chunk(s) were interrupted but %d were reconciled on resume' % (len(interrupted), reconciled))
         out7 = _timed('O7', lambda: steps.run_step(steps.REGISTRY['O7'], sub, redo=True))
-        if out7.status != steps.PASSED:
+        if out7.status == steps.PENDING and not ctx.owner_configured:
+            # the runner never creates views (section 10.11): O7 ran the stale check and the counters and waits for the admin
+            journal.step_end('O7', 'skipped', 'rehearsal: the views need the owner profile and were not created; stale check and counters ran')
+            ctx.log('rehearsal: the views are not rehearsed without the owner profile; the O7 block printed above is not run, '
+                    'and cleanup drops the rehearsal databases')
+        elif out7.status != steps.PASSED:
             raise KitError('Rehearsal O7 failed: ' + out7.note)
+        timings['views'] = 'created through the owner session' if out7.status == steps.PASSED else 'not rehearsed (no owner profile)'
         out8 = _timed('O8', lambda: steps.run_step(steps.REGISTRY['O8'], sub, redo=True))
         if out8.status != steps.PASSED:
             raise KitError('Rehearsal O8 failed: ' + out8.note)
@@ -322,9 +334,10 @@ def run(ctx, prefix, rows=SEED_ROWS, keep=False, kill_test='sigkill'):
         summary = ', '.join('%s %.1f s' % kv for kv in timings['steps'].items())
         ctx.journal.step_start('P5')
         if not switched:
-            ctx.journal.step_end('P5', 'pending', 'rehearsal %s: copy, kill test and verify passed (%s); the switch needs the owner profile' % (prefix, summary),
-                                 str(run_dir / 'timings.json'))
-            return steps.Outcome(steps.PENDING, 'rehearsal copy passed (%s); P5 needs the switch rehearsed with the owner profile' % summary, EXIT_GATE)
+            ctx.journal.step_end('P5', 'pending', 'rehearsal %s: copy, kill test and verify passed (%s); the views and the switch need the owner profile'
+                                 % (prefix, summary), str(run_dir / 'timings.json'))
+            return steps.Outcome(steps.PENDING, 'rehearsal copy passed (%s); P5 needs the views and the switch rehearsed with the owner profile' % summary,
+                                 EXIT_GATE)
         ctx.journal.step_end('P5', 'passed', 'rehearsal %s: %s; switch %s' % (prefix, summary, switched), str(run_dir / 'timings.json'))
         ctx.log('rehearsal timings written to %s' % (run_dir / 'timings.json'))
         return steps.Outcome(steps.PASSED, 'rehearsal complete: %s; switch %s' % (summary, switched))
@@ -367,14 +380,16 @@ def _rehearse_switch(ctx, sub, spec, names, plans, data, journal, timed, timings
             finally:
                 probe.close()
     else:
-        ctx.log('rehearsal: the lockout freeze is not rehearsed; the rehearsal source stays READWRITE for the switch')
+        ctx.log('rehearsal: the lockout freeze is not rehearsed; the rehearsal source stays READWRITE for the switch, and S1 does not '
+                'check a lockout pass')
     journal.set_meta('freeze_time', iso(utc_now()))
     guard = steps.guard_for('O10', spec, steps.OWNER)
     owner = ctx.owner_session(guard)
     runner = ctx.runner_session(read_guard('runner P5'))
     try:
         counts = {'tables': len(data.get('tables') or []), 'views': len(data.get('views') or []), 'pipelines': 0}
-        machine = switch.SwitchMachine(owner, sw_names, journal, ctx.log, runner, counts, spec.layout, open_session=ctx.owner_session, guard=guard)
+        machine = switch.SwitchMachine(owner, sw_names, journal, ctx.log, runner, counts, spec.layout, open_session=ctx.owner_session, guard=guard,
+                                       check_lockout_pass=False)
         timed('O10 switch', machine.forward)
     finally:
         owner.close()

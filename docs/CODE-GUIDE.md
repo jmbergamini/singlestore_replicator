@@ -6,7 +6,7 @@ The package is `s2rebuild/`. Every module starts with `s2rebuild <module>: <purp
 
 ## Module map
 
-- `cli.py`: the command line. Parses global and command flags, picks the run (`Invocation`), opens journals, logs and sessions, and dispatches to the step handlers or command functions. `docs-flags` prints the flag table in `docs/CONFIG.md`.
+- `cli.py`: the command line. Parses global and command flags, picks the run (`Invocation`), opens journals, logs and sessions, and dispatches to the step handlers or command functions. Every journal it opens is checked in one place (`Invocation.check_journals`: the recorded names, and the configuration hash after O1). `check` and `profile` apply the precondition and `--redo` rules of `steps.run_step` before they connect or write. `docs-flags` prints the flag table in `docs/CONFIG.md`.
 - `common.py`: KitError and its exit codes, UTC time helpers, run ids.
 - `config.py`: loads and validates the YAML against a declarative schema, applies defaults and the run-date names, refuses unknown keys, and exposes `Config`, `DatabaseSpec` and `Window` (with the abort deadline rule).
 - `connect.py`: Secrets (Keychain or environment), the Redactor that masks secrets in every line (SQL user names are masked in logs but kept in the admin blocks an operator copies), guarded `Session`, `DryRunSession` and `SessionFactory`, and the 0600 `Log`.
@@ -17,11 +17,11 @@ The package is `s2rebuild/`. Every module starts with `s2rebuild <module>: <purp
 - `estimate.py`: the throughput model, the list-scheduling simulation, allowances, bands, window fit, and `calibrate`.
 - `report_xlsx.py` and `report_md.py`: the profile and final workbooks (Summary first, one tab per table, pipelines and offsets tabs) and the Markdown run report; the C2 handler.
 - `transform.py`: the replacement definition hook (a pass-through in this pass; see below).
-- `copy.py`: O5 and O6: the replacement, the chunk scheduler, reconciliation, lock probes, the fresh-table fallback, the abort deadline and stop file, the count proof.
+- `copy.py`: O5 and O6: the replacement, the chunk scheduler, reconciliation, lock probes, the fresh-table fallback, the abort deadline and stop file, the count proof, and the copy lock that O6, an O7 re-copy round, `mark-recopy` and O10 take.
 - `verify.py` and `postcopy.py`: the three verification tiers and the O7 stale check, views and counters, the O8 handler.
 - `watch.py`: the writer watch and the quiet proof.
-- `ownersql.py`: admin blocks (checks, statements, stops, skip conditions, captures), their execution with gates, the DETACH escalation, the P1, C3 and C4 blocks and handlers, and `ownerlib`, the dependency-free copy of the gate logic for the notebook.
-- `freeze.py`: O3 Path A with the write probe and the resume path.
+- `ownersql.py`: admin blocks (checks, statements, stops, skip conditions, captures) and their companion blocks (the O3 re-entry block), their execution with gates, the DETACH escalation, the P1, C3 and C4 blocks and handlers, and `ownerlib`, the dependency-free copy of the gate logic for the notebook.
+- `freeze.py`: O3 Path A with the write probe and the resume paths (after the READONLY attachment, and at the ATTACH after a stop between DETACH and ATTACH).
 - `lockout.py` and `grants.py`: O3 Path B: per-scope snapshots, revoke, the kill loop, restore and compare.
 - `pipelines.py`: O2 stop and capture, O9 replay or verification, O11 release, C1 checks, and the import of a notebook capture.
 - `switch.py`: the O10 state machine and rollback.
@@ -29,7 +29,7 @@ The package is `s2rebuild/`. Every module starts with `s2rebuild <module>: <purp
 - `rehearse.py`: P5 on throwaway databases with the SIGKILL test.
 - `bundle.py`: MANIFEST.json, the static-tree scan, the zip and `--verify`.
 
-`tests/fakedb.py` is an in-memory stand-in for the workspace (attachments and branches, pipelines that move with their storage, grants by scope, identity rules, read-only refusals, lock waits, blocking DETACH). Tests never open a network connection.
+`tests/fakedb.py` is an in-memory stand-in for the workspace (attachments and branches, pipelines that move with their storage, grants by scope, identity rules, read-only refusals, lock waits, blocking DETACH, the capture reads of P3 and O4). `tests.helpers.fake_driver` puts it behind the driver, so a test can run a live command on the command line. Tests never open a network connection.
 
 ## Data flow
 
@@ -56,8 +56,8 @@ The package is `s2rebuild/`. Every module starts with `s2rebuild <module>: <purp
 | Switch order | Retained branch first, then live | Live first saves one step; the current order keeps the live name unambiguous |
 | Replacement after switch | Left attached until C3 | Detach it at S3 to free compute; cleanup then needs the Portal |
 | Verification depth | Count, newest, grouped fingerprint within a budget | Full fingerprint everywhere (`verify.fingerprint_budget_minutes` very large) or counts only |
-| View definers | DEFINER removed | Keep DEFINER when the executing identity may set it: `postcopy.py` |
-| Counters | MAX + 1 then sync | Carry the source counter value: `postcopy.py` |
+| View definers | Created by the owner session; the original DEFINER kept while its account exists and is not the runner, else the owner account; without the owner profile the O7 block for the admin | Always the owner account, or a named service account: `postcopy.definer_choice` |
+| Counters | The larger of the source counter and MAX + 1, then sync on every aggregator (ALL) | MAX + 1 only, or the source counter only: `postcopy.counter_value` |
 | Admin steps | Execute with gates when the owner profile exists | Print only (no owner profile) or the generated notebook |
 | Workers | 4 | Up to 16; watch leaf CPU: `copy.workers` |
 | Driver | PyMySQL in the terminal, singlestoredb in the notebook | Either everywhere: `connect.py` and the notebook template |

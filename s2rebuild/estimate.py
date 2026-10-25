@@ -16,6 +16,7 @@ import sqlite3
 from pathlib import Path
 
 from .common import KitError, format_duration, iso, parse_utc, utc_now
+from .inventory import unmigrated
 from .journal import read_only_uri
 
 DEFAULT_SCAN_S_PER_ROW = 7.62e-8
@@ -27,6 +28,8 @@ DEFAULT_COMPUTE_SIZE = 'S-16'
 # Fixed allowances per step, in minutes (section 10.6).
 ALLOWANCE_MINUTES = {'freeze': 10, 'create_replacement': 2, 'post_copy': 5, 'switch': 10, 'release': 10}
 PIPELINE_MINUTES_EACH = 1
+# The error text of the chunk rows a fresh-table load writes (one whole-table INSERT, not a chunk timing); read_chunks skips them.
+FRESH_LOAD_ERROR = 'fresh-table load'
 
 
 @dataclasses.dataclass(frozen=True)
@@ -387,7 +390,8 @@ def read_chunks(journal_path, until=None, first_pass_only=True):
     """(table_rows, rows_inserted, seconds, started, ended) for the done chunks of a journal, read-only.
 
     first_pass_only keeps chunks with one attempt (re-copies carry lock waits and pauses);
-    until keeps chunks that ended before that UTC time.
+    until keeps chunks that ended before that UTC time. Chunk rows of a fresh-table load
+    (error FRESH_LOAD_ERROR: bucket 0 holds every row, the duration is zero) are skipped.
     """
     path = Path(journal_path)
     if not path.is_file():
@@ -400,7 +404,8 @@ def read_chunks(journal_path, until=None, first_pass_only=True):
         try:
             tables = {r[0]: int(r[1]) for r in conn.execute('SELECT table_name, est_rows FROM tables')}
             rows = conn.execute("SELECT table_name, rows_inserted, started_utc, ended_utc, attempts FROM chunks "
-                                "WHERE state = 'done' AND started_utc IS NOT NULL AND ended_utc IS NOT NULL").fetchall()
+                                "WHERE state = 'done' AND started_utc IS NOT NULL AND ended_utc IS NOT NULL "
+                                "AND (error IS NULL OR error <> ?)", (FRESH_LOAD_ERROR,)).fetchall()
         except sqlite3.DatabaseError as exc:
             raise KitError('Journal %s has no readable tables and chunks (%s)' % (path, type(exc).__name__))
     finally:
@@ -519,5 +524,7 @@ def plan_sheet(config, db, run_id, inventory, est, fit, rehearsal=None, env=None
     accounts = (inventory or {}).get('accounts') or []
     lines.append('Accounts   write-capable: %s%s' % (', '.join(a['user'] for a in accounts) or 'none found',
                                                      ' (Path B would revoke these on every database)' if config.freeze.mode == 'lockout' else ''))
+    listed, refusals = unmigrated(config, db, (inventory or {}).get('routines') or [], pipelines.get('items') or [])
+    lines.append('Routines   %s' % ('; '.join(['%s not migrated' % label for label in listed] + ['REFUSED: ' + r for r in refusals]) or 'none'))
     lines.append('Rehearsal  %s' % (rehearsal or 'none recorded'))
     return lines

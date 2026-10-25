@@ -185,6 +185,14 @@ class ValidationTests(unittest.TestCase):
             from s2rebuild.config import build_config
             build_config(['not', 'a', 'mapping'])
 
+    def test_f8_routine_ignore_entries_are_names_or_database_names(self):
+        self.assertEqual(config_from(lambda d: d.pop('objects')).objects.routines.ignore, [], 'empty by default')
+        cfg = config_from(lambda d: d.update(objects={'routines': {'ignore': ['p1', 'example_orders_db.f1']}}))
+        self.assertEqual(cfg.objects.routines.ignore, ['p1', 'example_orders_db.f1'])
+        for bad in ('a.b.c', 'bad-name', 'db.', '', 7):
+            self.refuse(r'objects\.routines\.ignore entries must be', lambda d, bad=bad: d.update(objects={'routines': {'ignore': [bad]}}))
+        self.refuse(r'Unknown configuration key objects\.routines\.ignored', lambda d: d.update(objects={'routines': {'ignored': []}}))
+
     def test_config_hash_is_stable_and_sensitive(self):
         a = config_from().config_hash()
         b = config_from().config_hash()

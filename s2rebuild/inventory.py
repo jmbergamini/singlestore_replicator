@@ -7,6 +7,8 @@ information_schema views, SHOW CREATE TABLE, SHOW CREATE VIEW and, with the owne
 SHOW CREATE PIPELINE ... EXTENDED. Nothing else. Files that hold definitions are written with
 mode 0600 and the CREDENTIALS clause of a pipeline is replaced by a placeholder before it is
 written. The copy plan (TablePlan, hash buckets) built here is what copy.py executes.
+Routines are captured by name and type only and are not migrated in this pass: P2, P3 and O4
+refuse while objects.routines.ignore does not list one, or a procedure a pipeline loads into.
 """
 import csv
 import datetime as dt
@@ -19,7 +21,7 @@ from pathlib import Path
 
 from . import steps
 from .common import KitError, iso, utc_now
-from .sqlutil import ident, qualified
+from .sqlutil import ident, qualified, strip_literals
 
 INVENTORY_FILE = 'inventory.json'
 TABLES_CSV = 'tables.csv'
@@ -36,7 +38,7 @@ _DEFINER = re.compile(r'DEFINER=(`[^`]*`@`[^`]*`)')
 _VARCHAR = re.compile(r'(?:var)?char\((\d+)\)', re.I)
 _CREDENTIALS = re.compile(r"""(CREDENTIALS\s+)(?:'(?:[^'\\]|\\.|'')*'|"(?:[^"\\]|\\.|"")*")""", re.I)
 _CREDENTIALS_TOKEN = re.compile(r'(CREDENTIALS\s+)<[^<>]*REDACTED[^<>]*>', re.I)
-_CREDENTIALS_WORD = re.compile(r'\bCREDENTIALS\b', re.I)
+_CREDENTIALS_CLAUSE = re.compile(r"""\bCREDENTIALS\s*(?:['"]|<(?!-))""", re.I)
 _REDACTED = re.compile(r'(<redacted>|\*{3,}|REDACTED|<hidden>)', re.I)
 _SOURCE = re.compile(r'LOAD\s+DATA\s+(KAFKA|S3|AZURE|GCS|FS|HDFS|LINK)\s+(\'(?:[^\'\\]|\\.)*\'|"(?:[^"\\]|\\.)*")?', re.I)
 _TARGET = re.compile(r'INTO\s+(TABLE|PROCEDURE)\s+`?([A-Za-z0-9_]+)`?', re.I)
@@ -149,12 +151,14 @@ def redact_credentials(statement, name='pipeline'):
 
     Handled: the bare token the server returns for every identity (CREDENTIALS <CREDENTIALS
     REDACTED>), and single-quoted or double-quoted literals with backslash or doubled-quote
-    escapes. When the word CREDENTIALS remains without the placeholder afterwards, the text is
-    refused rather than written, so no unrecognized form reaches a file.
+    escapes. When an unreplaced CREDENTIALS clause remains afterwards (the word outside a string
+    literal followed by a quote or a <, other than the placeholder), the text is refused rather
+    than written, so no unrecognized form reaches a file. The word elsewhere (a topic, table or
+    column named credentials, or a <- column mapping) is not a clause and is kept.
     """
     text = _CREDENTIALS_TOKEN.sub(lambda m: m.group(1) + "'" + CREDENTIALS_PLACEHOLDER + "'", str(statement or ''))
     text = _CREDENTIALS.sub(lambda m: m.group(1) + "'" + CREDENTIALS_PLACEHOLDER + "'", text)
-    if _CREDENTIALS_WORD.search(text) and CREDENTIALS_PLACEHOLDER not in text:
+    if _CREDENTIALS_CLAUSE.search(strip_literals(text.replace("'" + CREDENTIALS_PLACEHOLDER + "'", ''))):
         raise KitError('Pipeline %s: the CREDENTIALS clause has a form the kit cannot replace; refusing to write its definition' % name)
     return text
 
@@ -293,9 +297,14 @@ def _pipelines(owner_session, db_name, app_managed, now):
         name = r['PIPELINE_NAME']
         rows = owner_session.query('SHOW CREATE PIPELINE %s EXTENDED' % qualified(db_name, name))
         create, alters = parse_pipeline_statements(rows)
-        item = {'name': name, 'state': r['STATE'], 'definition': redact_credentials(create, name),
+        if not create:
+            raise KitError('Pipeline %s: SHOW CREATE PIPELINE returned no CREATE statement; refusing to store an empty definition; '
+                           'capture again with the owner profile' % name)
+        definition = redact_credentials(create, name)
+        # the marker is read on the stored definition, the text O9 checks, so the workbook names the pipelines O9 will refuse
+        item = {'name': name, 'state': r['STATE'], 'definition': definition,
                 'alter_statements': [redact_credentials(a, name) for a in alters],
-                'redaction_marker': has_redaction_marker(create), 'app_managed': name in app_managed,
+                'redaction_marker': has_redaction_marker(definition), 'app_managed': name in app_managed,
                 'offsets': [], 'last_batch_time': None, 'rows_24h': 0, 'errors_24h': 0, 'last_error': None}
         item.update(describe_pipeline(create))
         by_name[name] = item
@@ -388,6 +397,58 @@ def capture(session, db, config, owner_session=None, exact_counts=False, log=Non
         log('inventory of %s: %d tables, %d views, %d routines, %d write-capable accounts, %s' % (
             name, len(tables), len(views), len(routines), len(inventory['accounts']), inventory['pipelines']['note']))
     return inventory
+
+
+# ---------------------------------------------------------------------------
+# Routines (not migrated in this pass)
+# ---------------------------------------------------------------------------
+ROUTINES_IGNORE_KEY = 'objects.routines.ignore'
+
+
+def routine_listed(config, db, name):
+    """True when objects.routines.ignore lists the routine by name, or as <database>.<name> for this database only."""
+    ignore = set(config.objects.routines.ignore) if config.objects is not None else set()
+    return name in ignore or '%s.%s' % (db.source, name) in ignore
+
+
+def unmigrated(config, db, routines, pipelines=()):
+    """(listed, refusals) for the procedures and functions of a database; no statement is issued.
+
+    Routines are not recreated in the replacement in this pass. listed holds 'procedure name'
+    for each routine objects.routines.ignore lists. refusals names each routine the key does
+    not list, and each captured pipeline that loads into a procedure the key does not list.
+    """
+    listed, refusals = [], []
+    for r in routines:
+        label = '%s %s' % (str(r['type']).lower(), r['name'])
+        if routine_listed(config, db, r['name']):
+            listed.append(label)
+        else:
+            refusals.append('%s is not listed in %s' % (label, ROUTINES_IGNORE_KEY))
+    for item in pipelines:
+        target = str(item.get('target') or '')
+        if target.startswith('procedure ') and not routine_listed(config, db, target.split(' ', 1)[1]):
+            refusals.append('pipeline %s loads into %s, which is not listed in %s' % (item['name'], target, ROUTINES_IGNORE_KEY))
+    return listed, refusals
+
+
+def refuse_unmigrated(inventory, config, db, step, journal=None):
+    """Raise KitError when the capture holds a routine or a procedure target objects.routines.ignore does not list.
+
+    With a journal the step is started and recorded failed first, so an earlier pass of the
+    step no longer counts. Returns the listed routines when nothing is refused.
+    """
+    pipelines = (inventory.get('pipelines') or {}).get('items') or []
+    listed, refusals = unmigrated(config, db, inventory.get('routines') or [], pipelines)
+    if not refusals:
+        return listed
+    note = ('%s refused for %s: routines are not migrated in this pass: %s. List each name (or database.name) under %s '
+            'to accept that it is absent from the database after the switch, then capture again' % (
+                step, db.source, '; '.join(refusals), ROUTINES_IGNORE_KEY))
+    if journal is not None:
+        journal.step_start(step)
+        journal.step_end(step, 'failed', note)
+    raise KitError(note)
 
 
 # ---------------------------------------------------------------------------
@@ -667,9 +728,13 @@ def inventory_dir(config, run_id, db, step):
 
 
 def handle_p3(step, ctx):
-    """P3 handler: the profile command does the capture; here the step reports whether a capture exists."""
+    """P3 handler: the profile command does the capture; here the step reports whether a capture exists.
+
+    A capture with a routine or procedure target objects.routines.ignore does not list is refused.
+    """
     directory = inventory_dir(ctx.config, ctx.run_id or '', ctx.db, 'P3')
     if (directory / INVENTORY_FILE).is_file():
+        refuse_unmigrated(load(directory), ctx.config, ctx.db, 'P3')
         return steps.Outcome(steps.PASSED, 'inventory present at %s' % directory)
     note = 'run s2rebuild profile to capture the inventory and write the profile workbook'
     if ctx.dry_run:
@@ -678,9 +743,13 @@ def handle_p3(step, ctx):
 
 
 def handle_o4(step, ctx):
-    """O4 handler: the freeze capture is driven by the profile code path (cli); report presence of the capture."""
+    """O4 handler: the freeze capture is driven by the profile code path (cli); report presence of the capture.
+
+    A capture with a routine or procedure target objects.routines.ignore does not list is refused.
+    """
     directory = inventory_dir(ctx.config, ctx.run_id or '', ctx.db, 'O4')
     if (directory / INVENTORY_FILE).is_file():
+        refuse_unmigrated(load(directory), ctx.config, ctx.db, 'O4')
         return steps.Outcome(steps.PASSED, 'freeze capture present at %s' % directory)
     note = 'run s2rebuild step O4 through the profile code path after the freeze (s2rebuild profile --step O4)'
     if ctx.dry_run:
@@ -708,7 +777,8 @@ def preflight(runner, db, config, owner=None):
 
     Connection and engine version; the runner's privileges against section 5, each missing one by
     name; whether the runner may create branches (recorded, not assumed); the source layout and
-    STORAGE_ID; the replacement and retained names free; leaf cores times 8 against the target
+    STORAGE_ID; every procedure and function listed in objects.routines.ignore (routines are not
+    migrated in this pass); the replacement and retained names free; leaf cores times 8 against the target
     partition count when MV_NODES is readable; with the owner profile, its connection and the
     pipelines it can see. Statements issued: SELECT only.
     """
@@ -744,6 +814,15 @@ def preflight(runner, db, config, owner=None):
     else:
         facts['source_attachment'] = dict(attached[0])
         lines.append('source STORAGE_ID: %s (%s), recorded' % (attached[0].get('STORAGE_ID'), attached[0].get('ATTACH_TYPE')))
+    routines = [{'name': r['ROUTINE_NAME'], 'type': r['ROUTINE_TYPE']} for r in runner.query(ROUTINES_SQL, (db.source,))]
+    listed, refusals = unmigrated(config, db, routines)
+    facts['routines_not_migrated'] = listed
+    if refusals:
+        ok = False
+        lines.append('routines: FAILED, not migrated in this pass: %s; list each name (or database.name) under %s '
+                     'to accept that it is absent after the switch' % ('; '.join(refusals), ROUTINES_IGNORE_KEY))
+    else:
+        lines.append('routines: %s' % (('not migrated, listed in %s: %s' % (ROUTINES_IGNORE_KEY, ', '.join(listed))) if listed else 'none'))
     for role, name in (('replacement', db.replacement), ('retained', db.retained)):
         if runner.query(LAYOUT_SQL, (name,)) or runner.query(ATTACHMENT_SQL, (name,)):
             ok = False
@@ -774,14 +853,19 @@ def preflight(runner, db, config, owner=None):
 
 
 def handle_p2(step, ctx):
-    """P2 handler (also behind s2rebuild check): the preflight checks, the source STORAGE_ID recorded in the journal."""
+    """P2 handler (also behind s2rebuild check): the preflight checks, the source STORAGE_ID recorded in the journal.
+
+    Refuses Path B with more than one configured database (steps.path_b_single_database) before any connection.
+    """
     from .sqlutil import read_guard
+    steps.path_b_single_database(ctx.config)
     runner = ctx.runner_session(read_guard('runner P2'))
     owner = ctx.owner_session(read_guard('owner P2')) if ctx.owner_configured else None
     try:
         if ctx.dry_run:
             for sql, args in ((CURRENT_SQL, ()), (GRANTEE_PRIVILEGES_SQL, ('<grantee>',)), (LAYOUT_SQL, (ctx.db.source,)),
-                              (ATTACHMENT_SQL, (ctx.db.source,)), (LAYOUT_SQL, (ctx.db.replacement,)), (LAYOUT_SQL, (ctx.db.retained,)), (LEAF_CORES_SQL, ())):
+                              (ATTACHMENT_SQL, (ctx.db.source,)), (ROUTINES_SQL, (ctx.db.source,)), (LAYOUT_SQL, (ctx.db.replacement,)),
+                              (LAYOUT_SQL, (ctx.db.retained,)), (LEAF_CORES_SQL, ())):
                 runner.query(sql, args)
             return steps.Outcome(steps.PASSED, 'dry run: preflight queries printed')
         ok, lines, facts = preflight(runner, ctx.db, ctx.config, owner)

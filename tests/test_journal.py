@@ -9,8 +9,9 @@ import unittest
 from pathlib import Path
 
 from s2rebuild.common import KitError
-from s2rebuild.journal import COLUMNS, MEMORY, SCHEMA_VERSION, Journal
-from tests.helpers import Plan, plans
+from s2rebuild.journal import ADDED_COLUMNS, COLUMNS, MEMORY, SCHEMA_VERSION, TABLE_CONSTRAINTS, Journal
+from tests.fakedb import SimulatedCrash
+from tests.helpers import Plan, crash_journal, plans
 
 # The reference runner's journal schema, with neutral names, as the migration fixture.
 LEGACY_SCHEMA = [
@@ -41,6 +42,25 @@ def legacy_journal(path):
     conn.close()
 
 
+def version_1_journal(path):
+    """A journal as schema version 1 of the kit wrote it: every table, without the columns version 2 added, O8 passed on one verified table."""
+    conn = sqlite3.connect(str(path))
+    for name, cols in COLUMNS.items():
+        later = {c for c, _ in ADDED_COLUMNS[2].get(name, [])}
+        parts = ['%s %s' % col for col in cols if col[0] not in later]
+        if name in TABLE_CONSTRAINTS:
+            parts.append(TABLE_CONSTRAINTS[name])
+        conn.execute('CREATE TABLE %s (%s)' % (name, ', '.join(parts)))
+    conn.execute("INSERT INTO meta VALUES ('schema_version', '1'), ('source_db', 'src_db'), ('replacement_db', 'tgt_db')")
+    conn.execute("INSERT INTO tables (table_name, est_rows, n_buckets, key_kind, key_expr, columns_json, target_count, verified_at_utc) "
+                 "VALUES ('t1', 10, 1, 'key', '`id`', '[\"id\", \"v\"]', 10, '2026-11-01T06:00:00Z')")
+    conn.execute("INSERT INTO chunks (table_name, bucket, state, rows_inserted, ended_utc, attempts) VALUES ('t1', 0, 'done', 10, '2026-11-01T05:30:00Z', 1)")
+    conn.execute("INSERT INTO verification (table_name, tier, result, checked_utc) VALUES ('t1', 'count', 'match', '2026-11-01T06:00:00Z')")
+    conn.execute("INSERT INTO steps (step_id, status, note) VALUES ('O8', 'passed', 'every tier passed')")
+    conn.commit()
+    conn.close()
+
+
 class SchemaTests(unittest.TestCase):
     def test_schema_created_in_memory_and_on_disk(self):
         j = Journal(MEMORY)
@@ -65,7 +85,7 @@ class SchemaTests(unittest.TestCase):
             path = Path(tmp) / 'legacy.sqlite'
             legacy_journal(path)
             j = Journal(path)
-            self.assertEqual(j.schema_version(), 1)
+            self.assertEqual(j.schema_version(), SCHEMA_VERSION)
             self.assertEqual(j.get_meta('source_db'), 'src_db')
             cols = [r[1] for r in j.conn.execute('PRAGMA table_info(tables)')]
             for added in ('size_gib', 'time_column', 'unique_key_lock_risk', 'concurrency', 'verified_at_utc'):
@@ -82,7 +102,7 @@ class SchemaTests(unittest.TestCase):
             self.assertEqual(j.step_status('O6'), 'running')
             j.close()
             again = Journal(path)
-            self.assertEqual(again.schema_version(), 1)
+            self.assertEqual(again.schema_version(), SCHEMA_VERSION)
             again.close()
 
     def test_refuses_a_newer_schema(self):
@@ -125,6 +145,59 @@ class SchemaTests(unittest.TestCase):
             with self.assertRaises(sqlite3.OperationalError):
                 ro.set_meta('x', 'y')
             ro.close()
+
+    def test_f4_version_1_journal_upgrades_in_place_to_version_2(self):
+        """A version 1 journal gains tables.recopy_epoch (0) and verification.epoch (unknown for the rows it holds) and keeps its data."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'v1.sqlite'
+            version_1_journal(path)
+            j = Journal(path)
+            self.assertEqual((j.schema_version(), SCHEMA_VERSION), (2, 2))
+            for table, cols in COLUMNS.items():
+                self.assertEqual(set(j._existing_columns(table)), {c for c, _ in cols}, table)
+            self.assertEqual(j.recopy_epoch('t1'), 0)
+            self.assertIsNone(j.verifications('t1')[0]['epoch'], 'a version 1 row has no epoch: S0 asks for a new O8')
+            self.assertEqual(j.step_status('O8'), 'passed')
+            state = j.verification_state()[0]
+            self.assertEqual((state['table_name'], state['verified_at_utc'], state['epoch_verified']), ('t1', '2026-11-01T06:00:00Z', 0))
+            j.record_verification('t1', 'count', 'match', 10, 10)
+            self.assertEqual(j.verifications('t1')[-1]['epoch'], 0)
+            self.assertEqual(j.verification_state()[0]['epoch_verified'], 1)
+            j.close()
+            again = Journal(path)
+            self.assertEqual(again.schema_version(), 2)
+            again.close()
+
+    def test_f4_read_only_open_reads_a_version_1_journal_without_changing_it(self):
+        """status opens a version 1 journal read-only as it is: the steps read, the version stays 1, the file is not written."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'v1.sqlite'
+            version_1_journal(path)
+            before = path.read_bytes()
+            ro = Journal(path, read_only=True)
+            self.assertEqual(ro.schema_version(), 1)
+            self.assertEqual(ro.steps_board()['O8']['status'], 'passed')
+            with self.assertRaises(sqlite3.OperationalError):
+                ro.set_meta('x', 'y')
+            ro.close()
+            self.assertEqual(path.read_bytes(), before)
+
+    def test_f4_read_only_version_1_journal_gives_the_s0_state_without_changing_it(self):
+        """owner-sql opens a version 1 journal read only: its S0 state reads as after the upgrade (epoch 0, no row at that epoch),
+        so the O10 forward block carries a STOP naming the table, and the file is not written. Read only, so nothing to inject."""
+        from s2rebuild import switch
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'v1.sqlite'
+            version_1_journal(path)
+            before = path.read_bytes()
+            ro = Journal(path, read_only=True)
+            state = ro.verification_state()
+            self.assertEqual([(t['table_name'], t['recopy_epoch'], t['epoch_verified'], t['chunks_open']) for t in state], [('t1', 0, 0, 0)])
+            self.assertEqual(switch.unverified_tables(ro), ['t1 (no matching verification at re-copy epoch 0)'])
+            self.assertIn('not verified on the rows now copied: t1 (no matching verification at re-copy epoch 0); rerun O6 to O8',
+                          '; '.join(switch.s0_journal_problems(ro)))
+            ro.close()
+            self.assertEqual(path.read_bytes(), before)
 
     def test_read_only_refuses_an_older_schema_with_a_remedy(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -302,6 +375,191 @@ class PlanAndChunkTests(unittest.TestCase):
             j.mark_recopy('nope')
         with self.assertRaisesRegex(KitError, 'No bucket matched'):
             j.mark_recopy('t_big', 7)
+
+    def test_f4_mark_recopy_reopens_o6_to_o8_and_clears_the_evidence_of_that_table(self):
+        """O6, O7 and O8 go back to pending with the table named; verified_at_utc and target_count are cleared; the epoch counts the marks."""
+        j = self.j
+        for p in self.plans:
+            for b in range(p.n_buckets):
+                j.mark_started(p.name, b)
+                j.mark_done(p.name, b, 10)
+            j.record_table_counts(p.name, 10 * p.n_buckets, 10 * p.n_buckets)
+            j.record_verification(p.name, 'count', 'match', 10, 10)
+        for step_id in ('O6', 'O7', 'O8'):
+            j.step_end(step_id, 'passed', 'passed before the re-copy')
+        j.step_end('O9', 'passed', 'pipelines')
+        self.assertEqual(j.mark_recopy('t_big', 1), 1)
+        board = j.steps_board()
+        self.assertEqual({s: board[s]['status'] for s in ('O6', 'O7', 'O8', 'O9')},
+                         {'O6': 'pending', 'O7': 'pending', 'O8': 'pending', 'O9': 'passed'}, 'O9 is held by run_step, not reopened')
+        for step_id in ('O6', 'O7', 'O8'):
+            self.assertIn('t_big', board[step_id]['note'])
+        rows = {r['table_name']: r for r in j.tables()}
+        self.assertEqual((rows['t_big']['verified_at_utc'], rows['t_big']['target_count'], rows['t_big']['recopy_epoch']), (None, None, 1))
+        self.assertEqual((rows['t_small']['target_count'], rows['t_small']['recopy_epoch']), (10, 0), 'other tables keep their evidence')
+        self.assertIsNotNone(rows['t_small']['verified_at_utc'])
+        j.record_verification('t_big', 'count', 'match', 30, 30)
+        self.assertEqual([r['epoch'] for r in j.verifications('t_big')], [0, 1], 'each row carries the epoch it verified')
+        j.step_start('O8')
+        j.step_end('O7', 'failed', 'stale check mismatch')
+        self.assertEqual(j.mark_recopy('t_big'), 3)
+        self.assertEqual((j.step_status('O8'), j.step_status('O7')), ('running', 'failed'), 'a step that is not passed keeps its status')
+        self.assertEqual(j.recopy_epoch('t_big'), 2)
+        with self.assertRaisesRegex(KitError, 'No bucket matched'):
+            j.mark_recopy('t_big', 7)
+        self.assertEqual(j.recopy_epoch('t_big'), 2, 'a refused mark changes nothing')
+
+    def test_f4_mark_recopy_crash_part_way_leaves_the_journal_as_it_was(self):
+        """kill -9 stand-in at each journal write of mark_recopy after the chunk update: nothing is marked, nothing reopened; the rerun marks it all."""
+        for method, match in (('set_table_attr', lambda table, column, value: column == 'verified_at_utc'),
+                              ('event', lambda kind, detail: kind == 'mark_recopy'),
+                              ('step_end', lambda step_id, status, note=None, evidence_path=None: step_id == 'O8')):
+            with self.subTest(method=method):
+                j = Journal(MEMORY)
+                self.addCleanup(j.close)
+                j.init_plan(self.plans, 'src_db', 'tgt_db')
+                for b in range(3):
+                    j.mark_started('t_big', b)
+                    j.mark_done('t_big', b, 10)
+                j.record_table_counts('t_big', 30, 30)
+                j.record_verification('t_big', 'count', 'match', 30, 30)
+                for step_id in ('O6', 'O7', 'O8'):
+                    j.step_end(step_id, 'passed', 'passed before the re-copy')
+                before = (j.chunks('t_big'), j.tables(), j.steps_board(), j.events('mark_recopy'))
+                fired = crash_journal(self, j, method, match=match)
+                with self.assertRaises(SimulatedCrash):
+                    j.mark_recopy('t_big', 1)
+                self.assertEqual(len(fired), 1)
+                self.assertEqual((j.chunks('t_big'), j.tables(), j.steps_board(), j.events('mark_recopy')), before)
+                self.assertEqual(j.mark_recopy('t_big', 1), 1)
+                self.assertEqual([c['state'] for c in j.chunks('t_big')], ['done', 'failed', 'done'])
+                self.assertEqual({s: j.step_status(s) for s in ('O6', 'O7', 'O8')}, {'O6': 'pending', 'O7': 'pending', 'O8': 'pending'})
+                self.assertEqual(j.recopy_epoch('t_big'), 1, 'the epoch counts one mark, not the crashed one')
+
+    def test_f4_mark_recopy_refused_once_the_switch_began_with_nothing_written(self):
+        """Every record that the switch may have begun refuses mark_recopy before any write; a pending O10 without a go does not, and
+        neither does an O10 left running or failed before the go (test_f4_o10_stopped_before_the_go_leaves_the_recopy_open).
+        A refusal with no statement of its own: it guards the mark_recopy journal write; the failure points at the S1 DETACH are in
+        test_switch test_f4_mark_recopy_and_o6_to_o8_refused_once_the_switch_began."""
+        marks = [('O10 failed by a gate', lambda j: j.record_gate('O10', False, 'hand switch stopped at S2'), 'gate O10 --fail was recorded'),
+                 ('O10 passed', lambda j: j.record_gate('O10', True, 'switched by hand'), 'O10 is passed'),
+                 ('go', lambda j: j.event('switch_go', 'go recorded for live name src_db'), 'the go decision was recorded'),
+                 ('observed', lambda j: j.event('switch_observed', 'gate O10 --pass evidence (refused): live src_db on STORAGE_ID sid-9'),
+                  'a switch was observed: gate O10 --pass evidence'),
+                 ('switched', lambda j: j.set_meta('switched_utc', '2026-11-01T07:00:00Z'), 'switched_utc is 2026-11-01T07:00:00Z'),
+                 ('rolled back', lambda j: j.set_meta('rolled_back_utc', '2026-11-01T07:30:00Z'), 'rolled_back_utc is'),
+                 ('retained', lambda j: j.record_attachment('retained', 'src_db_retained', 'sid-1', 'cid-1', 'READONLY'),
+                  'the retained attachment is recorded')]
+        for label, record, reason in marks:
+            with self.subTest(mark=label):
+                j = Journal(MEMORY)
+                self.addCleanup(j.close)
+                j.init_plan(self.plans, 'src_db', 'tgt_db')
+                for b in range(3):
+                    j.mark_started('t_big', b)
+                    j.mark_done('t_big', b, 10)
+                j.record_table_counts('t_big', 30, 30)
+                j.record_verification('t_big', 'count', 'match', 30, 30)
+                for step_id in ('O6', 'O7', 'O8'):
+                    j.step_end(step_id, 'passed', 'passed before the switch')
+                j.step_end('O10', 'pending', 'printed for the hand route')
+                self.assertIsNone(j.switch_began(), 'a printed, pending O10 is not a switch')
+                record(j)
+                before = (j.chunks('t_big'), j.tables(), j.steps_board(), j.events('mark_recopy'))
+                with self.assertRaisesRegex(KitError, 'mark-recopy refused for t_big: the switch may have begun \\(%s' % reason):
+                    j.mark_recopy('t_big', 1)
+                with self.assertRaisesRegex(KitError, 'mark-recopy refused for t_big'):
+                    j.check_recopy('t_big')
+                self.assertEqual((j.chunks('t_big'), j.tables(), j.steps_board(), j.events('mark_recopy')), before)
+
+    def test_f4_o10_stopped_before_the_go_does_not_count_as_a_switch(self):
+        """An O10 left running (a killed process) or failed (a Ctrl-C, a lost connection) with no go decision issued nothing, so
+        mark_recopy goes ahead; a refused mark (no such bucket) is refused by check_recopy before any write. Journal unit test: the
+        failure points around the go are in test_switch test_f4_o10_stopped_before_the_go_leaves_the_recopy_open."""
+        for label, record in (('running', lambda j: j.step_start('O10')),
+                              ('failed', lambda j: j.step_end('O10', 'failed', 'interrupted by KeyboardInterrupt (error unknown)'))):
+            with self.subTest(o10=label):
+                j = Journal(MEMORY)
+                self.addCleanup(j.close)
+                j.init_plan(self.plans, 'src_db', 'tgt_db')
+                for step_id in ('O6', 'O7', 'O8'):
+                    j.step_end(step_id, 'passed', 'passed before O10')
+                record(j)
+                self.assertIsNone(j.switch_began())
+                before = (j.chunks('t_big'), j.tables(), j.steps_board())
+                with self.assertRaisesRegex(KitError, 'No bucket matched t_big bucket 9'):
+                    j.check_recopy('t_big', 9)
+                with self.assertRaisesRegex(KitError, 'not in this journal'):
+                    j.check_recopy('t_none')
+                self.assertEqual((j.chunks('t_big'), j.tables(), j.steps_board()), before)
+                self.assertEqual(j.mark_recopy('t_big', 1), 1)
+                self.assertEqual(j.step_status('O8'), 'pending')
+                self.assertEqual(j.step_status('O10'), label, 'the mark leaves O10 as it was')
+
+    def test_f4_mark_step_start_and_go_read_the_switch_state_in_their_own_transaction(self):
+        """Of a re-copy mark, a start of O6 to O8 and the go decision, whichever commits second is refused: mark_recopy and step_start
+        with unless read switch_began, and record_go reads its check, each inside its own BEGIN IMMEDIATE transaction. A refused go
+        or a refused start writes nothing. Journal unit test: the failure points at the go write are in test_switch
+        test_f4_go_write_fault_points_hold_the_recopy_rule_on_the_rerun."""
+        j = self.j
+        for step_id in ('O6', 'O7', 'O8'):
+            j.step_end(step_id, 'passed', 'passed before O10')
+        seen = []
+        real = j.switch_began
+
+        def spy():
+            seen.append(j.conn.in_transaction)
+            return real()
+        j.switch_began = spy
+        self.assertEqual(j.mark_recopy('t_big', 1), 1)
+        self.assertIsNone(j.step_start('O6', unless=j.switch_began))
+        self.assertEqual((j.step_status('O6'), seen), ('running', [True, True]), 'both read the switch state inside the transaction')
+        checked = []
+
+        def refuse(journal):
+            checked.append(journal.conn.in_transaction)
+            return ['O6 is running (another process started it after S0)', 'O8 has not passed']
+        before = j.events()
+        with self.assertRaisesRegex(KitError, r'^S0 refused at the go decision: O6 is running \(another process started it after S0\); '
+                                              r'O8 has not passed; nothing was issued$'):
+            j.record_go('go recorded for live name src_db', refuse)
+        self.assertEqual((checked, j.events(), j.conn.in_transaction), ([True], before, False), 'nothing written, the transaction closed')
+        j.record_go('go recorded for live name src_db', lambda journal: [])
+        self.assertEqual(j.events('switch_go'), ['go recorded for live name src_db'])
+        board = j.steps_board()
+        self.assertEqual(j.step_start('O7', unless=j.switch_began), 'the go decision was recorded: go recorded for live name src_db')
+        self.assertEqual(j.steps_board(), board, 'a refused start writes nothing')
+        with self.assertRaisesRegex(KitError, 'mark-recopy refused for t_big: the switch may have begun'):
+            j.mark_recopy('t_big', 0)
+        self.assertEqual(seen[-2:], [True, True])
+
+    def test_f4_reopen_evidence_clears_the_table_and_a_crash_part_way_leaves_the_journal_as_it_was(self):
+        """reopen_evidence (the fresh-table load) reopens O7 and O8 and clears the table's evidence in one transaction; a kill -9
+        stand-in at each of its journal writes rolls it all back, and the rerun reopens once."""
+        for method, match in ((None, None), ('event', lambda kind, detail: kind == 'evidence_reopened'),
+                              ('set_table_attr', lambda table, column, value: column == 'verified_at_utc'),
+                              ('step_end', lambda step_id, status, note=None, evidence_path=None: step_id == 'O8')):
+            with self.subTest(method=method):
+                j = Journal(MEMORY)
+                self.addCleanup(j.close)
+                j.init_plan(self.plans, 'src_db', 'tgt_db')
+                j.record_table_counts('t_big', 30, 30)
+                j.record_verification('t_big', 'count', 'match', 30, 30)
+                for step_id in ('O7', 'O8'):
+                    j.step_end(step_id, 'passed', 'passed before the load')
+                j.step_start('O6')
+                if method is not None:
+                    before = (j.tables(), j.steps_board(), j.events('evidence_reopened'))
+                    crash_journal(self, j, method, match=match)
+                    with self.assertRaises(SimulatedCrash):
+                        j.reopen_evidence('t_big', 'fresh-table load')
+                    self.assertEqual((j.tables(), j.steps_board(), j.events('evidence_reopened')), before)
+                j.reopen_evidence('t_big', 'fresh-table load')
+                row = next(t for t in j.tables() if t['table_name'] == 't_big')
+                self.assertEqual((row['target_count'], row['verified_at_utc'], row['recopy_epoch']), (None, None, 1))
+                self.assertEqual({s: j.step_status(s) for s in ('O6', 'O7', 'O8')}, {'O6': 'running', 'O7': 'pending', 'O8': 'pending'},
+                                 'the running O6 that loads the table keeps its status')
+                self.assertEqual(j.events('evidence_reopened'), ['t_big: fresh-table load'])
 
     def test_table_flags_and_attrs(self):
         j = self.j

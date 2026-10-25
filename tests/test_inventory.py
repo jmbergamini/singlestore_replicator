@@ -263,7 +263,7 @@ class PlanTests(unittest.TestCase):
                          "LOAD DATA KAFKA 'x' CREDENTIALS '<<CREDENTIALS>>' INTO TABLE t")
         self.assertEqual(I.redact_credentials('LOAD DATA S3 "b" CONFIG "{}" INTO TABLE t'), 'LOAD DATA S3 "b" CONFIG "{}" INTO TABLE t')
         with self.assertRaisesRegex(KitError, 'cannot replace'):
-            I.redact_credentials("LOAD DATA KAFKA 'x' CREDENTIALS @var INTO TABLE t", 'p9')
+            I.redact_credentials("LOAD DATA KAFKA 'x' CREDENTIALS <hidden> INTO TABLE t", 'p9')
         self.assertTrue(I.has_redaction_marker("CREDENTIALS '<redacted>'"))
         self.assertFalse(I.has_redaction_marker("CREDENTIALS '<<CREDENTIALS>>'"))
         create, alters = I.parse_pipeline_statements([{'Pipeline': 'p', 'Create Pipeline': 'CREATE PIPELINE `p` AS LOAD DATA S3 "b/k" INTO TABLE t',
@@ -274,6 +274,93 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(d, {'source_type': 'S3', 'source_location': 'bucket/prefix', 'target': 'table t', 'batch_interval': 500,
                              'duplicate_handling': 'SKIP DUPLICATE KEY ERRORS'})
         self.assertEqual(I.describe_pipeline('CREATE PIPELINE `p` AS LOAD DATA KAFKA "h/t" INTO PROCEDURE `pr`')['target'], 'procedure pr')
+
+
+class RoutineTests(unittest.TestCase):
+    def test_f8_a_pipeline_into_an_unlisted_procedure_is_refused_at_p3(self):
+        """A pipeline that loads into a procedure is refused unless objects.routines.ignore lists it (O9 does not recreate procedures)."""
+        answers = canned_answers()
+        show = answers['SHOW CREATE']
+
+        def show_create(norm, args):
+            rows = show(norm, args)
+            if norm.startswith('SHOW CREATE PIPELINE'):
+                rows[0]['Create Pipeline'] = rows[0]['Create Pipeline'].replace('INTO TABLE `t_keyed`', 'INTO PROCEDURE `load_orders`')
+            return rows
+        answers['SHOW CREATE'] = show_create
+
+        def config(names):
+            return config_from(lambda d: (d['connections'].update(owner={'user': 'admin', 'password_keychain': 's2rebuild-owner'}),
+                                          d.update(objects={'routines': {'ignore': names}})))
+        cfg = config(['proc1'])
+        inv = I.capture(FakeSession(answers), cfg.databases[0], cfg, FakeSession(answers), sleep=lambda s: None)
+        self.assertEqual(inv['pipelines']['items'][0]['target'], 'procedure load_orders')
+        with self.assertRaisesRegex(KitError, 'P3 refused for example_orders_db: routines are not migrated in this pass: pipeline p1 '
+                                              'loads into procedure load_orders, which is not listed in objects.routines.ignore'):
+            I.refuse_unmigrated(inv, cfg, cfg.databases[0], 'P3')
+        cfg = config(['proc1', 'load_orders'])
+        self.assertEqual(I.refuse_unmigrated(inv, cfg, cfg.databases[0], 'P3'), ['procedure proc1'])
+
+    def test_f8_a_qualified_name_lists_the_routine_for_its_database_only(self):
+        """database.routine lists the routine on that database only; a bare name lists it on every configured database."""
+        def config(names):
+            def mutate(d):
+                d['databases'].append({'source': 'second_db', 'layout': {'partitions': 8, 'sub_partitions': 64}})
+                d['objects'] = {'routines': {'ignore': names}}
+            return config_from(mutate)
+        routines = [{'name': 'proc1', 'type': 'PROCEDURE'}]
+        cfg = config([DB + '.proc1'])
+        first, second = cfg.databases
+        self.assertEqual(I.unmigrated(cfg, first, routines), (['procedure proc1'], []))
+        self.assertEqual(I.unmigrated(cfg, second, routines), ([], ['procedure proc1 is not listed in objects.routines.ignore']))
+        cfg = config(['proc1'])
+        self.assertEqual([I.unmigrated(cfg, db, routines) for db in cfg.databases], [(['procedure proc1'], [])] * 2)
+
+
+def answers_with_pipeline_rows(rows):
+    """canned_answers() where SHOW CREATE PIPELINE returns the given rows."""
+    answers = canned_answers()
+    show = answers['SHOW CREATE']
+    answers['SHOW CREATE'] = lambda norm, args: [dict(r) for r in rows] if norm.startswith('SHOW CREATE PIPELINE') else show(norm, args)
+    return answers
+
+
+class PipelineCaptureTests(unittest.TestCase):
+    """F14: the CREDENTIALS check refuses only an unreplaced clause, and an empty definition refuses the capture."""
+
+    def setUp(self):
+        self.cfg = config_from(lambda d: d['connections'].update(owner={'user': 'admin', 'password_keychain': 's2rebuild-owner'}))
+        self.db = self.cfg.databases[0]
+
+    def capture(self, answers):
+        return I.capture(FakeSession(answers), self.db, self.cfg, FakeSession(answers), sleep=lambda s: None)
+
+    def test_f14_a_topic_table_or_column_named_credentials_is_captured(self):
+        """The word credentials as a topic, a target table or a mapped column is no CREDENTIALS clause; an unreplaced clause still refuses."""
+        definition = ("CREATE PIPELINE `p1` AS LOAD DATA KAFKA 'b:9092/credentials' BATCH_INTERVAL 1000 REPLACE INTO TABLE `credentials` "
+                      "FORMAT JSON (`id` <- `id`, credentials <- data::credentials)")
+        inv = self.capture(answers_with_pipeline_rows([{'Pipeline': 'p1', 'Create Pipeline': definition}]))
+        p1 = inv['pipelines']['items'][0]
+        self.assertEqual(p1['definition'], definition, 'kept as the server returned it')
+        self.assertEqual((p1['source_location'], p1['target']), ('b:9092/credentials', 'table credentials'))
+        for plain in ("CREATE PIPELINE `p2` AS LOAD DATA S3 'bucket/credentials/' INTO TABLE credentials (id, credentials)",
+                      'CREATE PIPELINE `p3` AS LOAD DATA KAFKA "b/credentials" INTO TABLE `t`'):
+            self.assertEqual(I.redact_credentials(plain, 'p2'), plain)
+        kept = I.redact_credentials("CREATE PIPELINE `p4` AS LOAD DATA KAFKA 'b/credentials' CREDENTIALS <CREDENTIALS REDACTED> INTO TABLE credentials")
+        self.assertEqual(kept, "CREATE PIPELINE `p4` AS LOAD DATA KAFKA 'b/credentials' CREDENTIALS '<<CREDENTIALS>>' INTO TABLE credentials")
+        for unreplaced in ("CREDENTIALS <hidden>", "CREDENTIALS '{\"sasl.password\": \"unterminated"):
+            with self.assertRaisesRegex(KitError, 'Pipeline p5: the CREDENTIALS clause has a form the kit cannot replace'):
+                I.redact_credentials("CREATE PIPELINE `p5` AS LOAD DATA KAFKA 'b/credentials' %s INTO TABLE credentials" % unreplaced, 'p5')
+
+    def test_f14_an_empty_definition_refuses_the_capture_naming_the_pipeline(self):
+        """No CREATE row, an empty one, or no row at all from SHOW CREATE PIPELINE refuses the capture by name; nothing is returned to store."""
+        shapes = {'empty CREATE value': [{'Pipeline': 'p1', 'Create Pipeline': ''}],
+                  'ALTER rows only': [{'Pipeline': 'p1', 'Create Pipeline': "ALTER PIPELINE `p1` SET OFFSETS '{\"0\": 10}'"}],
+                  'no row': []}
+        for shape, rows in shapes.items():
+            with self.subTest(shape=shape):
+                with self.assertRaisesRegex(KitError, 'Pipeline p1: SHOW CREATE PIPELINE returned no CREATE statement; refusing to store'):
+                    self.capture(answers_with_pipeline_rows(rows))
 
 
 class DriftTests(unittest.TestCase):
@@ -337,7 +424,7 @@ class HandlerTests(unittest.TestCase):
             self.assertEqual(I.handle_p3(steps.REGISTRY['P3'], ctx).status, steps.REFUSED)
             target = I.inventory_dir(cfg, 'r1', cfg.databases[0], 'P3')
             target.mkdir(parents=True)
-            (target / I.INVENTORY_FILE).write_text('{}')
+            (target / I.INVENTORY_FILE).write_text('{"kit": "s2rebuild", "tables": []}')
             self.assertEqual(I.handle_p3(steps.REGISTRY['P3'], ctx).status, steps.PASSED)
             self.assertEqual(I.handle_o4(steps.REGISTRY['O4'], ctx).status, steps.REFUSED)
 

@@ -2,8 +2,9 @@
 
 Author: John Bergamini
 
-Section 10.10 of the architecture. Every table records verified_at_utc when a tier matches;
-O10 refuses to switch a database whose newest verified_at_utc is older than freeze_time. A
+Section 10.10 of the architecture. Every table records verified_at_utc when a tier matches,
+and every verification row carries the table's re-copy epoch; O10 refuses to switch unless
+every table was verified after freeze_time and after its last chunk, at its current epoch. A
 mismatching fingerprint group names the bucket to re-copy when the group count equals the
 table's bucket count. Statements issued, all through the read guard: SELECT COUNT(*), SELECT
 MAX(time column), SELECT MIN and MAX of the first key column, and the grouped fingerprint

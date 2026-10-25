@@ -23,3 +23,6 @@ window:
   end: 2026-11-01T13:00:00Z
   restart_allowance_minutes: 60
   buffer_minutes: 30
+objects:
+  routines:
+    ignore: [nightly_rollup]

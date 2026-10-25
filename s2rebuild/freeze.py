@@ -8,13 +8,18 @@ at most freeze.detach_wait_seconds; then the kit cancels it on its own connectio
 DETACH ... KILL when freeze.detach_kill is set (ownersql.detach_with_escalation). O3 is
 resumable: when the source is already attached READONLY on the recorded STORAGE_ID (a rerun,
 a notebook run or a block run by hand), the kit only checks the attachment, runs the write probe
-and records freeze_time. The write probe is the one runner statement that names the source in a
-write, allowed by the probe guard in O3 only; it compares a string column with a token that
-cannot exist (a string compared with a numeric column would convert to 0 and could match), or,
-on a table without string columns, an integer key with MIN minus one. Statements issued: DETACH
-DATABASE (and DETACH ... KILL, KILL QUERY on the kit's own waiting connection), ATTACH DATABASE
-... READ ONLY through the O3 owner guard; the probe DELETE and SET lock_wait_timeout through the
-runner probe guard; SELECT on the attachment and privilege views.
+and records freeze_time. When no database carries the source name and the recorded storage is
+detached (a stop between DETACH and ATTACH), the kit prints and runs the re-entry block, which
+starts at the ATTACH and never detaches again (owner-sql/O3-reentry.sql; owner-sql O3 writes it
+too). The kit reads the position with the owner session when the owner profile is configured,
+else as the runner. The write probe is the one runner statement that
+names the source in a write, allowed by the probe guard in O3 only; it compares a string column
+with a token that cannot exist (a string compared with a numeric column would convert to 0 and
+could match), or, on a table without string columns, an integer key with MIN minus one.
+Statements issued: DETACH DATABASE (and DETACH ... KILL, KILL QUERY on the kit's own waiting
+connection), ATTACH DATABASE ... READ ONLY through the O3 owner guard; the probe DELETE and SET
+lock_wait_timeout through the runner probe guard; SELECT on the attachment, branch and privilege
+views.
 """
 import secrets as random_secrets
 
@@ -26,11 +31,20 @@ PIPELINES_RUNNING_SQL = "SELECT COUNT(*) AS n FROM information_schema.PIPELINES 
 READ_ONLY_ERRNOS = (1290, 1836)
 STRING_TYPES = ('char', 'varchar', 'text', 'tinytext', 'mediumtext', 'longtext')
 INTEGER_TYPES = ('tinyint', 'smallint', 'mediumint', 'int', 'integer', 'bigint')
+PROBE_NOTE = ('The kit then runs the write probe as the runner and records freeze_time. After a notebook or hand run, '
+              's2rebuild step O3 --redo does both (it sees the READONLY attachment and resumes there).')
+REENTRY_NOTE = ('Re-entry: when the first check finds no rows, an earlier run may have stopped between DETACH and ATTACH. '
+                'Then run the re-entry block instead; it starts at the ATTACH: owner-sql/O3-reentry.sql (s2rebuild owner-sql O3 writes it), '
+                'or s2rebuild step O3 --redo, which prints and runs it (O3-reentry in the notebook).')
 
 
 def block(names):
-    """The O3 Path A block: checks, DETACH (with the wait and KILL escalation), check, ATTACH READ ONLY, checks, probe note."""
+    """The O3 Path A block: re-entry note, checks, DETACH (with the wait and KILL escalation), check, ATTACH READ ONLY, checks, probe note.
+
+    The re-entry note comes first, so a reader who stops at the first check has already read it.
+    """
     b = ownersql.Block('O3', 'Freeze: read-only attachment (Path A)')
+    b.note(REENTRY_NOTE)
     b.check('source attached READWRITE', switch.ATTACHED_SQL, (names['source'],), ownersql.Expect('column_equals', 'ATTACH_TYPE', 'READWRITE'))
     b.check('source STORAGE_ID equals the recorded one', switch.ATTACHED_SQL, (names['source'],), ownersql.Expect('column_equals', 'STORAGE_ID', names['source_sid']))
     b.check('no pipeline Running (O2 passed)', PIPELINES_RUNNING_SQL, (names['source'],), ownersql.Expect('column_equals', 'n', 0))
@@ -39,12 +53,39 @@ def block(names):
                                                                          ', cancel it and run DETACH DATABASE %s KILL instead' % ident(names['source']) if names['detach_kill']
                                                                          else ' cancel it and stop the writers first (detach_kill is off; s2rebuild lockout works as a bridge)'),
                 detach={'wait': names['detach_wait_seconds'], 'kill': bool(names['detach_kill'])})
-    b.check('source storage detached', switch.BRANCH_SQL, (names['source_sid'],), ownersql.Expect('column_equals', 'IS_DETACHED', 1))
-    b.statement("ATTACH DATABASE %s STORAGEID '%s' READ ONLY" % (ident(names['source']), names['source_sid']), 'attach the same storage read only')
+    _detached_check(b, names)
+    _attach(b, names)
     _after_checks(b, names)
-    b.note('The kit then runs the write probe as the runner and records freeze_time. After a notebook or hand run, '
-           's2rebuild step O3 --redo does both (it sees the READONLY attachment and resumes there).')
+    b.note(PROBE_NOTE)
     return b
+
+
+def reentry_block(names):
+    """The O3 re-entry block between DETACH and ATTACH: checks (storage detached, names free), ATTACH READ ONLY, checks, probe note.
+
+    An earlier run detached the source and stopped before the ATTACH. The replacement check
+    tells this state from the switch (S1) or a rollback (R1), which detach the source too: the
+    replacement exists only from O5 on, and P2 checked that its name was free.
+    """
+    b = ownersql.Block('O3', 'Freeze: re-entry between DETACH and ATTACH (Path A)')
+    b.note('An earlier run detached the source and stopped before the ATTACH; the block starts at the ATTACH. No DETACH is issued again.')
+    _detached_check(b, names)
+    b.check('no attached database named source', switch.ATTACHED_SQL, (names['source'],), ownersql.Expect('no_rows'))
+    b.check('no attached database named replacement (O5 and the switch have not run)', switch.ATTACHED_SQL, (names['replacement'],),
+            ownersql.Expect('no_rows'))
+    _attach(b, names)
+    _after_checks(b, names)
+    b.note(PROBE_NOTE)
+    return b
+
+
+def _detached_check(b, names):
+    """The gate ahead of every ATTACH: MV_CLOUD_BRANCHES shows the recorded source storage IS_DETACHED = 1."""
+    b.check('source storage detached', switch.BRANCH_SQL, (names['source_sid'],), ownersql.Expect('column_equals', 'IS_DETACHED', 1))
+
+
+def _attach(b, names):
+    b.statement("ATTACH DATABASE %s STORAGEID '%s' READ ONLY" % (ident(names['source']), names['source_sid']), 'attach the same storage read only')
 
 
 def _after_checks(b, names):
@@ -138,6 +179,25 @@ def source_attachment(session, source):
     return dict(rows[0]) if rows else None
 
 
+def storage_detached(session, storage_id, log=None, identity='runner'):
+    """True when MV_CLOUD_BRANCHES shows the storage with IS_DETACHED = 1 (a SELECT; issues nothing else).
+
+    A read error (a lost connection, or an account without access to the view) returns False
+    and is logged with the identity, the error type and the error number only. The caller then
+    gives the whole block, whose first check stops with the observed state.
+    """
+    try:
+        rows = session.query(switch.BRANCH_SQL, (storage_id,))
+    except Exception as exc:  # noqa: BLE001 - the whole block's first check reports the state instead
+        args = getattr(exc, 'args', ())
+        number = args[0] if args and isinstance(args[0], int) else 'unknown'
+        if log is not None:
+            log('could not read MV_CLOUD_BRANCHES for STORAGE_ID %s as the %s (%s, error %s); the whole block follows and its first '
+                'check reports the state' % (storage_id, identity, type(exc).__name__, number))
+        return False
+    return bool(rows) and str(dict(rows[0]).get('IS_DETACHED')) == '1'
+
+
 def finish_freeze(ctx):
     """The python postconditions of Path A: the write probe as the runner, freeze_time, and the grants reference for C1."""
     from . import copy as copy_module
@@ -166,13 +226,26 @@ def finish_freeze(ctx):
 
 
 def handle_o3(step, ctx):
-    """O3 handler: Path A prints and executes the block (or resumes after READONLY), then the probe and freeze_time; Path B defers to lockout."""
+    """O3 handler: Path A prints and executes the block, or resumes (after READONLY, or between DETACH and ATTACH), then the probe and freeze_time.
+
+    The position comes from the attachment views, read with the owner session when the owner
+    profile is configured (as O10 does), else as the runner: the source READONLY on the
+    recorded STORAGE_ID resumes at the probe; no database under the source name with the
+    recorded storage detached resumes at the ATTACH through the normal admin flow (printed to
+    owner-sql/O3-reentry.sql, executed with the owner profile or left for the gate). Anything
+    else gets the whole block, whose first checks refuse a source name held by another storage.
+    A read error on the branch view, and a dry run (it opens no connection), also get the whole
+    block. Path B defers to lockout.
+    """
     if ctx.config.freeze.mode == 'lockout':
         from . import lockout
         return lockout.handle_o3_lockout(step, ctx)
     names = ownersql.names_for(ctx)
     if not ctx.dry_run and not ownersql.placeholders(names['source_sid']):
-        reader = ctx.runner_session(read_guard('runner O3'))
+        identity = 'owner' if ctx.owner_configured else 'runner'
+        guard = read_guard('%s O3' % identity)
+        reader = ctx.owner_session(guard) if ctx.owner_configured else ctx.runner_session(guard)
+        results, detached = None, False
         try:
             att = source_attachment(reader, ctx.db.source)
             if att and str(att.get('ATTACH_TYPE')).upper() == 'READONLY' and str(att.get('STORAGE_ID')) == str(names['source_sid']):
@@ -180,14 +253,26 @@ def handle_o3(step, ctx):
                 ownersql.print_block(b, ctx, ownersql.owner_sql_path(ctx, 'O3'))
                 ctx.log('source %s is already READONLY on STORAGE_ID %s; resuming at the probe' % (ctx.db.source, names['source_sid']))
                 results = ownersql.execute_block(b, reader, ctx.log, ctx.journal)
-            else:
-                results = None
+            elif att is None:
+                detached = storage_detached(reader, names['source_sid'], ctx.log, identity)
         finally:
             reader.close()
         if results is not None:
             finish_freeze(ctx)
             return steps.Outcome(steps.PASSED, 'O3 resumed: READONLY attachment verified, write probe refused, freeze_time %s'
                                  % ctx.journal.get_meta('freeze_time'))
+        if detached:
+            ctx.log('no database is attached as %s and STORAGE_ID %s is detached: an earlier run stopped between DETACH and ATTACH; '
+                    'resuming at the ATTACH' % (ctx.db.source, names['source_sid']))
+            out = ownersql.handle_admin(step, ctx, reentry_block(names), after=lambda results: finish_freeze(ctx),
+                                        path=ownersql.owner_sql_path(ctx, 'O3', variant='reentry'))
+            if out.status == steps.PASSED:
+                return steps.Outcome(steps.PASSED, 'O3 resumed at the ATTACH: write probe refused, freeze_time %s; %s'
+                                     % (ctx.journal.get_meta('freeze_time'), out.note))
+            return out
+    if ctx.dry_run:
+        ctx.log('dry run: no connection is opened, so the attachment state is not read; after a stop between DETACH and ATTACH, '
+                's2rebuild step O3 --redo prints and runs the re-entry block instead (it starts at the ATTACH)')
     b = block(names)
     return ownersql.handle_admin(step, ctx, b, after=lambda results: finish_freeze(ctx))
 

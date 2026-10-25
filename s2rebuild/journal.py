@@ -4,8 +4,13 @@ Author: John Bergamini
 
 One journal per run per database (section 9 of the architecture): WAL mode, synchronous
 FULL, every write behind one lock. The schema carries a schema_version row in meta and a
-migration list; a journal written by the reference runner (no version row) is upgraded in
-place. Statements issued by this module: SQLite statements against the journal file only.
+migration list; a journal written by the reference runner (no version row) or by an earlier
+version of the kit is upgraded in place. A re-copy (mark_recopy) reopens the evidence built on
+the copy: it increments the table's recopy_epoch, and every verification row carries the epoch
+it verified. A mark, the start of O6 to O8 and the go decision of O10 (record_go) each read the
+switch state in their own BEGIN IMMEDIATE transaction, so of a re-copy and a go only the first
+to commit goes ahead. Statements issued by this module: SQLite statements against the journal
+file only.
 """
 import json
 import sqlite3
@@ -14,7 +19,7 @@ from pathlib import Path
 
 from .common import KitError, iso, utc_now
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 MEMORY = ':memory:'
 STEP_STATUSES = ('pending', 'running', 'passed', 'failed', 'skipped')
 CHUNK_STATES = ('pending', 'started', 'done', 'failed')
@@ -36,14 +41,15 @@ COLUMNS = {
                ('created_in_target', 'INTEGER NOT NULL DEFAULT 0'), ('definition_ok', 'INTEGER NOT NULL DEFAULT 0'),
                ('source_count', 'INTEGER'), ('target_count', 'INTEGER'), ('counted_utc', 'TEXT'),
                ('size_gib', 'REAL'), ('time_column', 'TEXT'), ('unique_key_lock_risk', 'INTEGER NOT NULL DEFAULT 0'),
-               ('concurrency', 'INTEGER'), ('verified_at_utc', 'TEXT')],
+               ('concurrency', 'INTEGER'), ('verified_at_utc', 'TEXT'), ('recopy_epoch', 'INTEGER NOT NULL DEFAULT 0')],
     'chunks': [('table_name', 'TEXT NOT NULL'), ('bucket', 'INTEGER NOT NULL'), ('state', 'TEXT NOT NULL'),
                ('rows_inserted', 'INTEGER'), ('started_utc', 'TEXT'), ('ended_utc', 'TEXT'),
                ('attempts', 'INTEGER NOT NULL DEFAULT 0'), ('error', 'TEXT'), ('source_count', 'INTEGER'),
                ('target_count', 'INTEGER'), ('counted_utc', 'TEXT')],
     'verification': [('id', 'INTEGER PRIMARY KEY AUTOINCREMENT'), ('table_name', 'TEXT NOT NULL'), ('tier', 'TEXT NOT NULL'),
                      ('result', 'TEXT NOT NULL'), ('source_value', 'TEXT'), ('target_value', 'TEXT'),
-                     ('sql_source', 'TEXT'), ('sql_target', 'TEXT'), ('detail', 'TEXT'), ('checked_utc', 'TEXT NOT NULL')],
+                     ('sql_source', 'TEXT'), ('sql_target', 'TEXT'), ('detail', 'TEXT'), ('checked_utc', 'TEXT NOT NULL'),
+                     ('epoch', 'INTEGER')],
     'attachments': [('id', 'INTEGER PRIMARY KEY AUTOINCREMENT'), ('role', 'TEXT NOT NULL'), ('database_name', 'TEXT NOT NULL'),
                     ('storage_id', 'TEXT'), ('compute_id', 'TEXT'), ('attach_type', 'TEXT'), ('observed_utc', 'TEXT NOT NULL')],
     'grants_snapshot': [('grantee', 'TEXT PRIMARY KEY'), ('privileges_json', 'TEXT NOT NULL'),
@@ -58,6 +64,12 @@ COLUMNS = {
     'events': [('ts', 'TEXT NOT NULL'), ('kind', 'TEXT NOT NULL'), ('detail', 'TEXT NOT NULL')],
 }
 TABLE_CONSTRAINTS = {'chunks': 'PRIMARY KEY (table_name, bucket)'}
+# Columns a later schema version added to a version 1 journal, by the version that added them.
+ADDED_COLUMNS = {2: {'tables': [('recopy_epoch', 'INTEGER NOT NULL DEFAULT 0')], 'verification': [('epoch', 'INTEGER')]}}
+# Steps whose evidence a re-copy invalidates, with the note mark_recopy records when it reopens them.
+RECOPY_REOPENS = (('O6', 'buckets of %s marked for re-copy; rerun O6'),
+                  ('O7', 'counters and stale check predate the re-copy of %s; rerun O7 after O6'),
+                  ('O8', 'verification predates the re-copy of %s; rerun O8 after O7'))
 
 
 def create_table_sql(name):
@@ -97,8 +109,9 @@ def _open_error(path, exc):
 class Journal:
     """The run journal. Open with a path, or MEMORY for a throwaway in-memory journal.
 
-    read_only opens an existing journal without migrating it (status); a journal in an older
-    schema is refused with the command that upgrades it. Every sqlite failure while opening
+    read_only opens an existing journal without migrating it (status). A version 1 journal opens
+    as it is, since status reads only the steps; a journal without every table (the reference
+    runner's) is refused with the command that upgrades it. Every sqlite failure while opening
     becomes a KitError that names the path.
     """
 
@@ -168,6 +181,8 @@ class Journal:
                     version, SCHEMA_VERSION))
             if version < 1:
                 self._migrate_to_1()
+            if version < 2:
+                self._migrate_to_2()
             self.conn.execute("INSERT INTO meta (key, value) VALUES ('schema_version', ?) "
                               'ON CONFLICT(key) DO UPDATE SET value = excluded.value', (str(SCHEMA_VERSION),))
 
@@ -184,6 +199,20 @@ class Journal:
                     for col, decl in COLUMNS[name]:
                         if col not in have:
                             self.conn.execute('ALTER TABLE %s ADD COLUMN %s %s' % (name, col, decl.replace(' PRIMARY KEY', '')))
+            self.conn.execute('COMMIT')
+        except Exception:
+            self.conn.execute('ROLLBACK')
+            raise
+
+    def _migrate_to_2(self):
+        """Version 2: tables.recopy_epoch and verification.epoch, added to a version 1 journal when missing."""
+        self.conn.execute('BEGIN')
+        try:
+            for name, columns in ADDED_COLUMNS[2].items():
+                have = set(self._existing_columns(name))
+                for col, decl in columns:
+                    if col not in have:
+                        self.conn.execute('ALTER TABLE %s ADD COLUMN %s %s' % (name, col, decl))
             self.conn.execute('COMMIT')
         except Exception:
             self.conn.execute('ROLLBACK')
@@ -223,6 +252,26 @@ class Journal:
         """Every meta key and value as a dict."""
         return {k: v for k, v in self._q('SELECT key, value FROM meta ORDER BY key')}
 
+    def accept_config_hash(self, old, new, note):
+        """Record an accepted configuration change: a config_change event with both hashes and the note, then new as config_hash.
+
+        One BEGIN IMMEDIATE transaction, so a crash part way leaves the old hash and no event. Refused,
+        with nothing written, when the recorded hash is no longer old (another process accepted first).
+        """
+        with self.lock:
+            self.conn.execute('BEGIN IMMEDIATE')
+            try:
+                recorded = self.get_meta('config_hash')
+                if recorded != old:
+                    raise KitError('The configuration hash of %s changed meanwhile (now %s); run the command again' % (
+                        self.path, (recorded or 'none')[:12]))
+                self.event('config_change', 'configuration hash %s replaced by %s after O1: %s' % (old, new, note))
+                self.set_meta('config_hash', new)
+                self.conn.execute('COMMIT')
+            except BaseException:
+                self.conn.execute('ROLLBACK')
+                raise
+
     def event(self, kind, detail):
         """Append one timestamped event row (kind, detail)."""
         self._q('INSERT INTO events (ts, kind, detail) VALUES (?, ?, ?)', (iso(utc_now()), kind, str(detail)))
@@ -244,8 +293,30 @@ class Journal:
         row = self.step(step_id)
         return row['status'] if row else None
 
-    def step_start(self, step_id, note=None):
-        """Mark a step running. Clears the previous end time and keeps earlier evidence."""
+    def step_start(self, step_id, note=None, unless=None):
+        """Mark a step running. Clears the previous end time and keeps earlier evidence.
+
+        unless, when given, is called inside the same BEGIN IMMEDIATE transaction before the write
+        (run_step passes switch_began for O6 to O8). When it returns a reason, nothing is written and
+        the reason is returned. So a go decision committed by another process is never missed, and
+        a step started first is seen running by the go (record_go). Returns None when started.
+        """
+        if unless is None:
+            self._step_start(step_id, note)
+            return None
+        with self.lock:
+            self.conn.execute('BEGIN IMMEDIATE')
+            try:
+                reason = unless()
+                if not reason:
+                    self._step_start(step_id, note)
+                self.conn.execute('COMMIT')
+            except BaseException:
+                self.conn.execute('ROLLBACK')
+                raise
+        return reason or None
+
+    def _step_start(self, step_id, note):
         now = iso(utc_now())
         self._q('INSERT INTO steps (step_id, status, started_utc, ended_utc, note) VALUES (?, ?, ?, NULL, ?) '
                 'ON CONFLICT(step_id) DO UPDATE SET status = excluded.status, started_utc = excluded.started_utc, '
@@ -363,10 +434,33 @@ class Journal:
         self._q("UPDATE chunks SET state = 'started', started_utc = ?, ended_utc = NULL, attempts = attempts + 1, "
                 'error = NULL WHERE table_name = ? AND bucket = ?', (iso(utc_now()), table, bucket))
 
-    def mark_done(self, table, bucket, rows):
-        """Record a finished chunk with the rows the INSERT reported."""
+    def mark_done(self, table, bucket, rows, error=None):
+        """Record a finished chunk with the rows the INSERT reported; error, when given, tags how it was loaded (the fresh-table load)."""
+        if error is not None:
+            self._q("UPDATE chunks SET state = 'done', rows_inserted = ?, ended_utc = ?, error = ? WHERE table_name = ? AND bucket = ?",
+                    (rows, iso(utc_now()), str(error)[:2000], table, bucket))
+            return
         self._q("UPDATE chunks SET state = 'done', rows_inserted = ?, ended_utc = ? WHERE table_name = ? AND bucket = ?",
                 (rows, iso(utc_now()), table, bucket))
+
+    def mark_loaded(self, table, n_buckets, rows, error, meta_key, meta_value):
+        """Record a whole-table load (the fresh-table load) in one BEGIN IMMEDIATE transaction.
+
+        Every bucket of table is marked started, then done with error as its tag (bucket 0 with
+        rows, the others with 0), then meta_key is set to meta_value. A crash part way leaves the
+        journal as it was, so the meta value never reads done beside a bucket that is not.
+        """
+        with self.lock:
+            self.conn.execute('BEGIN IMMEDIATE')
+            try:
+                for b in range(n_buckets):
+                    self.mark_started(table, b)
+                    self.mark_done(table, b, rows if b == 0 else 0, error=error)
+                self.set_meta(meta_key, meta_value)
+                self.conn.execute('COMMIT')
+            except BaseException:
+                self.conn.execute('ROLLBACK')
+                raise
 
     def undo_attempt(self, table, bucket):
         """A lock wait does not count against the attempt limit."""
@@ -378,11 +472,36 @@ class Journal:
         self._q("UPDATE chunks SET state = 'failed', ended_utc = ?, error = ? WHERE table_name = ? AND bucket = ?",
                 (iso(utc_now()), str(error)[:2000], table, bucket))
 
-    def mark_recopy(self, table, bucket=None):
-        """Set buckets to failed with attempts 0 so the next copy run deletes and re-inserts them."""
-        known = {r[0] for r in self._q('SELECT table_name FROM tables')}
-        if table not in known:
+    def has_table(self, table):
+        """True when table is a planned table of this journal."""
+        return bool(self._q('SELECT 1 FROM tables WHERE table_name = ?', (table,)))
+
+    def check_recopy(self, table, bucket=None):
+        """Refuse a re-copy mark before anything is written: a table not in this journal, a bucket not in the table, or a switch
+        that may have begun (switch_began). mark_recopy runs it inside its own transaction, so a go decision committed by another
+        process just before is seen; mark-recopy also runs it on every selected journal before it marks any of them. Reads the
+        journal only."""
+        if not self.has_table(table):
             raise KitError('Table %s is not in this journal' % table)
+        began = self.switch_began()
+        if began:
+            raise KitError('mark-recopy refused for %s: the switch may have begun (%s); a re-copy now would change the copy behind the '
+                           'live name and clear the target counts the rollback proof compares; nothing was marked. Finish the switch or '
+                           'roll it back; a new copy is a new run' % (table, began))
+        if bucket is not None and not self._q('SELECT 1 FROM chunks WHERE table_name = ? AND bucket = ?', (table, int(bucket))):
+            raise KitError('No bucket matched %s bucket %d' % (table, int(bucket)))
+
+    def mark_recopy(self, table, bucket=None):
+        """Set buckets to failed with attempts 0 so the next copy run deletes and re-inserts them; reopen what the copy proved.
+
+        One BEGIN IMMEDIATE transaction: check_recopy, the chunk rows, the mark_recopy event and
+        _reopen_evidence (the table's verified_at_utc and target_count cleared, its recopy_epoch
+        incremented, O6, O7 and O8 set to pending when they had passed). A crash part way leaves
+        the journal as it was. Refused, with nothing written, by check_recopy (once the switch may
+        have begun, among others); since the check reads inside the transaction, a mark and the go
+        decision of O10 (record_go) are ordered: whichever commits second is refused.
+        Returns the buckets marked.
+        """
         if bucket is None:
             cur_sql = ("UPDATE chunks SET state = 'failed', attempts = 0, error = 'marked for re-copy', ended_utc = NULL "
                        'WHERE table_name = ?')
@@ -392,13 +511,104 @@ class Journal:
                        'WHERE table_name = ? AND bucket = ?')
             args = (table, int(bucket))
         with self.lock:
-            count = self.conn.execute(cur_sql, args).rowcount
-        if count == 0:
-            raise KitError('No bucket matched %s%s' % (table, '' if bucket is None else ' bucket %d' % bucket))
-        self.event('mark_recopy', '%s%s' % (table, '' if bucket is None else ' bucket %d' % bucket))
-        if self.step_status('O6') == 'passed':
-            self.step_end('O6', 'pending', 'buckets marked for re-copy; rerun O6')
+            self.conn.execute('BEGIN IMMEDIATE')
+            try:
+                self.check_recopy(table, bucket)
+                count = self.conn.execute(cur_sql, args).rowcount
+                if count == 0:
+                    raise KitError('No bucket matched %s%s' % (table, '' if bucket is None else ' bucket %d' % bucket))
+                self.event('mark_recopy', '%s%s' % (table, '' if bucket is None else ' bucket %d' % bucket))
+                self._reopen_evidence(table)
+                self.conn.execute('COMMIT')
+            except BaseException:
+                self.conn.execute('ROLLBACK')
+                raise
         return count
+
+    def reopen_evidence(self, table, reason):
+        """Clear the evidence built on the rows of table before they are replaced another way (the fresh-table load).
+
+        One transaction: an evidence_reopened event with the reason, then _reopen_evidence. A crash
+        part way leaves the journal as it was.
+        """
+        with self.lock:
+            self.conn.execute('BEGIN IMMEDIATE')
+            try:
+                self.event('evidence_reopened', '%s: %s' % (table, reason))
+                self._reopen_evidence(table)
+                self.conn.execute('COMMIT')
+            except BaseException:
+                self.conn.execute('ROLLBACK')
+                raise
+
+    def _reopen_evidence(self, table):
+        """Inside the caller's transaction: target_count and verified_at_utc of table cleared, recopy_epoch + 1, and O6, O7 and
+        O8 set to pending when passed or skipped, each note naming the table; a running or failed step keeps its status."""
+        self.conn.execute('UPDATE tables SET target_count = NULL, recopy_epoch = recopy_epoch + 1 WHERE table_name = ?', (table,))
+        self.set_table_attr(table, 'verified_at_utc', None)
+        for step_id, note in RECOPY_REOPENS:
+            if self.step_status(step_id) in ('passed', 'skipped'):
+                self.step_end(step_id, 'pending', note % table)
+
+    def record_go(self, detail, check):
+        """Record the go decision of O10 (the switch_go event) in one BEGIN IMMEDIATE transaction with its last check.
+
+        check(journal) returns the problems that refuse the go, read inside the transaction. A
+        re-copy mark or a step start that another process committed first is seen, and one that
+        commits after sees the go, since mark_recopy and run_step read switch_began in their own
+        transactions. With a problem left nothing is written and KitError names every problem.
+        """
+        with self.lock:
+            self.conn.execute('BEGIN IMMEDIATE')
+            try:
+                problems = list(check(self))
+                if problems:
+                    raise KitError('S0 refused at the go decision: %s; nothing was issued' % '; '.join(problems))
+                self.event('switch_go', detail)
+                self.conn.execute('COMMIT')
+            except BaseException:
+                self.conn.execute('ROLLBACK')
+                raise
+
+    def switch_began(self):
+        """Why the switch may have begun, or None: O10 passed, the go decision recorded, an O10 gate recorded (pass or fail),
+        a switch observed (switch_observed: in the evidence of a refused gate O10 --pass, or in the position O10 read before its
+        go), a switched, rollback or release time recorded, or the retained or live attachment recorded.
+
+        From then on the copy is what the live name resolves to and target_count is what the rollback
+        proof compares, so mark_recopy and O6 to O8 refuse. The kit route records the go decision
+        (record_go) before its first statement, so an O10 that stopped before the go (a Ctrl-C at the
+        typed-name prompt, a lost owner connection, a stop during S0) issued nothing and does not count,
+        even when it is failed or still running. Every O10 refusal that issues nothing comes before the
+        go (S0 with the Path B last lockout pass, the S1 before-checks, the go transaction), so it
+        does not count either. While it waits for the go, O10 holds the copy lock and
+        record_go reads S0's journal part again, so a re-copy in that window is refused or refuses the
+        go. A gate is how a person reports a hand or notebook O10, so any O10 gate counts. Reads the
+        journal only.
+        """
+        if self.step_status('O10') == 'passed':
+            return 'O10 is passed'
+        go = self.events('switch_go')
+        if go:
+            return 'the go decision was recorded: %s' % go[-1]
+        gates = [d for d in self.events('gate') if d.startswith('O10 ')]
+        if gates:
+            return 'gate O10 --%s was recorded' % gates[-1].split(' ')[1].rstrip(':')
+        observed = self.events('switch_observed')
+        if observed:
+            return 'a switch was observed: %s' % observed[-1]
+        for key in ('switched_utc', 'rollback_started_utc', 'rolled_back_utc', 'release_started_utc', 'released_utc'):
+            if self.get_meta(key):
+                return '%s is %s' % (key, self.get_meta(key))
+        for role in ('retained', 'live'):
+            if self.attachment(role):
+                return 'the %s attachment is recorded' % role
+        return None
+
+    def recopy_epoch(self, table):
+        """The table's re-copy epoch: 0 until mark_recopy first marks it, then one more per mark."""
+        rows = self._q('SELECT recopy_epoch FROM tables WHERE table_name = ?', (table,))
+        return int(rows[0][0] or 0) if rows else 0
 
     def record_chunk_counts(self, table, bucket, source_count, target_count):
         """Store the per-bucket COUNT(*) of both sides with the time of the count."""
@@ -418,15 +628,37 @@ class Journal:
     # -- verification -----------------------------------------------------------
     def record_verification(self, table, tier, result, source_value=None, target_value=None, sql_source=None,
                             sql_target=None, detail=None):
-        """Append one verification row; a result of 'match' also stamps the table's verified_at_utc. Returns the time."""
+        """Append one verification row at the table's current recopy_epoch; a result of 'match' also stamps verified_at_utc.
+
+        Returns the time of the row.
+        """
         now = iso(utc_now())
         self._q('INSERT INTO verification (table_name, tier, result, source_value, target_value, sql_source, sql_target, '
-                'detail, checked_utc) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                'detail, checked_utc, epoch) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, (SELECT recopy_epoch FROM tables WHERE table_name = ?))',
                 (table, tier, result, None if source_value is None else str(source_value),
-                 None if target_value is None else str(target_value), sql_source, sql_target, detail, now))
+                 None if target_value is None else str(target_value), sql_source, sql_target, detail, now, table))
         if result == 'match':
             self.set_table_attr(table, 'verified_at_utc', now)
         return now
+
+    def verification_state(self):
+        """Per planned table, by name: verified_at_utc, recopy_epoch, the chunks not done, the newest chunk ended_utc,
+        and epoch_verified (1 when a match or sampled verification row carries the current recopy_epoch).
+
+        A version 1 journal opened read only (owner-sql) has no epoch columns: every table reads
+        epoch 0 and not epoch_verified, as after its upgrade, where the old rows carry no epoch.
+        """
+        if 'recopy_epoch' not in self._existing_columns('tables') or 'epoch' not in self._existing_columns('verification'):
+            epoch, verified = '0 AS recopy_epoch', '0 AS epoch_verified'
+        else:
+            epoch = 't.recopy_epoch'
+            verified = ("EXISTS (SELECT 1 FROM verification v WHERE v.table_name = t.table_name AND v.epoch = t.recopy_epoch "
+                        "AND v.result IN ('match', 'sampled')) AS epoch_verified")
+        return self._rows(
+            'SELECT t.table_name, t.verified_at_utc, %s, ' % epoch +
+            "(SELECT COUNT(*) FROM chunks c WHERE c.table_name = t.table_name AND c.state != 'done') AS chunks_open, "
+            '(SELECT MAX(c.ended_utc) FROM chunks c WHERE c.table_name = t.table_name) AS last_chunk_end, '
+            '%s FROM tables t ORDER BY t.table_name' % verified)
 
     def verifications(self, table=None, tier=None):
         """Verification rows as dicts, filtered by table and tier when given."""

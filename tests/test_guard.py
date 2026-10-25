@@ -44,6 +44,7 @@ class ClassifyTests(unittest.TestCase):
             ("ATTACH DATABASE `src` AS `ret` STORAGEID 'abc' READ ONLY", 'ATTACH DATABASE', ('src', 'ret')),
             ("ATTACH DATABASE `repl` AS `src` STORAGEID 'def'", 'ATTACH DATABASE', ('repl', 'src')),
             ('CREATE TABLE `repl`.`t` LIKE `src`.`t`', 'CREATE TABLE', ('repl',)),
+            ('CREATE TABLE `repl`.`t__fresh` LIKE `repl`.`t`', 'CREATE TABLE', ('repl',)),
             ('DROP TABLE `repl`.`t`', 'DROP TABLE', ('repl',)),
             ('ALTER TABLE `repl`.`t` AUTO_INCREMENT = 12', 'ALTER TABLE', ('repl',)),
             ('ALTER TABLE `repl`.`t__fresh` RENAME TO `t`', 'ALTER TABLE', ('repl',)),
@@ -71,6 +72,23 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(classify('DETACH DATABASE `s` FORCE').detail, 'FORCE')
         self.assertEqual(classify("ATTACH DATABASE `s` STORAGEID 'x' READ ONLY").detail, 'READ ONLY')
         self.assertEqual(classify('SET GLOBAL Query_Parallelism_Per_Leaf_Core = 1').detail, 'query_parallelism_per_leaf_core')
+
+    def test_f7_create_view_with_a_definer_names_the_replacement_only(self):
+        """CREATE VIEW keeps its kind and database with a DEFINER clause in either quote form; the O7 owner guard names the replacement only."""
+        for sql in ('CREATE DEFINER=`app`@`%` SCHEMA_BINDING=OFF VIEW `repl`.`v` AS SELECT 1',
+                    'CREATE ALGORITHM=UNDEFINED DEFINER=`app`@`%` SQL SECURITY DEFINER VIEW `repl`.`v` AS SELECT 1',
+                    "CREATE DEFINER = 'app'@'%' VIEW `repl`.`v` AS SELECT 1"):
+            st = classify(sql)
+            self.assertEqual((st.kind, st.databases, st.detail), ('CREATE VIEW', ('repl',), 'v'), sql)
+        with self.assertRaises(GuardError):
+            classify("CREATE DEFINER=`app`@`%` VIEW `repl`.`v` AS SELECT 1; DROP DATABASE `src`")
+        o7 = steps.guard_for('O7', DB, steps.OWNER)
+        o7.check('USE `%s`' % TGT)
+        o7.check('CREATE DEFINER=`app`@`%%` VIEW `%s`.`v` AS SELECT 1' % TGT)
+        for sql in ('CREATE VIEW `%s`.`v` AS SELECT 1' % SRC, 'USE `%s`' % SRC, 'CREATE TABLE `%s`.`t` LIKE `%s`.`t`' % (TGT, SRC),
+                    "DROP USER 's2rebuild_runner'@'%'"):
+            with self.assertRaises(GuardError, msg=sql):
+                o7.check(sql)
 
     def test_unsupported_kinds_refused(self):
         for sql in ('UPDATE `r`.`t` SET a = 1', 'TRUNCATE TABLE `r`.`t`', 'RENAME TABLE `r`.`t` TO `r`.`u`',
@@ -150,12 +168,13 @@ class GuardTests(unittest.TestCase):
         allowed = [
             'CREATE DATABASE `%s` PARTITIONS 32 SUB_PARTITIONS 512' % TGT,
             'CREATE TABLE `%s`.`t` LIKE `%s`.`t`' % (TGT, SRC),
+            'CREATE TABLE `%s`.`t__fresh` LIKE `%s`.`t`' % (TGT, TGT),   # the fresh-table fallback copies the checked replacement definition
             'INSERT INTO `%s`.`t` (`a`) SELECT `a` FROM `%s`.`t` WHERE CRC32(`a`) MOD 2 = 0' % (TGT, SRC),
             'DELETE FROM `%s`.`t` WHERE CRC32(`a`) MOD 2 = 0' % TGT,
             'CREATE VIEW `%s`.`v` AS SELECT 1 FROM `%s`.`t`' % (TGT, TGT),
             'ALTER TABLE `%s`.`t` AUTO_INCREMENT = 100' % TGT,
             'ALTER TABLE `%s`.`t__fresh` RENAME TO `t`' % TGT,
-            'AGGREGATOR SYNC AUTO_INCREMENT ON `%s`.`t`' % TGT,
+            'AGGREGATOR SYNC AUTO_INCREMENT ON `%s`.`t` ALL' % TGT,
             'DROP TABLE `%s`.`t`' % TGT,
             'SELECT COUNT(*) AS n FROM `%s`.`t`' % SRC,
             'SHOW CREATE TABLE `%s`.`t`' % TGT,
@@ -168,6 +187,7 @@ class GuardTests(unittest.TestCase):
             'INSERT INTO `%s`.`t` (`a`) SELECT `a` FROM `%s`.`t`' % (SRC, TGT),
             'DELETE FROM `%s`.`t` WHERE 1' % SRC,
             'CREATE TABLE `%s`.`t` LIKE `%s`.`t`' % (SRC, TGT),
+            'CREATE TABLE `%s`.`t__fresh` LIKE `%s`.`t`' % (SRC, SRC),
             'CREATE DATABASE `%s`' % SRC,
             'DROP TABLE `%s`.`t`' % SRC,
             'ALTER TABLE `%s`.`t` ADD COLUMN b int' % TGT,
@@ -187,6 +207,20 @@ class GuardTests(unittest.TestCase):
             with self.assertRaises(GuardError, msg=sql):
                 g.check(sql)
             self.assertFalse(g.allows(sql))
+
+    def test_f11_aggregator_sync_runs_on_every_aggregator_only(self):
+        """AGGREGATOR SYNC AUTO_INCREMENT ... ALL is the one sync form the runner guard accepts: without ALL only the aggregator of
+        the session syncs, so a counter set at O7 would not reach the others. The ALL form names the replacement only."""
+        st = classify('AGGREGATOR SYNC AUTO_INCREMENT ON `repl`.`t` ALL')
+        self.assertEqual((st.kind, st.databases, st.detail), ('AGGREGATOR SYNC AUTO_INCREMENT', ('repl',), 'ALL'))
+        self.assertEqual(classify('AGGREGATOR SYNC AUTO_INCREMENT ON `repl`.`t`').detail, '')
+        g = sqlutil.runner_guard(TGT)
+        g.check('AGGREGATOR SYNC AUTO_INCREMENT ON `%s`.`t` ALL' % TGT)
+        with self.assertRaisesRegex(GuardError, 'refuses AGGREGATOR SYNC AUTO_INCREMENT without ALL'):
+            g.check('AGGREGATOR SYNC AUTO_INCREMENT ON `%s`.`t`' % TGT)
+        for sql in ('AGGREGATOR SYNC AUTO_INCREMENT ON `%s`.`t` ALL' % SRC, 'AGGREGATOR SYNC AUTO_INCREMENT ON `%s`.`t` ALL x' % TGT):
+            with self.assertRaises(GuardError, msg=sql):
+                g.check(sql)
 
     def test_read_guard(self):
         g = sqlutil.read_guard()
@@ -320,7 +354,7 @@ ALLOWANCES = {
     'inventory.py': {'pipeline', 'grant', 'attach', 'drop'},  # pipeline capture, grantees, attachment row, DROP in the write privilege list
     'estimate.py': {'pipeline', 'attach', 'revoke', 'kill'},   # pipeline allowance and the plan sheet's freeze path wording
     'report_xlsx.py': {'pipeline', 'grant', 'attach', 'revoke'},  # Pipelines tabs, grants scope row, source attachment row, Path B action row
-    'copy.py': {'drop'},                                        # DROP TABLE in the fresh-table fallback (section 10.9)
+    'copy.py': {'drop', 'kill'},                                # DROP TABLE in the fresh-table fallback (section 10.9); the hard-stop hint names the operating system kill, no KILL statement
     'transform.py': set(),
     'verify.py': set(),
     'postcopy.py': set(),

@@ -172,7 +172,9 @@ def summary_rows(inventory, plans, est, fit, config, db, run_id, baseline, steps
                  ('Tables without a time column (count only at tier 2)', ', '.join(p.name for p in plans if not p.time_column) or 'none'),
                  ('Tables with unique-key lock risk', ', '.join(p.name for p in plans if p.unique_key_lock_risk) or 'none'),
                  ('Tables hashed over all columns (no non-null key)', ', '.join(p.name for p in plans if p.key_kind == 'row') or 'none'),
-                 ('Views with a DEFINER', ', '.join(v['name'] for v in inventory.get('views') or [] if v.get('definer')) or 'none')])
+                 ('Views with a DEFINER', ', '.join(v['name'] for v in inventory.get('views') or [] if v.get('definer')) or 'none'),
+                 ('Routines not migrated (objects.routines.ignore)',
+                  ', '.join('%s %s' % (str(r['type']).lower(), r['name']) for r in inventory.get('routines') or []) or 'none')])
     if pipelines.get('captured'):
         items = pipelines['items']
         rows.extend([('Pipelines the application recreates', ', '.join(i['name'] for i in items if i['app_managed']) or 'none'),
@@ -229,7 +231,7 @@ def table_rows(table, plan, est):
     if plan.computed_columns:
         callouts.append('computed columns are excluded from the copy column list')
     if auto.get('column'):
-        callouts.append('counter set to MAX plus 1 and synced at O7')
+        callouts.append('counter set at O7 to the larger of the source counter and MAX plus 1, synced on every aggregator')
     rows.extend(('', c) for c in callouts) if callouts else rows.append(('', 'none'))
     return rows
 
@@ -355,8 +357,8 @@ def _latest(results, tier):
     return None
 
 
-def final_summary_rows(inventory, plans, journal, config, db, run_id, name_map=None, baseline=None):
-    """The (label, value) rows of the final workbook's Summary tab."""
+def final_summary_rows(inventory, plans, journal, config, db, run_id, name_map=None, baseline=None, calibration=None):
+    """The (label, value) rows of the final workbook's Summary tab; calibration, when given, is the C2 Calibration line."""
     board = journal.steps_board()
     per_table, total = copy_stats(journal)
     meta = journal.meta()
@@ -386,6 +388,8 @@ def final_summary_rows(inventory, plans, journal, config, db, run_id, name_map=N
                  ('GiB per hour expected', round(size_gib / est.copy_seconds * 3600, 1) if est.copy_seconds else 0),
                  ('GiB per hour actual', round(size_gib / hours, 1) if hours else 0),
                  ('Worker seconds expected', round(est.schedule.worker_seconds)), ('Worker seconds actual', round(total['worker_seconds']))])
+    if calibration:
+        rows.append(('Calibration', calibration))
     rows.append((None, None))
     rows.append(('Accounts', None))
     accounts = inventory.get('accounts') or []
@@ -500,8 +504,8 @@ def final_table_rows(table, plan, journal, per_table):
         elif e['kind'] == 'counter':
             data = json.loads(detail)
             if data.get('table') == plan.name:
-                callouts.append('counter: %s (source counter %s, target before %s, after %s)' % (
-                    data.get('action'), data.get('source_counter'), data.get('target_before'), data.get('target_after')))
+                callouts.append('counter: %s (source counter %s, MAX+1 %s, target before %s, after %s)' % (
+                    data.get('action'), data.get('source_counter'), data.get('max_plus_one'), data.get('target_before'), data.get('target_after')))
         elif e['kind'] == 'serialized' and detail.startswith(plan.name + ' '):
             callouts.append('serialized after a lock wait')
     if plan.unique_key_lock_risk:
@@ -510,7 +514,7 @@ def final_table_rows(table, plan, journal, per_table):
     return rows
 
 
-def write_final_workbook(path, inventory, plans, journal, config, db, run_id, baseline=None, env=None):
+def write_final_workbook(path, inventory, plans, journal, config, db, run_id, baseline=None, env=None, calibration=None):
     """Write the final workbook: Summary, one tab per table with copy and verification results, Pipelines tabs."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -519,7 +523,7 @@ def write_final_workbook(path, inventory, plans, journal, config, db, run_id, ba
     summary.title = 'Summary'
     used = {'Summary', 'Pipelines', 'Pipeline offsets', 'System', 'Views', 'History'}
     name_map = {p.name: sheet_name(p.name, used) for p in plans}
-    _rows(summary, final_summary_rows(inventory, plans, journal, config, db, run_id, name_map, baseline))
+    _rows(summary, final_summary_rows(inventory, plans, journal, config, db, run_id, name_map, baseline, calibration))
     summary.cell(row=1, column=1).font = _TITLE
     _widths(summary, [46, 90])
     per_table, _ = copy_stats(journal)
@@ -541,10 +545,11 @@ def write_final_workbook(path, inventory, plans, journal, config, db, run_id, ba
         if e['kind'] == 'view':
             data = json.loads(e['detail'])
             view_events[data['view']] = data
+    # the definer choice O7 recorded per view (postcopy.create_views); an older journal recorded only the removal
     _table(ws, ['view', 'original definer', 'created in replacement'],
-           [[v['name'], v.get('definer') or 'none', 'yes (definer removed)' if v['name'] in view_events else 'no']
-            for v in inventory.get('views') or []] or [['none', None, None]])
-    _widths(ws, [40, 30, 24])
+           [[v['name'], v.get('definer') or 'none', ('yes (%s)' % view_events[v['name']].get('reason', 'definer removed'))
+             if v['name'] in view_events else 'no'] for v in inventory.get('views') or []] or [['none', None, None]])
+    _widths(ws, [40, 30, 60])
     pipelines = inventory.get('pipelines') or {}
     journal_pipes = {p['name']: p for p in journal.pipelines()}
     ws = wb.create_sheet('Pipelines')
@@ -584,22 +589,32 @@ def write_final_workbook(path, inventory, plans, journal, config, db, run_id, ba
 
 
 def handle_c2(step, ctx):
-    """C2 handler: the final workbook and the Markdown run report, then the baseline recalibrated from the run journal."""
+    """C2 handler: the baseline fitted from the run journal, the final workbook and the Markdown run report, then the fitted baseline written.
+
+    Calibration is advisory. When the journal cannot be fitted (too few first-pass chunks, or any
+    other calibrate refusal), the baseline in use stays, the Summary of both reports carries a
+    Calibration line that says so, and the step passes with that note. calibrate only reads the
+    journal, so it runs before the reports; the baseline file is the last write.
+    """
     from . import copy as copy_module, estimate, report_md
     data, plans, _ = copy_module.load_plans(ctx)
     reports = ctx.config.runs_dir() / ctx.run_id / ctx.db.source / 'reports'
     if ctx.dry_run:
         return steps.Outcome(steps.PASSED, 'dry run: final.xlsx and run-report.md would be written to %s and the baseline recalibrated' % reports)
     baseline = copy_module.baseline_for(ctx.config)
-    xlsx = write_final_workbook(reports / 'final.xlsx', data, plans, ctx.journal, ctx.config, ctx.db, ctx.run_id, baseline, ctx.options.get('env') or {})
-    md = report_md.write_run_report(reports / 'run-report.md', data, plans, ctx.journal, ctx.config, ctx.db, ctx.run_id)
-    ctx.log('final workbook %s and run report %s written' % (xlsx, md))
     try:
-        cal = estimate.calibrate(ctx.journal_path, first_pass_only=True, workers=ctx.config.copy.workers,
-                                 compute_size=ctx.config.workspace.compute_size, run_id=ctx.run_id)
+        cal, kept = estimate.calibrate(ctx.journal_path, first_pass_only=True, workers=ctx.config.copy.workers,
+                                       compute_size=ctx.config.workspace.compute_size, run_id=ctx.run_id), None
     except KitError as exc:
-        return steps.Outcome(steps.PENDING, 'reports written; the baseline was not recalibrated (%s); keep the current baseline and record the gate' % exc,
-                             steps.EXIT_GATE)
+        cal, kept = None, 'baseline not recalibrated (%s); the baseline in use stays: %s' % (
+            exc, 'the shipped default' if baseline.source == 'default' else baseline.source)
+    xlsx = write_final_workbook(reports / 'final.xlsx', data, plans, ctx.journal, ctx.config, ctx.db, ctx.run_id, baseline, ctx.options.get('env') or {},
+                                calibration=kept)
+    md = report_md.write_run_report(reports / 'run-report.md', data, plans, ctx.journal, ctx.config, ctx.db, ctx.run_id, calibration=kept)
+    ctx.log('final workbook %s and run report %s written' % (xlsx, md))
+    if cal is None:
+        ctx.log('    ' + kept)
+        return steps.Outcome(steps.PASSED, 'reports written; ' + kept)
     size = sum(float(t.get('size_gib') or 0) for t in ctx.journal.tables()) or None
     for line in estimate.calibration_lines(cal, size):
         ctx.log('    ' + line)

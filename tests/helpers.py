@@ -101,6 +101,111 @@ class FakeConn:
         self.closed = True
 
 
+FAULT_POINTS = ('before', 'after', 'journal')
+
+
+def crash_journal(test, journal, method, match=None, times=1, exc=None):
+    """Fail a Journal method before it writes: the third failure point (statement done, journal not updated).
+
+    method names a Journal method such as set_meta, event, step_end or mark_done; match, when
+    given, is called with the method's arguments and must return True for the call to fail. The
+    default exception is SimulatedCrash (kill -9: not an Exception, so no except Exception handler can
+    journal it; steps.run_step still records the step failed, where a real kill -9 leaves it running).
+    Returns a list that holds the arguments of every call that failed. The patch is removed at cleanup.
+    """
+    from tests.fakedb import SimulatedCrash
+    original = getattr(journal, method)
+    fired = []
+    left = [int(times)]
+
+    def failing(*args, **kwargs):
+        if left[0] > 0 and (match is None or match(*args, **kwargs)):
+            left[0] -= 1
+            fired.append((args, kwargs))
+            raise (exc or SimulatedCrash)('killed before the journal update: %s%r' % (method, args))
+        return original(*args, **kwargs)
+    setattr(journal, method, failing)
+    test.addCleanup(lambda: journal.__dict__.pop(method, None))
+    return fired
+
+
+def crash_journals(test, method, match=None, after=False):
+    """crash_journal for every Journal object, those a command opens itself included (tests that drive the command line).
+
+    The first call of the Journal method that match accepts raises SimulatedCrash; after=True
+    lets that call write first, so the process dies just after the journal write. Returns the
+    list of calls that failed. The patch is removed at cleanup.
+    """
+    from unittest import mock
+    from s2rebuild.journal import Journal
+    from tests.fakedb import SimulatedCrash
+    original = getattr(Journal, method)
+    fired = []
+
+    def failing(self, *args, **kwargs):
+        if not fired and (match is None or match(*args, **kwargs)):
+            fired.append((args, kwargs))
+            if after:
+                original(self, *args, **kwargs)
+            raise SimulatedCrash('killed %s the journal write: %s%r' % ('after' if after else 'before', method, args))
+        return original(self, *args, **kwargs)
+    patcher = mock.patch.object(Journal, method, failing)
+    patcher.start()
+    test.addCleanup(patcher.stop)
+    return fired
+
+
+def record_passed(config, run_id, step_ids=('P1', 'P2'), note='recorded for the test'):
+    """Record steps passed in the on-disk journal of every configured database of run_id, as their gates and commands would.
+
+    A step a person records gets a gate (P1, O1 to O3), a python step a passed result (P2 as
+    s2rebuild check records it). Returns the journal paths.
+    """
+    from s2rebuild import steps
+    from s2rebuild.journal import Journal
+    paths = []
+    for db in config.databases:
+        path = config.runs_dir() / run_id / db.source / 'journal.sqlite'
+        journal = Journal(path)
+        try:
+            for step_id in step_ids:
+                if steps.REGISTRY[step_id].needs_person:
+                    journal.record_gate(step_id, True, note)
+                else:
+                    journal.step_end(step_id, 'passed', note)
+        finally:
+            journal.close()
+        paths.append(path)
+    return paths
+
+
+def fake_driver(test, fake):
+    """Stand in for the PyMySQL module so a live command on the command line opens its connections on fake (a FakeDB).
+
+    No network connection is opened: connect returns fake.connect(user=...). The real module is
+    put back at cleanup.
+    """
+    import sys
+    import types
+    module = types.ModuleType('pymysql')
+    cursors = types.ModuleType('pymysql.cursors')
+    cursors.DictCursor = object
+    module.cursors = cursors
+    module.connect = lambda **kw: fake.connect(user=kw.get('user'))
+    saved = {k: sys.modules.get(k) for k in ('pymysql', 'pymysql.cursors')}
+
+    def restore():
+        for k, v in saved.items():
+            if v is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = v
+    sys.modules['pymysql'] = module
+    sys.modules['pymysql.cursors'] = cursors
+    test.addCleanup(restore)
+    return module
+
+
 def run_cli(argv, env=None):
     """Run the command line in-process; return (exit code, captured text)."""
     out = io.StringIO()

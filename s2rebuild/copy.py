@@ -10,13 +10,18 @@ waits requeued without consuming an attempt, the definition diff that ignores on
 AUTO_INCREMENT counter, the refusal of a replacement holding rows the journal cannot explain,
 and the count proof at the end. New: names and sizes from config, the bucket cap, a queue per
 table with per-table concurrency and automatic serialization after a lock wait, the lock probe,
-the fresh-table fallback and per-chunk timings for calibrate.
+the fresh-table fallback and per-chunk timings for calibrate. A fresh-table load replaces a whole
+table, so it reopens O7 and O8 and the table's verification as a mark-recopy does, and the O10
+block files of the database get a STOP first. Stop safety: a chunk fails after copy.max_lock_waits
+lock waits, with the fresh-table command in its error; a second Ctrl-C prints the hard-stop hint
+and the workers still finish their chunks; the fresh-table load honors the abort deadline and the
+stop file and reuses only the fresh table its journal recorded.
 
 Statements issued, every one through the runner guard naming the replacement: CREATE DATABASE,
 CREATE TABLE LIKE, SHOW CREATE TABLE, INSERT INTO replacement SELECT FROM source, DELETE FROM
 replacement (reconciliation and lock probe), SELECT COUNT(*), SET lock_wait_timeout and, for the
-fresh-table fallback, CREATE TABLE LIKE, INSERT SELECT without a predicate, DROP TABLE and
-ALTER TABLE RENAME TO.
+fresh-table fallback, CREATE TABLE replacement.t__fresh LIKE replacement.t, INSERT SELECT without
+a predicate, DROP TABLE and ALTER TABLE RENAME TO.
 """
 import collections
 import contextlib
@@ -28,21 +33,37 @@ import time
 import traceback
 from pathlib import Path
 
-from . import estimate, inventory, steps, transform
+from . import estimate, inventory, ownersql, steps, transform
 from .common import EXIT_INCOMPLETE, EXIT_MISMATCH, EXIT_REFUSED, KitError, iso, parse_utc, utc_now
 from .sqlutil import ident, qualified, runner_guard
 
 DURABILITY_FLAGS = ('IS_SYNC', 'IS_SYNC_DURABILITY', 'IS_SYNC_DURABILITY_ON_REF_DB_ONLY')
 LOCK_WAIT_ERRNO = 1205
 FRESH_SUFFIX = '__fresh'
+MAX_NAME_CHARS = 64
+# Journal meta key prefix for the fresh table a load created: value '<fresh name> <phase>', and for loaded
+# also the table's recopy_epoch when the fresh table was complete.
+FRESH_META = 'fresh_table:'
+FRESH_CREATING, FRESH_LOADED, FRESH_DONE = 'creating', 'loaded', 'done'
+HARD_STOP_HINT = 'a hard stop needs kill; the leaf lock will hold 15 to 20 minutes'
+
+
+def _lock_holder(text):
+    """'pid N, running WHAT' from the lock file text '<pid> <what>' (a bare pid gives 'pid N')."""
+    pid, _, what = text.partition(' ')
+    return 'pid %s%s' % (pid, (', running ' + what.strip()) if what.strip() else '')
 
 
 @contextlib.contextmanager
-def copy_lock(journal_path):
-    """Hold <journal>.lock exclusively while a copy runs; refuse when another process holds it.
+def copy_lock(journal_path, purpose='O6'):
+    """Hold <journal>.lock exclusively while the copy may change or the switch stands on it; refuse when another process holds it.
 
-    Two runners on one journal would insert every pending bucket twice. The lock file carries
-    the holder's pid. An in-memory journal (no path) takes no lock.
+    Taken by O6, by an O7 re-copy round from its mark through its copy, by mark-recopy, and by
+    O10 from S0 through the forward machine. Two runners on one journal would insert every
+    pending bucket twice, and a re-copy while O10 waits for its go would change the copy the
+    switch is about to stand on. The lock file carries the holder's pid and purpose; a refusal
+    names them. The lock goes with the process, so a holder that died blocks nothing. An in-memory
+    journal (no path) takes no lock.
     """
     if not journal_path:
         yield None
@@ -58,9 +79,9 @@ def copy_lock(journal_path):
                 holder = os.read(fd, 64).decode('utf8', 'replace').strip()
             except OSError:
                 pass
-            raise KitError('Another s2rebuild process holds the copy lock for this journal%s; wait for it to finish before rerunning O6' % (
-                (' (pid %s)' % holder) if holder else ''))
-        os.pwrite(fd, ('%-24d' % os.getpid()).encode('ascii'), 0)
+            raise KitError('Another s2rebuild process holds the copy lock for this journal%s; wait for it to finish, then run %s again' % (
+                (' (%s)' % _lock_holder(holder)) if holder else '', purpose))
+        os.pwrite(fd, ('%-64s' % ('%d %s' % (os.getpid(), purpose))[:64]).encode('ascii'), 0)
         yield path
     finally:
         try:
@@ -143,8 +164,8 @@ class Statements:
         return 'SELECT @@lock_wait_timeout AS v'
 
     def create_fresh(self, plan):
-        """CREATE TABLE replacement.table__fresh LIKE source.table."""
-        return 'CREATE TABLE %s LIKE %s' % (qualified(self.target_db, plan.name + FRESH_SUFFIX), qualified(self.source_db, plan.name))
+        """CREATE TABLE replacement.table__fresh LIKE replacement.table (the definition O5 checked against the capture)."""
+        return 'CREATE TABLE %s LIKE %s' % (qualified(self.target_db, plan.name + FRESH_SUFFIX), qualified(self.target_db, plan.name))
 
     def insert_all(self, plan):
         """INSERT INTO the fresh table SELECT every row of the source table."""
@@ -308,7 +329,9 @@ class Runner:
     attempt: the chunk goes to the back of its table's queue, the table's limit becomes 1 when
     table_concurrency is auto, and the table is parked for lock_retry_seconds while the other
     tables continue. Before a chunk on a table that has waited for a lock, the reconciliation
-    DELETE runs as a probe with lock_wait_timeout = lock_probe_timeout_seconds.
+    DELETE runs as a probe with lock_wait_timeout = lock_probe_timeout_seconds. The
+    max_lock_waits-th lock wait of one chunk in a run fails that chunk as an attempt, with the
+    fresh-table command in its error, so a lock that never clears ends O6 incomplete.
     """
 
     def __init__(self, plans, statements, journal, connect, log, copy_config, workers=None, abort_at=None, stop_file=None,
@@ -341,6 +364,8 @@ class Runner:
         self.peak_in_flight = {p.name: 0 for p in plans}
         self.parked_until = {}
         self.lock_waits = {p.name: 0 for p in plans}
+        self.chunk_lock_waits = collections.Counter()
+        self.lock_capped = []
         self.started_at = None
         self.rows_since_start = 0
         self.failed_this_run = 0
@@ -418,10 +443,11 @@ class Runner:
         with self.lock:
             self.in_flight[name] -= 1
 
-    def requeue_after_lock(self, name, bucket):
-        """Put the chunk back (as failed, so it is reconciled), serialize the table in auto mode and park it."""
+    def requeue_after_lock(self, name, bucket, requeue=True):
+        """Put the chunk back (as failed, so it is reconciled) unless requeue is False, serialize the table in auto mode and park it."""
         with self.lock:
-            self.queues[name].append((bucket, 'failed'))
+            if requeue:
+                self.queues[name].append((bucket, 'failed'))
             self.lock_waits[name] += 1
             if self.cfg.table_concurrency == 'auto' and name not in self.configured and self.limits.get(name, self.workers) != 1:
                 self.limits[name] = 1
@@ -469,6 +495,12 @@ class Runner:
         except Exception:  # noqa: BLE001 - a broken log must not take a worker down
             pass
 
+    def _count_lock_wait(self, table, bucket):
+        """Count one more lock wait for a chunk in this run; returns the count."""
+        with self.lock:
+            self.chunk_lock_waits[(table, bucket)] += 1
+            return self.chunk_lock_waits[(table, bucket)]
+
     def _give_back(self, table, bucket, prior):
         """Return a taken chunk to the front of its queue untouched."""
         with self.lock:
@@ -514,8 +546,11 @@ class Runner:
                 except Exception as exc:  # noqa: BLE001 - journal the failure and continue with the next chunk
                     detail = self.log.redactor('%s: %s' % (type(exc).__name__, exc))
                     try:
+                        capped = is_lock_wait(exc) and self._count_lock_wait(table, bucket) >= self.cfg.max_lock_waits
+                        if capped:
+                            detail = '%s; %s' % (detail, fresh_table_hint(table, self.cfg.max_lock_waits))
                         self.journal.mark_failed(table, bucket, detail)
-                        if is_lock_wait(exc):
+                        if is_lock_wait(exc) and not capped:
                             self.journal.undo_attempt(table, bucket)
                             self._safe_log('worker %d LOCK WAIT on %s bucket %d; parked for %d s: %s' % (
                                 idx, table, bucket, self.cfg.lock_retry_seconds, detail))
@@ -523,7 +558,11 @@ class Runner:
                         else:
                             with self.lock:
                                 self.failed_this_run += 1
+                                if capped and table not in self.lock_capped:
+                                    self.lock_capped.append(table)
                             self._safe_log('worker %d FAILED %s bucket %d: %s' % (idx, table, bucket, detail))
+                            if capped:
+                                self.requeue_after_lock(table, bucket, requeue=False)
                     except Exception as inner:  # noqa: BLE001 - journal trouble is reported, not fatal
                         self._safe_log('worker %d could not journal the failure of %s bucket %d: %s' % (
                             idx, table, bucket, self.log.redactor('%s: %s' % (type(inner).__name__, inner))))
@@ -572,26 +611,46 @@ class Runner:
         try:
             for t in threads:
                 t.start()
-            last = self.clock()
-            try:
-                while any(t.is_alive() for t in threads):
-                    self.sleep(0.2)
-                    if self.clock() - last >= self.cfg.progress_seconds:
-                        self._safe_log(self._progress_or_note())
-                        last = self.clock()
-            except KeyboardInterrupt:
-                self.interrupted = True
-                self.stop_launching.set()
-                with self.lock:
-                    running = sum(self.in_flight.values())
-                self._safe_log('Interrupted: no new chunk starts; waiting for %d in-flight chunk(s) to finish. A client that dies '
-                               'mid-statement leaves a leaf table lock for 15 to 20 minutes, so the workers are left to finish.' % running)
-            for t in threads:
-                t.join()
+            self._wait_for_workers(threads)
         finally:
             threading.excepthook = old_hook
         self._safe_log(self._progress_or_note())
         return self.finish()
+
+    def _wait_for_workers(self, threads):
+        """Wait until every worker has ended, with the progress line; a Ctrl-C never ends the wait.
+
+        The first KeyboardInterrupt stops new chunks while the running ones finish. Every later
+        one prints HARD_STOP_HINT and the wait goes on: the workers are daemon threads, so leaving
+        here early would end them mid INSERT. The wait sleeps through self.sleep.
+        """
+        last = self.clock()
+        interrupts = announced = 0
+        while True:
+            try:
+                if interrupts > announced:
+                    announced = interrupts
+                    self._announce_interrupt(announced)
+                if not any(t.is_alive() for t in threads):
+                    return
+                self.sleep(0.2)
+                if self.clock() - last >= self.cfg.progress_seconds:
+                    self._safe_log(self._progress_or_note())
+                    last = self.clock()
+            except KeyboardInterrupt:
+                interrupts += 1
+                self.interrupted = True
+                self.stop_launching.set()
+
+    def _announce_interrupt(self, count):
+        """The log line for the count-th Ctrl-C: the first stops new chunks, a later one names the hard stop."""
+        with self.lock:
+            running = sum(self.in_flight.values())
+        if count == 1:
+            self._safe_log('Interrupted: no new chunk starts; waiting for %d in-flight chunk(s) to finish. A client that dies '
+                           'mid-statement leaves a leaf table lock for 15 to 20 minutes, so the workers are left to finish.' % running)
+        else:
+            self._safe_log('Interrupted again: still waiting for %d in-flight chunk(s) to finish; %s.' % (running, HARD_STOP_HINT))
 
     def _progress_or_note(self):
         try:
@@ -667,36 +726,118 @@ class _CopySession:
         self.inner.close()
 
 
-def fresh_table_load(session, statements, journal, log, plan):
+def fresh_table_hint(table, waits):
+    """The error a chunk gets at its copy.max_lock_waits-th lock wait: the fresh-table command for its table."""
+    return '%d lock waits on one chunk of %s did not clear; load the table with s2rebuild step O6 --fresh-table %s' % (waits, table, table)
+
+
+def fresh_name(plan, planned=()):
+    """The fresh table name of a plan; refuses a name over 64 characters or one that is a planned table name."""
+    name = plan.name + FRESH_SUFFIX
+    if len(name) > MAX_NAME_CHARS:
+        raise KitError('The fresh table name for %s has %d characters, over the %d the server allows; the fresh-table fallback '
+                       'cannot load this table' % (plan.name, len(name), MAX_NAME_CHARS))
+    if name in planned:
+        raise KitError('The fresh table name %s is a planned table of this run; the fresh-table fallback would replace it, '
+                       'so it refuses to load %s' % (name, plan.name))
+    return name
+
+
+def fresh_record(journal, table):
+    """(fresh name, phase, recopy_epoch) the journal recorded for the fresh-table load of table, or (None, None, None).
+
+    The epoch is the one the loaded record carries; None for the other phases.
+    """
+    value = journal.get_meta(FRESH_META + table)
+    if not value:
+        return None, None, None
+    parts = value.split(' ')
+    epoch = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else None
+    return parts[0], (parts[1] if len(parts) > 1 else ''), epoch
+
+
+def fresh_loaded_value(journal, fresh, table):
+    """The loaded record of a fresh table: its name, the phase and the table's current recopy_epoch."""
+    return '%s %s %d' % (fresh, FRESH_LOADED, journal.recopy_epoch(table))
+
+
+def fresh_table_load(session, statements, journal, log, plan, ctx=None, planned=()):
     """The fresh-table fallback: load one table in a new table and swap it in (section 10.9).
 
-    Used when a target table is locked by a prepared transaction the kit cannot see. Every bucket
-    of the table is marked done with the rows the single INSERT reported.
+    Used when a target table is locked by a prepared transaction the kit cannot see. Issues
+    SELECT COUNT(*) on both sides, CREATE TABLE replacement.t__fresh LIKE replacement.t, one
+    INSERT SELECT without a predicate, DROP TABLE and ALTER TABLE RENAME TO. The journal meta
+    fresh_table:<t> records the fresh name before the CREATE (creating), after the fresh count
+    matches the source (loaded, with the table's recopy_epoch) and, in one transaction with the
+    chunk rows (Journal.mark_loaded), done. A rerun reuses only a fresh table it recorded as
+    creating or loaded; a table under that name the journal did not record refuses. The rename
+    counts as applied, and only the journal rows are written, when loaded is recorded, the fresh
+    table is gone, the table holds the source count, its recopy_epoch is the recorded one and a
+    bucket of it is not done. After a re-copy mark, or a copy run that finished its buckets, the
+    loaded record is stale and the table is loaded again. A missing replacement table is never
+    recreated from the source definition: the load resumes from a complete recorded fresh table
+    or refuses. Every bucket is marked done with error
+    estimate.FRESH_LOAD_ERROR (bucket 0 holds the rows), so calibrate skips them. The load
+    replaces the whole table, so before its first write the journal reopens the evidence built
+    on the old rows (Journal.reopen_evidence: target_count and verified_at_utc cleared,
+    recopy_epoch + 1, O7 and O8 pending when they had passed), as a mark-recopy of the table
+    does. With ctx (handle_o6) the O10 block files of the database get a STOP just before that
+    journal write.
     """
-    fresh = plan.name + FRESH_SUFFIX
+    fresh = fresh_name(plan, planned)
+    recorded, phase, epoch = fresh_record(journal, plan.name)
+    in_progress = recorded == fresh and phase in (FRESH_CREATING, FRESH_LOADED)
     existing = existing_target_tables(session, statements)
+    if fresh in existing and not in_progress:
+        raise KitError('%s exists in the replacement but this journal did not record creating it; the fresh-table load does not '
+                       'reuse or drop a table it did not create. Inspect it, drop it by hand, then rerun s2rebuild step O6 '
+                       '--fresh-table %s' % (fresh, plan.name))
     src = one_value(session.query(statements.count(statements.source_db, plan.name)))
-    rows = None
-    if fresh in existing:
-        tgt = one_value(session.query(statements.count(statements.target_db, fresh)))
-        if tgt == src:
+    fresh_rows = one_value(session.query(statements.count(statements.target_db, fresh))) if fresh in existing else None
+    renamed = in_progress and phase == FRESH_LOADED and fresh not in existing and plan.name in existing
+    swapped = renamed and epoch == journal.recopy_epoch(plan.name) and any(
+        state != 'done' for _, _, state, _, _ in journal.chunk_states(plan.name))
+    if swapped:
+        tgt = one_value(session.query(statements.count(statements.target_db, plan.name)))
+        if tgt != src:
+            raise KitError('%s was recorded loaded and is gone, but %s holds %d rows, not the source %d; inspect the replacement '
+                           'before any rerun' % (fresh, plan.name, tgt, src))
+    elif fresh_rows != src and plan.name not in existing:
+        raise KitError('%s is missing from the replacement and %s; the kit does not recreate it from the source definition. '
+                       'Drop %s by hand if it exists, run s2rebuild step O5 --redo to create %s from the capture, then rerun '
+                       's2rebuild step O6 --fresh-table %s' % (
+                           plan.name, 'no fresh table exists' if fresh_rows is None else '%s holds %d of %d rows' % (fresh, fresh_rows, src),
+                           fresh, plan.name, plan.name))
+    reason = 'fresh-table load; rerun O7 and O8 after O6 (s2rebuild run --from O6)'
+    if ctx is not None:
+        for line in ownersql.retire_o10_blocks(ctx, [plan.name], 'a fresh-table load replaces %s; %s' % (plan.name, reason)):
+            log(line)
+    journal.reopen_evidence(plan.name, reason)
+    if swapped:
+        log('%s was already renamed to %s and holds the full %d rows; recording the load' % (fresh, plan.name, tgt))
+        rows = tgt
+    else:
+        if fresh_rows == src:
             log('Fresh table for %s already holds the full %d rows; reload skipped' % (plan.name, src))
-            rows = tgt
+            rows = tgt = fresh_rows
         else:
-            session.execute(statements.drop_table(fresh))
-    if rows is None:
-        session.execute(statements.create_fresh(plan))
-        rows = session.execute(statements.insert_all(plan))
-        tgt = one_value(session.query(statements.count(statements.target_db, fresh)))
-        if src != tgt:
-            raise KitError('Fresh-table load of %s copied %d rows but the source holds %d; the fresh table is left for inspection' % (
-                plan.name, tgt, src))
-    if plan.name in existing:
-        session.execute(statements.drop_table(plan.name))
-    session.execute(statements.rename_fresh(plan))
-    for b in range(plan.n_buckets):
-        journal.mark_started(plan.name, b)
-        journal.mark_done(plan.name, b, rows if b == 0 else 0)
+            if renamed:
+                log('%s was recorded loaded, but %s was marked for re-copy or had every bucket done since; loading it again' % (
+                    fresh, plan.name))
+            journal.set_meta(FRESH_META + plan.name, '%s %s' % (fresh, FRESH_CREATING))
+            if fresh_rows is not None:
+                session.execute(statements.drop_table(fresh))
+            session.execute(statements.create_fresh(plan))
+            rows = session.execute(statements.insert_all(plan))
+            tgt = one_value(session.query(statements.count(statements.target_db, fresh)))
+            if src != tgt:
+                raise KitError('Fresh-table load of %s copied %d rows but the source holds %d; the fresh table is left for inspection' % (
+                    plan.name, tgt, src))
+        journal.set_meta(FRESH_META + plan.name, fresh_loaded_value(journal, fresh, plan.name))
+        if plan.name in existing:
+            session.execute(statements.drop_table(plan.name))
+        session.execute(statements.rename_fresh(plan))
+    journal.mark_loaded(plan.name, plan.n_buckets, rows, estimate.FRESH_LOAD_ERROR, FRESH_META + plan.name, '%s %s' % (fresh, FRESH_DONE))
     journal.record_table_counts(plan.name, src, tgt)
     journal.event('manual_load', '%s loaded through the fresh-table fallback with %d rows' % (plan.name, rows))
     log('Fresh-table load of %s done: %d rows, count proof matches' % (plan.name, rows))
@@ -787,7 +928,9 @@ def handle_o6(step, ctx):
     """O6 handler: copy every chunk (or one table through the fresh-table fallback), then the count proof.
 
     Live path: the copy lock, the source and row-accounting checks of the reference preflight,
-    then the Runner with the abort deadline including the longest-chunk allowance.
+    then the Runner with the abort deadline including the longest-chunk allowance. The abort
+    deadline is computed first: past it, or while the stop file exists, a fresh-table load is
+    refused before any connection opens.
     """
     try:
         data, plans, directory = load_plans(ctx)
@@ -802,6 +945,7 @@ def handle_o6(step, ctx):
                 plan = next((p for p in plans if p.name == fresh), None)
                 if plan is None:
                     return steps.Outcome(steps.REFUSED, 'Table %s is not in the plan' % fresh, EXIT_REFUSED)
+                fresh_name(plan, [p.name for p in plans])
                 for sql in (statements.create_fresh(plan), statements.insert_all(plan), statements.count(statements.source_db, plan.name),
                             statements.count(statements.target_db, plan.name + FRESH_SUFFIX), statements.drop_table(plan.name),
                             statements.rename_fresh(plan)):
@@ -817,6 +961,14 @@ def handle_o6(step, ctx):
     if journal.is_empty():
         return steps.Outcome(steps.REFUSED, 'O5 has not written the plan into this journal; run O5 first', EXIT_REFUSED)
     journal.check_plan(plans, statements.source_db, statements.target_db)
+    abort_at = resolve_abort_at(journal, ctx.config, longest_chunk_seconds(plans, ctx.config))
+    stop_file = stop_file_for(ctx.journal_path)
+    if fresh and abort_at is not None and utc_now() >= abort_at:
+        return steps.Outcome(steps.REFUSED, 'Abort deadline %s UTC has passed; the fresh-table load of %s is one whole-table INSERT '
+                             'and does not start after it' % (iso(abort_at), fresh), EXIT_REFUSED)
+    if fresh and stop_file is not None and stop_file.exists():
+        return steps.Outcome(steps.REFUSED, 'Stop file %s present; the fresh-table load of %s does not start. Remove it with '
+                             's2rebuild resume, then rerun' % (stop_file, fresh), EXIT_REFUSED)
     with copy_lock(ctx.journal_path):
         session = ctx.runner_session(runner_guard(ctx.db.replacement, 'runner O6'))
         try:
@@ -827,7 +979,7 @@ def handle_o6(step, ctx):
                 if plan is None:
                     return steps.Outcome(steps.REFUSED, 'Table %s is not in the plan' % fresh, EXIT_REFUSED)
                 try:
-                    fresh_table_load(session, statements, journal, ctx.log, plan)
+                    fresh_table_load(session, statements, journal, ctx.log, plan, ctx=ctx, planned=[p.name for p in plans])
                 except KitError:
                     raise
                 except Exception as exc:  # noqa: BLE001 - a driver error must leave a journaled, resumable state
@@ -841,8 +993,6 @@ def handle_o6(step, ctx):
                     return steps.Outcome(steps.INCOMPLETE, 'fresh-table load done; %d chunks still pending on other tables' % left, EXIT_INCOMPLETE)
         finally:
             session.close()
-        abort_at = resolve_abort_at(journal, ctx.config, longest_chunk_seconds(plans, ctx.config))
-        stop_file = stop_file_for(ctx.journal_path)
         if abort_at is not None:
             ctx.log('Abort deadline: %s UTC (includes the longest-chunk allowance). Stop file: %s' % (iso(abort_at), stop_file))
         runner = Runner(plans, statements, journal, ctx.runner_connector(), ctx.log, ctx.config.copy, abort_at=abort_at,
@@ -852,8 +1002,9 @@ def handle_o6(step, ctx):
         totals, _ = journal.totals()
         if totals['pending'][0] + totals['started'][0] + totals['failed'][0] == 0:
             return steps.Outcome(steps.MISMATCH, 'count proof found a per-table mismatch; see the journal counts', EXIT_MISMATCH)
-        return steps.Outcome(steps.INCOMPLETE, 'copy incomplete: pending=%d started=%d failed=%d%s; rerun O6 with the same run to resume' % (
-            totals['pending'][0], totals['started'][0], totals['failed'][0], ' (interrupted)' if runner.interrupted else ''), EXIT_INCOMPLETE)
+        return steps.Outcome(steps.INCOMPLETE, 'copy incomplete: pending=%d started=%d failed=%d%s; rerun O6 with the same run to resume%s' % (
+            totals['pending'][0], totals['started'][0], totals['failed'][0], ' (interrupted)' if runner.interrupted else '',
+            ''.join('; ' + fresh_table_hint(t, ctx.config.copy.max_lock_waits) for t in runner.lock_capped)), EXIT_INCOMPLETE)
     return steps.Outcome(steps.PASSED, 'every chunk done; per-table count proof all match')
 
 

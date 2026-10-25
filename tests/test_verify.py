@@ -9,16 +9,87 @@ from s2rebuild import estimate as E
 from s2rebuild import inventory as I
 from s2rebuild import steps
 from s2rebuild import verify as V
+from s2rebuild.common import EXIT_DONE
 from s2rebuild.connect import DryRunSession, Log
 from s2rebuild.sqlutil import read_guard, runner_guard
-from tests.fakedb import crc32, key_text
+from tests.fakedb import SimulatedCrash, crc32, key_text, multiset
+from tests.helpers import FAULT_POINTS, crash_journal
 from tests.test_copy import FIXTURE_TABLES, SRC, TGT, Harness
+
+LATE_ROW = {'a': 'late', 'b': '2026-03-03 00:00:00.000000', 'c': 777, 'note': 'arrived after the copy'}
 
 
 def copied(test, **kw):
     h = Harness(test, **kw)
     assert h.o5_o6().status == steps.PASSED, h.text()
     return h
+
+
+def stale_copy(test):
+    """A copied harness whose source t_comp gained a row after the copy, so the O7 stale check re-copies t_comp (one bucket)."""
+    h = copied(test)
+    h.fake.rows(SRC, 't_comp').append(dict(LATE_ROW))
+    return h
+
+
+def arm_recopy(test, h, table, statement, point):
+    """Arm one of FAULT_POINTS around the re-copy DELETE or INSERT of a marked bucket of table.
+
+    before: the server never sees the statement. after: the server applied it and the reply was
+    lost. journal: the statement ran and the worker dies (SimulatedCrash) before the journal
+    records it: the reconcile_delete event after the DELETE, mark_done after the INSERT.
+    """
+    if point == 'journal':
+        if statement == 'DELETE':
+            return crash_journal(test, h.journal, 'event', match=lambda kind, detail: kind == 'reconcile_delete' and detail.startswith(table + ' '))
+        return crash_journal(test, h.journal, 'mark_done', match=lambda t, bucket, rows: t == table)
+    h.fake.fail_statement(r'^%s (FROM|INTO) `%s`\.`%s`' % (statement, TGT, table), point)
+    return h.fake.faults_fired
+
+
+def table_writes(h, table, start=0):
+    """The DELETE and INSERT statements the fake applied to the replacement table, from position start of its write list."""
+    return [w.split(' ')[0] for w in h.fake.writes[start:] if w.startswith(('DELETE FROM `%s`.`%s`' % (TGT, table), 'INSERT INTO `%s`.`%s`' % (TGT, table)))]
+
+
+def assert_reinserted_once(test, h, table, start):
+    """Every re-copy INSERT of table follows its DELETE, and the replacement holds the source rows exactly once."""
+    seen = table_writes(h, table, start)
+    for i, kind in enumerate(seen):
+        if kind == 'INSERT':
+            test.assertEqual(seen[i - 1] if i else None, 'DELETE', 'an INSERT of a marked bucket always follows its DELETE: %s' % seen)
+    test.assertEqual(multiset(h.fake.rows(TGT, table)), multiset(h.fake.rows(SRC, table)), 'no row lost or doubled')
+
+
+def auto_increment_on_t_comp(inv):
+    """Inventory mutation: t_comp has the AUTO_INCREMENT column c (source counter 500), so O7 sets its replacement counter."""
+    for t in inv['tables']:
+        if t['name'] == 't_comp':
+            t['auto_increment'] = {'column': 'c', 'counter': 500}
+
+
+def counter_writes(h, table, start=0):
+    """The ALTER TABLE ... AUTO_INCREMENT and AGGREGATOR SYNC AUTO_INCREMENT statements the fake applied to the replacement table."""
+    return [w for w in h.fake.writes[start:] if w.startswith(('ALTER TABLE `%s`.`%s` AUTO_INCREMENT' % (TGT, table),
+                                                             'AGGREGATOR SYNC AUTO_INCREMENT ON `%s`.`%s`' % (TGT, table)))]
+
+
+def assert_counter_follows(test, h, table, after_kind):
+    """The newest counter event of table comes after the newest event of after_kind, and the replacement counter is the one it set."""
+    import json
+    events = h.journal.events()
+    last = max(i for i, e in enumerate(events) if e['kind'] == after_kind)
+    counters = [(i, json.loads(e['detail'])) for i, e in enumerate(events) if e['kind'] == 'counter']
+    counters = [(i, c) for i, c in counters if c['table'] == table]
+    test.assertTrue(counters and counters[-1][0] > last, 'a counter event of %s follows the %s event' % (table, after_kind))
+    test.assertIsNotNone(counters[-1][1]['target_after'], 'the counter is set, not left at the default')
+    test.assertEqual(h.fake.databases[TGT]['tables'][table]['auto_increment'], counters[-1][1]['target_after'])
+
+
+def run_from_o6(h, to_id='O8'):
+    """The operator's rerun: s2rebuild run --from O6 --to to_id on the harness journal; returns the exit code."""
+    return steps.run_steps(h.config, [h.db], {h.db.source: h.journal}, h.log, run_id=h.run_id, from_id='O6', to_id=to_id,
+                           sessions=h.sessions)
 
 
 class SqlTests(unittest.TestCase):
@@ -206,6 +277,76 @@ class StaleCheckAndHandlersTests(unittest.TestCase):
         events = [e['kind'] for e in h.journal.events()]
         self.assertLess(events.index('mark_recopy'), events.index('counter'))
 
+    def test_f4_o7_repair_leaves_o6_passed_and_o8_runnable(self):
+        """O7's own re-copy redid the O6 work: O6 ends passed, O8 runs without a rerun of O6, and its rows carry the new epoch."""
+        h = stale_copy(self)
+        out7 = h.step('O7', redo=False)
+        self.assertEqual(out7.status, steps.PASSED, h.text())
+        self.assertIn('after 1 re-copy round(s)', out7.note)
+        row = h.journal.step('O6')
+        self.assertEqual(row['status'], 'passed', 'the completed re-copy round is the O6 gate')
+        self.assertIn('re-copy round 1 of the O7 stale check', row['note'])
+        self.assertEqual(h.journal.recopy_epoch('t_comp'), 1)
+        o7_rows = h.journal.verifications('t_comp')
+        self.assertEqual({r['epoch'] for r in o7_rows if r['result'] == 'mismatch'}, {0}, 'the mismatch was found at epoch 0')
+        self.assertEqual(o7_rows[-1]['epoch'], 1, 'the clean stale check after the re-copy ran at epoch 1')
+        out8 = h.step('O8', redo=False)
+        self.assertEqual(out8.status, steps.PASSED, h.text())
+        self.assertEqual({r['epoch'] for r in h.journal.verifications('t_comp')[len(o7_rows):]}, {1}, 'O8 verified at the new epoch')
+        state = {t['table_name']: t for t in h.journal.verification_state()}
+        self.assertTrue(all(t['epoch_verified'] for t in state.values()), state)
+
+    def test_f4_o7_recopy_fault_points_resume_from_o6_and_end_with_o6_to_o8_passed(self):
+        """A failure before, after, or after and before the journal update, at the re-copy DELETE and at the re-copy INSERT of the
+        bucket O7 marked: O7 stops with O6 pending; the operator's run --from O6 reconciles the bucket, O7 and O8 pass, no row doubled."""
+        for statement in ('DELETE', 'INSERT'):
+            for point in FAULT_POINTS:
+                with self.subTest(statement=statement, point=point):
+                    h = stale_copy(self)
+                    start = len(h.fake.writes)
+                    fired = arm_recopy(self, h, 't_comp', statement, point)
+                    out7 = h.step('O7', redo=False)
+                    self.assertEqual(len(fired), 1, 'the fault fired')
+                    self.assertEqual(out7.status, steps.INCOMPLETE, h.text())
+                    self.assertIn('rerun O6 to finish the marked buckets, then O7', out7.note)
+                    self.assertEqual({s: h.journal.step_status(s) for s in ('O6', 'O7')}, {'O6': 'pending', 'O7': 'pending'})
+                    self.assertEqual(h.journal.events('counter'), [], 'no counter is set before the re-copy completes')
+                    self.assertEqual(run_from_o6(h), EXIT_DONE, h.text())
+                    self.assertEqual({s: h.journal.step_status(s) for s in ('O6', 'O7', 'O8')}, {'O6': 'passed', 'O7': 'passed', 'O8': 'passed'})
+                    assert_reinserted_once(self, h, 't_comp', start)
+                    self.assertNotIn('[O7] Post-copy (python; runner) database %s: already passed' % SRC, h.text())
+
+    def test_f4_o7_crash_after_its_recopy_round_resumes_from_o6_and_sets_the_counter_after_the_recopy(self):
+        """A kill -9 stand-in at the journal write that marks O6 passed after O7's completed re-copy round, and one before, after, or
+        after and before the journal event, at the counter ALTER that follows that round: O7 ends failed, and the operator's run
+        --from O6 ends with O6, O7 and O8 passed, no row lost or doubled, and the counter set after the re-copy."""
+        cases = [('O6 passed', None)] + [('counter', point) for point in FAULT_POINTS]
+        for where, point in cases:
+            with self.subTest(where=where, point=point):
+                h = copied(self, mutate_inventory=auto_increment_on_t_comp)
+                h.fake.rows(SRC, 't_comp').append(dict(LATE_ROW))
+                start = len(h.fake.writes)
+                if where == 'O6 passed':
+                    fired = crash_journal(self, h.journal, 'step_end',
+                                          match=lambda step_id, status, note=None, evidence_path=None: step_id == 'O6' and status == 'passed')
+                elif point == 'journal':
+                    fired = crash_journal(self, h.journal, 'event', match=lambda kind, detail: kind == 'counter')
+                else:
+                    h.fake.fail_statement(r'^ALTER TABLE `%s`\.`t_comp` AUTO_INCREMENT' % TGT, point, crash=True)
+                    fired = h.fake.faults_fired
+                with self.assertRaises(SimulatedCrash):
+                    h.step('O7', redo=False)
+                self.assertEqual(len(fired), 1, 'the fault fired')
+                self.assertEqual(h.journal.step_status('O7'), 'failed')
+                self.assertEqual(h.journal.step_status('O6'), 'pending' if where == 'O6 passed' else 'passed',
+                                 'O6 is passed again only once its journal write is done')
+                self.assertEqual(run_from_o6(h), EXIT_DONE, h.text())
+                self.assertEqual({s: h.journal.step_status(s) for s in ('O6', 'O7', 'O8')}, {'O6': 'passed', 'O7': 'passed', 'O8': 'passed'})
+                assert_reinserted_once(self, h, 't_comp', start)
+                assert_counter_follows(self, h, 't_comp', 'mark_recopy')
+                self.assertGreater(h.fake.databases[TGT]['tables']['t_comp']['auto_increment'], LATE_ROW['c'],
+                                   'the counter is above every id the re-copy brought')
+
     def test_o8_mismatch_marks_buckets_and_exits_3(self):
         h = copied(self)
         self.assertEqual(h.step('O7').status, steps.PASSED, h.text())
@@ -214,8 +355,10 @@ class StaleCheckAndHandlersTests(unittest.TestCase):
         self.assertEqual((out8.status, out8.exit_code), (steps.MISMATCH, 3), h.text())
         self.assertIn('mark-recopy t_single --bucket', out8.note)
         self.assertEqual(h.journal.step_status('O8'), 'failed')
+        self.assertEqual(h.journal.step_status('O7'), 'pending', 'the re-copy reopens O7 for the counters (F4)')
         self.assertTrue(any(c['state'] == 'failed' for c in h.journal.chunks('t_single')))
         self.assertEqual(h.step('O6', options={'retry_failed': True}).status, steps.PASSED)
+        self.assertEqual(h.step('O7').status, steps.PASSED)
         self.assertEqual(h.step('O8').status, steps.PASSED)
 
     def test_o8_sampled_needs_yes(self):

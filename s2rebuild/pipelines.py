@@ -6,7 +6,10 @@ Section 10.12 of the architecture. The copy is not complete until every pipeline
 replacement, stopped, at the offsets recorded when the source stopped. O9 therefore replays only
 the O2 capture taken after the stop (taken by the kit with the owner profile, or imported from
 the notebook O2 result with s2rebuild gate O2 --evidence); an earlier capture is refused because
-its offsets were still moving. Credentials are redacted by the server for every identity, so the
+its offsets were still moving. The recorded position is the committed one: LATEST_SUCCESSFUL_OFFSET
+per partition, LATEST_LOADED_OFFSET only where successful is NULL; O2 refuses a capture in which
+the two differ on any partition after the stop (a NULL successful offset beside a loaded one
+included), and O9 and O11 compare and check retention partition by partition against it. Credentials are redacted by the server for every identity, so the
 kit injects them at replay time from the environment variables named in the configuration, as a
 SQL literal with backslashes and quotes escaped; the value lives only in the process environment
 and in the statement sent to the server, and every form of it is masked in logs. Route customer
@@ -24,11 +27,12 @@ from .sqlutil import ident, qualified, read_guard, secret_forms, sql_literal, st
 RUNNING_SQL = "SELECT COUNT(*) AS n FROM information_schema.PIPELINES WHERE DATABASE_NAME = %s AND STATE = 'Running'"
 COUNT_SQL = 'SELECT COUNT(*) AS n FROM information_schema.PIPELINES WHERE DATABASE_NAME = %s'
 EXISTS_SQL = 'SELECT COUNT(*) AS n FROM information_schema.PIPELINES WHERE DATABASE_NAME = %s AND PIPELINE_NAME = %s'
-NOT_RUNNING_SQL = "SELECT COUNT(*) AS n FROM information_schema.PIPELINES WHERE DATABASE_NAME = %s AND PIPELINE_NAME = %s AND STATE <> 'Running'"
+STOPPED_SQL = "SELECT COUNT(*) AS n FROM information_schema.PIPELINES WHERE DATABASE_NAME = %s AND PIPELINE_NAME = %s AND STATE = 'Stopped'"
 IS_RUNNING_SQL = "SELECT COUNT(*) AS n FROM information_schema.PIPELINES WHERE DATABASE_NAME = %s AND PIPELINE_NAME = %s AND STATE = 'Running'"
-OFFSET_SUM_SQL = ('SELECT COUNT(*) AS partitions, SUM(LATEST_LOADED_OFFSET) AS loaded FROM information_schema.PIPELINES_OFFSETS '
-                  'WHERE DATABASE_NAME = %s AND PIPELINE_NAME = %s')
+PARTITION_OFFSET_SQL = ('SELECT LATEST_SUCCESSFUL_OFFSET AS successful, LATEST_LOADED_OFFSET AS loaded FROM information_schema.PIPELINES_OFFSETS '
+                        'WHERE DATABASE_NAME = %s AND PIPELINE_NAME = %s AND SOURCE_PARTITION_ID = %s')
 PARALLELISM_SQL = 'SELECT @@GLOBAL.query_parallelism_per_leaf_core AS v'
+NOT_CHECKED = 'pipelines and grants: not checked, no owner profile'
 _PIPELINE_NAME = re.compile(r'PIPELINE\s+(?:`[^`]+`\.)?`([^`]+)`', re.I)
 
 
@@ -42,8 +46,17 @@ def needs_credentials(item):
     return any(inventory.CREDENTIALS_PLACEHOLDER in (s or '') for s in [item.get('definition')] + list(item.get('alter_statements') or []))
 
 
+def committed_offset(o):
+    """(column, value) of a captured partition's replay position: ('successful', LATEST_SUCCESSFUL_OFFSET), the safe restart
+    position; ('loaded', LATEST_LOADED_OFFSET) only when successful is NULL. O2 refuses a capture with a NULL successful
+    offset beside a loaded one, so from an O2 capture the fallback carries NULL only."""
+    if o.get('successful') is not None:
+        return 'successful', o['successful']
+    return 'loaded', o.get('loaded')
+
+
 def _offsets_known(item):
-    return [o for o in item.get('offsets') or [] if o.get('loaded') is not None]
+    return [o for o in item.get('offsets') or [] if committed_offset(o)[1] is not None]
 
 
 def names_source(text, source):
@@ -76,7 +89,10 @@ def captured_items(ctx):
 # Blocks
 # ---------------------------------------------------------------------------
 def stop_block(names, items, extra_names=()):
-    """O2: STOP PIPELINE for every captured pipeline (and every pipeline seen live since), then verify none Running, then capture."""
+    """O2: STOP PIPELINE for every captured pipeline (and every pipeline seen live since), then verify none Running, then capture.
+
+    A STOP is skipped only when the pipeline is Stopped already, so a pipeline in state Error is stopped too.
+    """
     b = ownersql.Block('O2', 'Stop pipelines')
     b.check('pipelines on the source (count, informational)', COUNT_SQL, (names['source'],), ownersql.Expect('some_rows'))
     if not items and not extra_names:
@@ -84,7 +100,7 @@ def stop_block(names, items, extra_names=()):
     listed = [(i['name'], bool(i.get('app_managed'))) for i in items] + [(n, False) for n in extra_names if n not in {i['name'] for i in items}]
     for name, app_managed in listed:
         b.statement('STOP PIPELINE %s' % qualified(names['source'], name), 'stop pipeline %s%s' % (name, ' (application managed)' if app_managed else ''),
-                    skip_if=(NOT_RUNNING_SQL, (names['source'], name)))
+                    skip_if=(STOPPED_SQL, (names['source'], name)))
     b.check('no pipeline Running', RUNNING_SQL, (names['source'],), ownersql.Expect('column_equals', 'n', 0))
     b.capture(names['source'], 'every definition and offset of %s is read again now; the offsets captured after the stop are the ones '
                                'replayed at O9 (in the notebook the result carries them for s2rebuild gate O2 --evidence)' % names['source'])
@@ -101,19 +117,26 @@ def _capture_refusal(capture_step, items):
 
 
 def _verify_checks(b, names, expected):
+    """The O9 gate checks: count, none Running, then one check per pipeline and partition that its committed offset equals the capture."""
     b.check('pipeline count equals the capture minus application-managed ones', COUNT_SQL, (names['replacement'],),
             ownersql.Expect('column_equals', 'n', len(expected)))
     b.check('no pipeline Running in the replacement', RUNNING_SQL, (names['replacement'],), ownersql.Expect('column_equals', 'n', 0))
     for item in expected:
-        known = _offsets_known(item)
-        if known:
-            b.check('offsets of %s equal the O2 capture (partitions and summed loaded offset)' % item['name'], OFFSET_SUM_SQL,
-                    (names['replacement'], item['name']),
-                    ownersql.Expect('columns_equal', value={'partitions': len(item.get('offsets') or []), 'loaded': sum(o['loaded'] for o in known)}))
+        for o in _offsets_known(item):
+            column, value = committed_offset(o)
+            b.check('offset of %s partition %s equals the O2 capture (%s)' % (
+                item['name'], o['partition'], 'LATEST_SUCCESSFUL_OFFSET' if column == 'successful'
+                else 'LATEST_LOADED_OFFSET: the capture holds no successful offset'), PARTITION_OFFSET_SQL,
+                (names['replacement'], item['name'], str(o['partition'])), ownersql.Expect('column_equals', column, value))
 
 
 def replay_block(names, items, capture_step='O2'):
-    """O9: USE the replacement, CREATE each pipeline (skipped when it exists; never started), its ALTER statements, then the checks."""
+    """O9: USE the replacement, CREATE each pipeline (skipped when it exists; never started), its ALTER statements, then the checks.
+
+    A STOP comes first for a capture that cannot be replayed, a pipeline that names the source,
+    and a definition that still carries a redaction marker (as check_credentials refuses on the
+    kit route), so the notebook never sends a masked value to CREATE PIPELINE.
+    """
     b = ownersql.Block('O9', 'Recreate pipelines in the replacement, stopped, at the recorded offsets')
     expected = expected_items(items)
     refusal = _capture_refusal(capture_step, items)
@@ -125,6 +148,9 @@ def replay_block(names, items, capture_step='O2'):
                 b.refuse('pipeline %s names the source database %s in its statements; edit the capture so it loads into the replacement'
                          % (item['name'], names['source']))
                 break
+    for item in expected:
+        if inventory.has_redaction_marker(item.get('definition')):
+            b.refuse('pipeline %s still carries a redaction marker in its definition; capture it again' % item['name'])
     b.statement('USE %s' % ident(names['replacement']), 'work inside the replacement')
     for item in expected:
         b.statement(item['definition'], 'create pipeline %s' % item['name'], skip_if=(EXISTS_SQL, (names['replacement'], item['name'])),
@@ -160,10 +186,10 @@ def release_block(names, items, grant_snapshot, config=None):
                 'SELECT COUNT(*) AS n FROM information_schema.PIPELINES_OFFSETS WHERE DATABASE_NAME = %s AND PIPELINE_NAME = %s '
                 'AND SOURCE_PARTITION_ID IN (' + ', '.join(['%s'] * len(parts)) + ')',
                 (names['source'], item['name']) + tuple(parts), ownersql.Expect('column_equals', 'n', len(parts)))
-        b.check('no retention gap on %s (recorded offset not below EARLIEST_OFFSET)' % item['name'],
+        b.check('no retention gap on %s (recorded committed offset not below EARLIEST_OFFSET)' % item['name'],
                 'SELECT COUNT(*) AS n FROM information_schema.PIPELINES_OFFSETS WHERE DATABASE_NAME = %s AND PIPELINE_NAME = %s AND ('
                 + ' OR '.join(['(SOURCE_PARTITION_ID = %s AND EARLIEST_OFFSET > %s)'] * len(known)) + ')',
-                (names['source'], item['name']) + tuple(v for o in known for v in (str(o['partition']), o['loaded'])),
+                (names['source'], item['name']) + tuple(v for o in known for v in (str(o['partition']), committed_offset(o)[1])),
                 ownersql.Expect('column_equals', 'n', 0))
     for grantee, scopes in sorted(grants.normalize(grant_snapshot).items()):
         for scope, privs in sorted(scopes.items()):
@@ -242,35 +268,41 @@ def offsets_in(session, db_name):
 
 
 def offsets_equal(session, replacement, items):
-    """Differences between the replacement's loaded offsets and the capture: [(pipeline, partition, recorded, replacement)]."""
+    """Differences between the replacement's committed offsets and the capture, partition by partition: [(pipeline, partition, recorded, replacement)].
+
+    The compared column is LATEST_SUCCESSFUL_OFFSET; LATEST_LOADED_OFFSET only for a partition whose captured successful offset is NULL.
+    """
     current = offsets_in(session, replacement)
     diffs = []
     for item in expected_items(items):
         for o in item.get('offsets') or []:
+            column, recorded = committed_offset(o)
             got = current.get((item['name'], str(o['partition'])))
-            loaded = got[2] if got else None
-            if loaded != o.get('loaded'):
-                diffs.append((item['name'], str(o['partition']), o.get('loaded'), loaded))
+            observed = (got[3] if column == 'successful' else got[2]) if got else None
+            if observed != recorded:
+                diffs.append((item['name'], str(o['partition']), recorded, observed))
     return diffs
 
 
 def retention_gaps(session, db_name, items):
-    """[(pipeline, partition, recorded loaded, current earliest)] where the recorded offset is below the current EARLIEST.
+    """[(pipeline, partition, recorded committed offset, current earliest)] where the recorded offset is below the current EARLIEST.
 
-    A captured partition with no PIPELINES_OFFSETS row on db_name is reported with earliest
+    The recorded offset is LATEST_SUCCESSFUL_OFFSET, or LATEST_LOADED_OFFSET when successful is
+    NULL. A captured partition with no PIPELINES_OFFSETS row on db_name is reported with earliest
     'missing', so the release refuses before any START.
     """
     current = offsets_in(session, db_name)
     gaps = []
     for item in expected_items(items):
         for o in _offsets_known(item):
+            recorded = committed_offset(o)[1]
             got = current.get((item['name'], str(o['partition'])))
             if got is None:
-                gaps.append((item['name'], str(o['partition']), o['loaded'], 'missing'))
+                gaps.append((item['name'], str(o['partition']), recorded, 'missing'))
                 continue
             earliest = got[0]
-            if earliest is not None and o['loaded'] < earliest:
-                gaps.append((item['name'], str(o['partition']), o['loaded'], earliest))
+            if earliest is not None and recorded < earliest:
+                gaps.append((item['name'], str(o['partition']), recorded, earliest))
     return gaps
 
 
@@ -305,10 +337,29 @@ def _require_stopped(items):
                        'stop them and rerun O2' % ', '.join(running))
 
 
+def _require_committed(items):
+    """Refuse the capture when LATEST_LOADED_OFFSET differs from LATEST_SUCCESSFUL_OFFSET on any partition after the stop.
+
+    The replay position must be the committed one. A NULL successful offset beside a loaded one
+    counts as a difference (a batch extracted and never committed); only both NULL passes.
+    """
+    def shown(v):
+        """An offset as the refusal prints it: NULL for None."""
+        return 'NULL' if v is None else v
+    pending = ['%s partition %s (loaded %s, successful %s)' % (i['name'], o['partition'], shown(o.get('loaded')), shown(o.get('successful')))
+               for i in items for o in i.get('offsets') or [] if o.get('loaded') != o.get('successful')]
+    if pending:
+        raise KitError('O2 capture refused: LATEST_LOADED_OFFSET differs from LATEST_SUCCESSFUL_OFFSET after the stop on %s; the replay position '
+                       'must be the committed offset, so rerun O2 once they agree (the rerun skips the stopped pipelines and reads the offsets again)'
+                       % '; '.join(pending[:10]))
+
+
 def capture_after_stop(ctx, owner_session):
-    """O2 python part: capture definitions and offsets again after the stop, refuse when any pipeline runs again, write and journal."""
+    """O2 python part: capture definitions and offsets again after the stop, refuse when any pipeline runs again or a partition holds
+    an uncommitted batch, write and journal."""
     items = inventory._pipelines(owner_session, ctx.db.source, set(ctx.db.app_managed_pipelines), utc_now())['items']
     _require_stopped(items)
+    _require_committed(items)
     write_capture(ctx, items, 'owner profile')
     return items
 
@@ -327,8 +378,10 @@ def items_from_capture(capture, app_managed=()):
         create, alters = inventory.parse_pipeline_statements(capture.get('definitions', {}).get(name) or [])
         if not create:
             raise KitError('The notebook capture holds no CREATE statement for pipeline %s' % name)
-        item = {'name': name, 'state': str(s.get('STATE')), 'definition': inventory.redact_credentials(create, name),
-                'alter_statements': [inventory.redact_credentials(a, name) for a in alters], 'redaction_marker': inventory.has_redaction_marker(create),
+        definition = inventory.redact_credentials(create, name)
+        # the marker is read on the stored definition, the text O9 checks (check_credentials), as in the kit capture
+        item = {'name': name, 'state': str(s.get('STATE')), 'definition': definition,
+                'alter_statements': [inventory.redact_credentials(a, name) for a in alters], 'redaction_marker': inventory.has_redaction_marker(definition),
                 'app_managed': name in set(app_managed), 'offsets': offsets.get(name, []), 'last_batch_time': None, 'rows_24h': 0,
                 'errors_24h': 0, 'last_error': None}
         item.update(inventory.describe_pipeline(create))
@@ -337,11 +390,13 @@ def items_from_capture(capture, app_managed=()):
 
 
 def import_capture(ctx, capture):
-    """Import the notebook O2 capture (gate O2 --evidence) as the O2 capture; refuses when a pipeline is not Stopped."""
+    """Import the notebook O2 capture (gate O2 --evidence) as the O2 capture; refuses when a pipeline is not Stopped or loaded differs
+    from successful on a partition."""
     if str(capture.get('database')) != ctx.db.source:
         raise KitError('The notebook capture is for database %s, not %s' % (capture.get('database'), ctx.db.source))
     items = items_from_capture(capture, ctx.db.app_managed_pipelines)
     _require_stopped(items)
+    _require_committed(items)
     return write_capture(ctx, items, 'notebook O2 result')
 
 
@@ -420,7 +475,16 @@ def handle_o9(step, ctx):
 
 
 def handle_o11(step, ctx):
-    """O11 handler: retention and partition checks, grants restored first (from any unrestored snapshot), pipelines started, release time."""
+    """O11 handler: retention and partition checks, grants restored first (from any unrestored snapshot), pipelines started, release time.
+
+    With the owner profile, release_started_utc is written inside the open owner session once
+    the retention check and every check ahead of the first statement passed, just before that
+    statement (ownersql.execute_block before_first_statement). From that statement on a started
+    pipeline or a restored grant may write to the live name, so an O11 that fails or is
+    interrupted after it never leaves the rollback open. An O11 that stopped before it (a failed
+    check, a lost connection) issued nothing and leaves the rollback open. released_utc follows
+    once the whole block and the grants compare passed.
+    """
     cap = capture_for(ctx)
     items = cap['items']
     names = ownersql.names_for(ctx)
@@ -454,7 +518,11 @@ def handle_o11(step, ctx):
             for grantee in snap:
                 ctx.journal.mark_grant_restored(grantee)
         ctx.journal.set_meta('released_utc', now)
-    return ownersql.handle_admin(step, ctx, b, after=_after)
+
+    def _before_first_statement():
+        ctx.journal.set_meta('release_started_utc', ctx.journal.get_meta('release_started_utc') or iso(utc_now()))
+        ctx.log('    release_started_utc recorded: from the next statement on a rollback is refused')
+    return ownersql.handle_admin(step, ctx, b, after=_after, before_first_statement=_before_first_statement)
 
 
 def _server_time(value):
@@ -462,7 +530,8 @@ def _server_time(value):
 
 
 def after_release_checks(session, db_name, items, journal, log, sleep=time.sleep, started_since=None):
-    """C1: every expected pipeline Running, offsets advancing where new data exists, no errors since the start; returns (ok, lines)."""
+    """C1: every expected pipeline Running, application-managed ones present, offsets advancing where new data exists, no errors since
+    the start; returns (ok, lines)."""
     lines, ok = [], True
     expected = expected_items(items)
     states = {str(r['PIPELINE_NAME']): str(r['STATE']) for r in session.query(inventory.PIPELINES_SQL, (db_name,))}
@@ -473,6 +542,8 @@ def after_release_checks(session, db_name, items, journal, log, sleep=time.sleep
     else:
         lines.append('pipelines Running: %d' % len(expected))
     missing_app = [i['name'] for i in items if i.get('app_managed') and i['name'] not in states]
+    if missing_app:
+        ok = False
     lines.append('application-managed pipelines present again: %s' % ('yes' if not missing_app else 'missing ' + ', '.join(missing_app)))
     first = offsets_in(session, db_name)
     sleep(60)
@@ -510,8 +581,14 @@ def handle_c1(step, ctx):
     """C1 handler: writer watch and count changes on the live database, pipeline and grants checks with the owner, app_writes_seen.
 
     Pipelines and other accounts' grants are invisible to the runner (section 5), so those two
-    checks need the owner profile; without it C1 reports them pending. The count change compares
-    two samples taken around the 60 s offset sample and the journal's verified target counts.
+    checks need the owner profile; without it they are recorded as not checked (a c1_not_checked
+    event and the step note) and do not hold the step. With the owner, an application-managed
+    pipeline missing from the live database fails the step. The count change compares two samples
+    taken around the 60 s offset sample and the journal's verified target counts. C1 passes only
+    when this run saw application writes (a foreign session, counts moving between the samples or
+    differing from the copy, or app_writes_seen recorded by an earlier C1 attempt of the run) or the
+    operator passed step C1 --idle-workload NOTE, which is recorded as an idle_workload event;
+    otherwise it fails with exit 4.
     """
     from . import copy as copy_module
     from . import watch
@@ -530,7 +607,6 @@ def handle_c1(step, ctx):
     sleep = ctx.options.get('sleep') or time.sleep
     runner = ctx.runner_session(steps.guard_for('C1', ctx.db))
     protected = {ctx.config.runner.user} | ({ctx.config.owner.user} if ctx.config.owner else set())
-    pending = []
     ok, lines = True, []
     try:
         summary = watch.watch(runner, ctx.db.source, plans, protected, ctx.log, interval=1, tables=10, max_checks=3, sleep=lambda s: None)
@@ -553,26 +629,42 @@ def handle_c1(step, ctx):
                 owner.close()
         else:
             sleep(60)
-            pending = ['pipelines Running with offsets advancing and no errors', 'grants equal the snapshot']
         counts2 = watch.count_largest(runner, ctx.db.source, plans, 10)
     finally:
         runner.close()
     journal_counts = {t['table_name']: t.get('target_count') for t in ctx.journal.tables()}
     moved = sorted(n for n in counts2 if counts1.get(n) != counts2[n])
     differs = sorted(n for n in counts2 if journal_counts.get(n) is not None and int(journal_counts[n]) != counts2[n])
-    if summary['writers_seen'] or moved or differs or any(summary['count_deltas'].values()):
-        ctx.journal.set_meta('app_writes_seen', ctx.journal.get_meta('app_writes_seen') or iso(utc_now()))
+    if not ctx.owner_configured:
+        lines.append(NOT_CHECKED)
+        ctx.journal.event('c1_not_checked', NOT_CHECKED)
+        ctx.log(lines[-1])
+    seen_now = bool(summary['writers_seen'] or moved or differs or any(summary['count_deltas'].values()))
+    seen_before = ctx.journal.get_meta('app_writes_seen')
+    writes = seen_now or bool(seen_before)
+    if seen_now:
+        ctx.journal.set_meta('app_writes_seen', seen_before or iso(utc_now()))
         lines.append('application writes seen on the live database (%s); a rollback is now a new freeze and reconciliation' % (
             ', '.join(filter(None, ['sessions' if summary['writers_seen'] else '', 'counts moved on ' + ', '.join(moved) if moved else '',
                                      'counts differ from the copy on ' + ', '.join(differs) if differs else '']))))
+    elif seen_before:
+        # an earlier C1 attempt of this run saw them and recorded app_writes_seen; this sample saw none, which does not undo that
+        lines.append('no application write in this sample; an earlier C1 attempt of this run saw application writes on the live '
+                     'database at %s (app_writes_seen)' % seen_before)
     else:
         lines.append('no application session or count change seen yet on the live database')
     ctx.log(lines[-1])
     if not ok:
         return steps.Outcome(steps.FAILED, 'C1 checks failed: ' + '; '.join(lines), EXIT_GATE)
-    if pending:
-        return steps.Outcome(steps.PENDING, 'C1 runner checks done; these need the owner profile or the notebook: %s; %s' % (
-            ', '.join(pending), '; '.join(lines)), EXIT_GATE)
+    idle = str(ctx.options.get('idle_workload') or '').strip()
+    if not writes:
+        if not idle:
+            return steps.Outcome(steps.FAILED, 'C1 saw no application writes on the live database; rerun s2rebuild step C1 once the application '
+                                 'writes, or pass s2rebuild step C1 --idle-workload NOTE when the live database is idle on purpose; '
+                                 + '; '.join(lines), EXIT_GATE)
+        ctx.journal.event('idle_workload', idle)
+        lines.append('no application writes seen; idle workload accepted by the operator: ' + idle)
+        ctx.log(lines[-1])
     return steps.Outcome(steps.PASSED, 'C1 checks passed: ' + '; '.join(lines))
 
 

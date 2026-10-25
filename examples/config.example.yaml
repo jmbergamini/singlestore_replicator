@@ -36,9 +36,10 @@ freeze:
   detach_wait_seconds: 120              # how long a plain DETACH may wait before the kit escalates
   detach_kill: true                     # DETACH DATABASE ... KILL when writers block the detach
   write_probe: true
+  quiet_max_age_seconds: 60             # Path B: S1 of O10 needs a quiet lockout pass no older than this
   lockout:
     connections: 6                      # held connections, to reach several aggregators
-    interval_seconds: 0                 # 0 = tight loop
+    interval_seconds: 5                 # seconds between passes; 0 = tight loop
     protected_accounts: []              # never revoked; runner and owner are always protected
     quiet_passes_required: 3
 copy:
@@ -50,6 +51,7 @@ copy:
   lock_probe_timeout_seconds: 5
   lock_retry_seconds: 120
   max_attempts: 3
+  max_lock_waits: 10                    # lock waits of one chunk, then it fails with the fresh-table command
   progress_seconds: 60
 verify:
   tiers: [count, newest, fingerprint]
@@ -69,3 +71,6 @@ closeout:
   flexible_parallelism: 0.5             # SET GLOBAL query_parallelism_per_leaf_core; null to skip
 paths:
   runs_dir: customer/runs
+objects:
+  routines:
+    ignore: []                          # procedures and functions left behind (not migrated in this pass): name or database.name
