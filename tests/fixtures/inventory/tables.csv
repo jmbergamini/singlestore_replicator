@@ -1,0 +1,7 @@
+database,table_name,estimated_rows,exact_rows,size_gib,storage_type,key_kind,key_columns,buckets,time_column,unique_key_lock_risk,auto_increment_column,computed_columns
+example_orders_db,orders,25000000,,12.5,columnstore,key,id,3,updated_at,0,,
+example_orders_db,order_items,600000000,,180.25,columnstore,key,"order_id,line_no",32,_modified_time,0,,
+example_orders_db,events,12000000,,3.0,columnstore,row,,2,event_date,0,,
+example_orders_db,customers,2000000,,0.75,columnstore,key,id,1,created_at,1,id,
+example_orders_db,totals,3650,,0.001,rowstore,key,day,1,,0,,dollars
+example_orders_db,empty_table,0,,0.0,rowstore,row,,1,,0,,

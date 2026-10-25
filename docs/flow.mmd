@@ -1,0 +1,33 @@
+flowchart LR
+  subgraph P[Prepare: before the window]
+    direction TB
+    P1[P1 Prerequisites<br/>account, Keychain, config] --> P2[P2 Preflight<br/>connection, privileges,<br/>layout, storage IDs]
+    P2 --> P3[P3 Profile<br/>inventory, sizes, estimate]
+    P3 --> P4{P4 Plan<br/>window, deadline,<br/>freeze path}
+    P4 --> P5[P5 Rehearsal<br/>throwaway copy and switch]
+  end
+  subgraph O[Outage window]
+    direction TB
+    O1[O1 Start<br/>go decision, deadline] --> O2[O2 Stop pipelines<br/>capture offsets]
+    O2 --> O3{O3 Freeze}
+    O3 -->|Path A, default| O3A[Detach, attach READ ONLY<br/>write probe]
+    O3 -->|Path B, fallback| O3B[Revoke and kill loop<br/>quiet proof]
+    O3A --> O4[O4 Freeze capture<br/>inventory, drift, copy plan]
+    O3B --> O4
+    O4 --> O5[O5 Create replacement<br/>layout, tables, definition diff]
+    O5 --> O6[O6 Copy<br/>chunks, journal, resume]
+    O6 --> O7[O7 Post-copy<br/>views, counters, stale check]
+    O7 --> O8[O8 Verify<br/>counts, newest, fingerprints]
+    O8 --> O9[O9 Pipelines<br/>create stopped at offsets]
+    O9 --> O10{O10 Switch<br/>state machine}
+    O10 -->|go| O11[O11 Release<br/>start pipelines, restore grants,<br/>application restart]
+    O10 -->|no go| RB[Rollback<br/>original re-attached read write]
+  end
+  subgraph C[Close-out]
+    direction TB
+    C1[C1 Verify after release] --> C2[C2 Report and calibrate]
+    C2 --> C3[C3 Retention cleanup<br/>after N days]
+    C3 --> C4[C4 Remove migration account]
+  end
+  P5 --> O1
+  O11 --> C1

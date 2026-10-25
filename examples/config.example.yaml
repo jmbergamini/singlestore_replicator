@@ -1,0 +1,71 @@
+# SingleStore Database Rebuild Kit configuration. Copy to customer/config.yaml and edit.
+# Placeholder names only. No password, host or workspace id of a real customer belongs in
+# the static tree. Every key is documented in docs/CONFIG.md with its default.
+kit: s2rebuild
+version: 1
+customer: "Example Customer"            # label for reports; never used in the static tree
+workspace:
+  host: svc-xxxx-dml.svc.singlestore.com
+  port: 3306
+  ca_file: certs/singlestore_bundle.pem
+  compute_size: S-16                    # label stored with the baseline record
+  # id: <workspace id>                 # optional; the owner notebook checks it before running anything
+connections:
+  runner:
+    user: s2rebuild_runner
+    password_keychain: s2rebuild-runner # or password_env: S2REBUILD_RUNNER_PASSWORD
+  owner:                                # optional; when present, admin steps execute with gates
+    user: admin
+    password_keychain: s2rebuild-owner
+databases:
+  - source: acme_orders_db
+    replacement: acme_orders_db_rebuild_20261101    # default <source>_rebuild_<YYYYMMDD>
+    retained: acme_orders_db_retained_20261101      # default <source>_retained_<YYYYMMDD>
+    layout: { partitions: 32, sub_partitions: 512 }
+    time_column_candidates: [_modified_time, updated_at, modified_at, _created_time, created_at, event_date]
+    app_managed_pipelines: []           # pipelines the application drops and recreates itself
+    tables:                             # optional per-table overrides
+      big_events: { concurrency: 1, chunk_rows: 50000000 }
+window:
+  start: 2026-11-01T05:00:00Z
+  end: 2026-11-01T13:00:00Z
+  restart_allowance_minutes: 60         # time the customer needs to restart on the original
+  buffer_minutes: 30
+freeze:
+  mode: readonly                        # readonly | lockout
+  detach_wait_seconds: 120              # how long a plain DETACH may wait before the kit escalates
+  detach_kill: true                     # DETACH DATABASE ... KILL when writers block the detach
+  write_probe: true
+  lockout:
+    connections: 6                      # held connections, to reach several aggregators
+    interval_seconds: 0                 # 0 = tight loop
+    protected_accounts: []              # never revoked; runner and owner are always protected
+    quiet_passes_required: 3
+copy:
+  workers: 4
+  chunk_rows: 10000000
+  min_rows_for_chunking: 5000000
+  max_buckets_per_table: 32
+  table_concurrency: auto               # auto | 1; auto serializes a table after its first lock wait
+  lock_probe_timeout_seconds: 5
+  lock_retry_seconds: 120
+  max_attempts: 3
+  progress_seconds: 60
+verify:
+  tiers: [count, newest, fingerprint]
+  fingerprint_budget_minutes: 30
+  fingerprint_groups: 64
+  sample_percent_over_budget: 5
+pipelines:
+  route: kit                            # kit = the kit replays at O9; customer = the customer runs the placeholder file
+  credentials_env: { KAFKA: S2REBUILD_KAFKA_CREDENTIALS, S3: S2REBUILD_S3_CREDENTIALS }
+  per_pipeline_env: {}                  # pipeline_name: ENV_VAR, overrides the source-type entry
+  retention_hours: { KAFKA: 168 }       # stated by the customer per source type, for the plan sheet
+estimate:
+  baseline: customer/baseline.json      # optional; defaults ship in s2rebuild/estimate.py
+  band_percent: 15
+closeout:
+  retain_days: 7
+  flexible_parallelism: 0.5             # SET GLOBAL query_parallelism_per_leaf_core; null to skip
+paths:
+  runs_dir: customer/runs
