@@ -1,8 +1,8 @@
 # SingleStore Database Rebuild Kit (s2rebuild): Architecture
 
 Author: John Bergamini
-Version: 1.0 (implementation spec for the first hardening pass)
-Date: October 25, 2026
+Version: 1.0 (the design after the release 1.0 work order, `docs/RELEASE-1.0.md`)
+Date: October 27, 2026
 
 ## 1. Verdict
 
@@ -28,12 +28,15 @@ In scope:
 - Profile and time estimate before the window, from a throughput model calibrated on the reference run and recalibrated after every run.
 - Freeze by read-only attachment (Path A) or by revoke-and-kill (Path B).
 - Server-side chunked copy with a durable journal, resume and reconciliation.
-- Views, AUTO_INCREMENT counters, pipelines (created stopped at recorded offsets), grants restore.
-- Switch as a state machine with rollback.
-- Verification in three tiers with a time budget.
-- Excel and Markdown reports: one summary tab plus one tab per table.
-- Rehearsal on throwaway databases, including the switch.
-- A bundle command that produces a manifest and a zip of the static tree.
+- Views, routines (functions, table-valued functions, aggregates, procedures), AUTO_INCREMENT counters, reference tables through a staging table, pipelines (created stopped at recorded offsets), grants restore.
+- Switch as a state machine with rollback by branch record, ending with two entries: the live database and the retained copy (10.13).
+- Verification in three tiers, the fingerprints in parallel and sampled by a contiguous range above a row threshold, with an elapsed budget and an acceptance without a rerun (10.10).
+- Operator prompts for the owner password, the pipeline credentials and the run names; the runner password generated to the workspace policy (section 8).
+- Workspace guards: the state and settings through the Management API, a keep-alive thread during every step, a circuit breaker in the copy (10.23).
+- Excel and Markdown reports: one summary tab plus one tab per table, the Views and Routines tabs, the end state and retention.
+- Rehearsal of the real steps on throwaway databases, synthetic or a sample of a real database (`sample-database`), including the switch, a rollback leg and the end state (10.18).
+- The customer's delete of the retained copy after the retention period (`cleanup`, C5).
+- A bundle command that produces a manifest and a zip of the static tree; an engine capture that the test fake is built from (`engine-capture`, docs/CODE-GUIDE.md).
 
 Out of scope for this pass:
 
@@ -52,25 +55,27 @@ Kind: python (the kit runs it), admin (needs the Helios admin identity; the kit 
 | ID | Step | Kind | Identity | Gate to pass |
 |---|---|---|---|---|
 | P1 | Prerequisites | human + admin | admin | Kit installed, runner account created, Keychain items set, config written |
-| P2 | Preflight | python | runner (+ owner) | Connection, privileges, source layout, STORAGE_ID recorded, target names free, compute size fits the partition count |
-| P3 | Profile | python | runner (+ owner for pipelines) | Inventory JSON, profile Excel, estimate with bands, window fit printed |
-| P4 | Plan | decision | people | Freeze path, window, abort deadline, named owner for "application stopped", pipeline credential handover, retained name, retention days recorded in config |
+| P2 | Preflight | python | runner (+ owner) | Connection, privileges, source layout, the source's branch record recorded, target names free, compute size fits the partition count, the workspace ACTIVE with its autoscale and auto-suspend settings recorded when the Management API key is configured (else the three questions printed), the routines counted with the owner profile |
+| P3 | Profile | python | runner (+ owner for pipelines, routines and the write-capable accounts) | Inventory JSON with the routine definitions and the reference tables counted, profile Excel, estimate with bands scaled to the workspace, window fit printed; the pipeline credentials asked and stored in the Keychain on route kit |
+| P4 | Plan | decision | people | Freeze path, window, abort deadline, named owner for "application stopped", pipeline credential handover, retained name, retention days recorded in config; the auto-suspend choice for the waits between commands |
 | P5 | Rehearsal | python + admin | runner + owner | The real steps on throwaway databases: freeze, copy with the kill test resumed, verify, switch with a rollback leg, release, C1 and C3 ending at two entries; timings recorded under `customer/runs/` |
-| O1 | Start | python + decision | runner | Window and deadline recorded, P2 passed in this run, rehearsal evidence present or waived with `--no-rehearsal NOTE`, go recorded |
+| O1 | Start | python + decision | runner | Window and deadline recorded, P2 passed in this run, rehearsal evidence present or waived with `--no-rehearsal NOTE`, autoscale off or accepted with `--accept-autoscale NOTE`, the replacement and retained names confirmed (asked in production mode when the configuration leaves them out), go recorded |
 | O2 | Stop pipelines | admin | owner | No pipeline in state Running; every definition captured with a credentials placeholder; offsets captured after the stop, loaded equal to successful on every partition |
 | O3 | Freeze | admin | owner | Path A: write probe refused and ATTACH_TYPE = READONLY. Path B: quiet proof passed the configured number of times |
 | O4 | Freeze capture | python | runner | Inventory captured after the freeze; drift against P3 reviewed; copy plan written |
-| O5 | Create replacement | python | runner | Replacement layout verified; every table definition matches the capture |
-| O6 | Copy | python | runner | Every chunk done; per-table count proof all match |
-| O7 | Post-copy | python | runner, owner for the views | Views created, counters set, stale check 0 mismatches after re-copy |
-| O8 | Verify | python | runner | Tier 1 and 2 pass for every table; tier 3 within budget or accepted by the operator |
+| O5 | Create replacement | python | runner, owner for the routines | Replacement layout verified; every table definition matches the capture; the functions, table-valued functions and aggregates created with the captured definitions |
+| O6 | Copy | python | runner | Every chunk done (reference tables through a staging table); per-table count proof all match |
+| O7 | Post-copy | python | runner, owner for the views and procedures | Views and procedures created, counters set, stale check 0 mismatches after re-copy |
+| O8 | Verify | python | runner | Tier 1 and 2 pass for every table; tier 3 a full match, or a sampled or not fingerprinted result accepted by the operator with `--yes` |
 | O9 | Pipelines | admin | owner | Expected pipeline count in the replacement, all Stopped, the committed offset of every partition in the replacement equals the O2 capture |
 | O10 | Switch | admin | owner | Live name resolves to the replacement branch with the target layout; retained copy attached read only; the original record and the replacement dropped; exactly two entries |
 | O11 | Release | admin + human | owner + customer | Retention check passed per partition; pipelines started; grants match the snapshot (Path B); application restarted and writing |
 | C1 | Verify after release | python | runner | Writer watch shows the application on the live database; pipelines Running with offsets advancing; no pipeline errors |
 | C2 | Report and calibrate | python | runner | Final Excel and Markdown written; baseline recalibrated from the journal, or kept with a note when the journal cannot be fitted |
 | C3 | End state | admin | owner | Exactly two entries across both storages, the live record and the retained record; the live name resolves to the live record; a write on the retained name refused; the listing recorded; the repair block for a switch made without S2b and S4 |
-| C4 | Remove migration account | admin | owner | DROP USER done, zero privileges remain, Keychain item deleted |
+| C4 | Remove migration account | admin | owner | C3 passed; no view and no routine of the live database has the runner as its definer; DROP USER done, zero privileges remain, Keychain item deleted |
+
+C5, the delete of the retained copy, is a command (`s2rebuild cleanup --delete NAME`, owner, the customer's decision after `retain_until_utc`), not a step of the registry: the board stays P1 to C4 and no step and no configuration key deletes the retained copy (10.13).
 
 Rules:
 
@@ -130,8 +135,8 @@ Two SQL identities. The split is forced by Helios: SUPER cannot be granted, the 
 
 | Identity | Who | Used by | Required privileges |
 |---|---|---|---|
-| runner | A SQL account the kit creates in P1 and drops in C4 | P2, P3 (tables), O4 to O8, C1, C2, watch | SELECT, INSERT, DELETE, CREATE, DROP, ALTER, CREATE DATABASE, DROP DATABASE, PROCESS, CREATE VIEW, SHOW VIEW on `*.*` |
-| owner | The workspace admin SQL user, or the Portal identity in a notebook | P1 account creation, P3 pipelines, O2, O3, O7 views, O9, O10, O11, C3, C4, lockout | Everything the admin has. Named statements: STOP/START/CREATE/ALTER PIPELINE, DETACH, ATTACH, GRANT, REVOKE, KILL, CREATE USER, DROP USER, DROP DATABASE, CREATE VIEW (O7) |
+| runner | A SQL account the kit creates in P1 and drops in C4 | P2, P3 (tables), O4, O5 (database and tables), O6, O7 (counters, stale check), O8, C1, C2, watch, the keep-alive thread, `sample-database` (tables) | SELECT, INSERT, DELETE, CREATE, DROP, ALTER, CREATE DATABASE, DROP DATABASE, PROCESS, CREATE VIEW, SHOW VIEW on `*.*` |
+| owner | The workspace admin SQL user, or the Portal identity in a notebook | P1 account creation and the password policy, P2 and P3 pipelines, routines and the write-capable accounts, O2, O3, O5 functions and aggregates, O7 views and procedures, O9, O10, O11, C3, C4, lockout, `cleanup` (C5), `engine-capture`, `sample-database` (views and routines) | Everything the admin has. Named statements: STOP/START/CREATE/ALTER PIPELINE, DETACH, ATTACH, GRANT, REVOKE, KILL, CREATE USER, DROP USER, DROP DATABASE, CREATE VIEW, CREATE FUNCTION, CREATE AGGREGATE, CREATE PROCEDURE |
 
 P2 checks the runner's privileges against the list above by reading `information_schema.USER_PRIVILEGES` for the runner's grantee string (`'user'@'host'`, built from `CURRENT_USER()`) and reports each missing one by name. It also attempts to detect whether the runner can ATTACH or DETACH (the branching documentation says CREATE DATABASE or ATTACH DATABASE permission allows branches); the result is recorded, not assumed.
 
@@ -155,6 +160,9 @@ Everything outside `customer/` is static. A run never writes outside `customer/`
     CONFIG.md                   every config key and every CLI flag (flag table generated by `s2rebuild docs-flags`)
     CODE-GUIDE.md               module map, data flow, decisions you can change
     LESSONS.md                  Helios facts and run lessons, generic wording
+    COVERAGE.md                 the coverage grid: what the kit migrates and what it does not
+    ROADMAP.md                  what comes after release 1.0, with effort
+    RELEASE-1.0.md              the release 1.0 work order and the live test ladder
     s2rebuild-guide.pdf         printable guide with the flow diagram (built by docs/build_pdf.py)
     build_pdf.py
   examples/
@@ -164,6 +172,7 @@ Everything outside `customer/` is static. A run never writes outside `customer/`
   notebooks/
     owner-steps.template.ipynb  filled by `s2rebuild owner-notebook`
   tests/                        offline tests, fake connection, no network
+    engine/helios-<version>.json  the engine capture the fake is built from (s2rebuild engine-capture)
   customer/                     the only writable folder; excluded from the bundle by default
     config.yaml
     env.sh                      optional exports; no secret inside
@@ -177,6 +186,7 @@ Everything outside `customer/` is static. A run never writes outside `customer/`
       <database>/reports/       profile.xlsx, final.xlsx, run-report.md
       logs/                     one log per step invocation, redacted
       owner-steps.ipynb         generated notebook (optional)
+      rehearsal/                P5: timings.json, the rehearsal's own journal and the folders of the rehearsed steps
 ```
 
 Local working files that are not part of the kit (`.venv/`, `dist/`, editor and assistant settings) are excluded from the bundle: built-in patterns in `bundle.py` plus the patterns listed in `customer/bundle-exclude.txt`.
@@ -263,7 +273,7 @@ estimate:
   band_percent: 15
   scale_up_cap: 1.0                     # credit for more leaf cores than the baseline's: 1.0 none, up to 4.0
 closeout:
-  retain_days: 7
+  retain_days: 90                       # C2 records retain_until_utc; cleanup --delete refuses before it; minimum 1
   flexible_parallelism: 0.5             # SET GLOBAL query_parallelism_per_leaf_core; null to skip
 paths:
   runs_dir: customer/runs
@@ -307,7 +317,9 @@ Prompts: every question the kit asks goes through `prompts.ask` (a hidden value 
 | `abandon` | before O10 | Back out a run stopped before the switch: the source READWRITE again as its recorded record, the replacement dropped only as its recorded record and only while no branch was made from it, the run closed; prints the block, `--execute --note TEXT` runs it with the owner profile under the copy lock |
 | `pause` / `resume` | O6 | Create or remove the stop file; running chunks finish, no new chunk starts |
 | `report` | C2 | Final Excel and Markdown for a run (also produced automatically at the end of O8 and C1) |
-| `calibrate` | C2 | Fit the throughput model from a journal and write `customer/baseline.json` |
+| `calibrate` | C2 | Fit the throughput model from a journal and write `customer/baseline.json`, with the leaf cores P2 recorded |
+| `cleanup` | C5 | List what the run left after C3 (the live record, the retained record, its size, `retain_until_utc`); `--delete NAME` deletes the retained copy for good: refused before the date, on a wrong name, a differing record or C3 not passed; the name typed again at the prompt (`--yes` does not apply); DETACH, the record's own syntax read write, a record check, DROP, each behind its check. Owner profile required |
+| `engine-capture` | tests | Write `tests/engine/helios-<version>.json`, the record of the engine the test fake is built from: the version, the column list of every `information_schema` view the kit reads, the ATTACH forms and id shapes as patterns, the PASSWORD_ variables, the runner-versus-owner counts on `--fixture-database NAME`, the hand-maintained error table carried over; `--out FILE`. Owner profile, reads only |
 | `bundle` | packaging | Write MANIFEST.json, check the denylist, zip the static tree to `dist/`; `--verify ZIP` unzips to a temp folder and compares hashes; `--include-customer` adds `customer/` |
 | `docs-flags` | docs | Print the flag table as Markdown for `docs/CONFIG.md` |
 
@@ -683,7 +695,7 @@ Verified on the reference run or in the documentation. `docs/LESSONS.md` carries
 17. `query_parallelism_per_leaf_core` is global, affects databases with sub-partitions only, and applies to new connections.
 18. Reference throughput, 4 workers on S-16 at 2x: 13.1 million rows scanned per second per worker, 339 thousand rows inserted per second per worker, 1.43 billion rows per hour and about 490 GiB per hour in aggregate.
 19. Engine 10.8.0: `PIPELINES_BATCHES_SUMMARY` has START_TIME (the batch timestamp), BATCH_TIME (the batch duration in seconds), ROWS_INSERTED and ROWS_UPDATED, and no BATCH_ROWS_WRITTEN; `PIPELINES_ERRORS` has ERROR_UNIX_TIMESTAMP and no ERROR_TIME.
-20. A workspace can enforce a password policy (`PASSWORD_MIN_LENGTH`, `PASSWORD_MIN_UPPERCASE_CHARS` and the other PASSWORD_ global variables); CREATE USER with a password that misses it fails with error 1144.
+20. A workspace can enforce a password policy (`PASSWORD_MIN_LENGTH`, `PASSWORD_MIN_UPPERCASE_CHARS` and the other PASSWORD_ global variables; on the test workspace a minimum length of 14, one of each character class, at most 3 repeated and 2 sequential characters); CREATE USER with a password that misses it fails with error 1144. P1 reads the variables through the owner session (`prompts.read_policy`), prints them and generates the runner password to them (`prompts.generate_password`: 32 characters or the policy minimum, every class, no character twice in a row, no three sequential characters); the test fake refuses a weaker password with 1144.
 21. An account without routine privileges sees no rows in `information_schema.ROUTINES`; the owner sees them all.
 22. Engine 10.8.0: ATTACH takes the STORAGEID unquoted and READ ONLY before it: `ATTACH DATABASE x [AS y] [READ ONLY] [STORAGEID id]`. A quoted id, or READ ONLY after STORAGEID, is error 1064. `MV_CLOUD_BRANCHES.ATTACH_SYNTAX` shows the form for each storage.
 23. On a READ ONLY attachment `information_schema.PIPELINES` shows no rows, while `PIPELINES_OFFSETS` keeps them. Pipelines must be captured before the freeze.
@@ -706,6 +718,7 @@ Verified on the reference run or in the documentation. `docs/LESSONS.md` carries
 40. Helios, run 20261026-1301, October 26: autoscale replaces nodes one at a time (MV_EVENTS: SYSTEM_VAR_CHANGED, NEW_MASTER_AGGREGATOR, NODE_DETACHED, NODE_OFFLINE per leaf) and every chunk in flight fails with error 1997 "transaction was already in its commit phase"; 28 chunks were lost that way, and P3 once failed at a connection reset while the workspace was scaling. Run with autoscale off: P2 reads the setting through the Management API when a key is configured and O1 refuses while it is on (`--accept-autoscale NOTE` overrides, recorded). The copy treats 1997 as a transient (`copy.is_commit_phase`: reconciled and requeued without an attempt), `copy.max_consecutive_failures` failures in a row trip the breaker and end O6 INCOMPLETE, and a driver reset (2003, 2004, 2006, 2013) ends a command with one plain line and exit 2.
 41. Helios, October 25: auto-suspend counts queries from connections as activity, not load batches; a workspace suspended while loads ran with no connection open. The kit's own keep-alive (`connect.KeepAlive`) sends `SELECT 1` on its own runner connection every `workspace.keepalive_minutes` while a step runs; between commands the plan (P4) records that auto-suspend is off for the window, or that a notebook job of the customer runs the same query every 15 minutes. The Management API field names the kit reads for the workspace (`GET /v1/workspaces/<id>`: `state`, `autoSuspend`, `autoScale`) are a best guess to confirm in the live ladder (I4); P2 records the raw fields, so a wrong name shows as "not reported" in the journal and on the plan sheet.
 42. Helios, S-8 at 4X (240 leaf cores), tpcds3tb, October 27: 270 M row chunks into 16 partitions took about 18 minutes at 4 workers (3.5 B rows per hour, leaf CPU about 17 percent) and 50 to 53 minutes at 12 workers (3.7 B rows per hour, CPU about 26 percent); client concurrency is not the limit. The estimate therefore scales its rates by the leaf cores P2 reads from `MV_NODES` against the baseline's (`estimate.scale_factor`), downward without limit and upward at most `estimate.scale_up_cap` (default 1.0), and the plan sheet carries the note as the planning line (section 10.6).
+43. Engine 10.8.0, a 3 TB database, October 27: DETACH of the idle database took 73 seconds at O3 and 10 seconds on `abandon`; ATTACH READWRITE took 8 seconds. `freeze.detach_wait_seconds` (default 120) is above the idle detach time, so the escalation to `DETACH ... KILL` (10.7) is for a database with writers, not for the upload; the estimate's freeze allowance of 10 minutes covers O3; the 30 seconds of fact 34 are four such statements with the live name free.
 
 ## 12. Documentation and branding
 
@@ -715,7 +728,10 @@ Deliverables:
 - `docs/STEPS.md`: the full catalog, one section per step: purpose, identity, inputs, outputs, statements issued, gate, how to re-enter, what to do when it fails. The O2, O9 and O11 sections repeat the pipeline and offsets explanation from section 10.12 in plain words, including the two credential routes and the retention check.
 - `docs/CONFIG.md`: every key with type, default and the steps that read it; every flag from `docs-flags`; environment variables; exit codes.
 - `docs/CODE-GUIDE.md`: module map with one paragraph each, the data flow from config to journal to reports, how to add a step, section 14, and a short section on the transform hook (10.21) as the place for future replacement changes.
-- `docs/LESSONS.md`: section 11 in plain words plus the run lessons.
+- `docs/LESSONS.md`: section 11 in plain words plus the run lessons; the two lists hold the same number of facts (a test checks it).
+- `docs/COVERAGE.md`: the coverage grid, one row per object kind with how it is migrated or what to do instead.
+- `docs/ROADMAP.md`: the items after release 1.0 with effort, and the detail behind the first two.
+- `docs/RELEASE-1.0.md`: the release 1.0 work order, the live test ladder and the configuration reference it was written from.
 - `docs/s2rebuild-guide.pdf`: the README and STEPS rendered with the flow diagram on page 2, built by `docs/build_pdf.py`.
 
 Branding and style:
@@ -744,6 +760,10 @@ Offline tests under `tests/` with a fake DB-API connection (port the 27 referenc
 - reports: workbook opens, Summary first, one tab per table, long names mapped, CREATE TABLE at the bottom.
 - bundle: manifest hashes, denylist hit fails, dash check fails, verify passes on its own zip.
 - style: no dashes, no denylisted words, author line in every module, docstring first lines.
+- engine: every `information_schema` query the kit holds names only columns of the capture; the fake answers the capture's error texts.
+- identity and endstate: the branch record everywhere, the two-entry switch, S2b's proof, the rollback legs, C3's gate and repair, C5's refusals and delete.
+- routines, prompts, workspace, rehearse, report: the capture and creation order of routines, the credential and name prompts with the Keychain writer replaced, the Management API client with a fake transport, the keep-alive clock, the breaker, the statement-log walk of the rehearsal, the report rows.
+- docs: the flag table equals `docs-flags`, every configuration key documented, every command named, every step sectioned, the guide PDF current, the fact counts equal.
 
 Acceptance for the hand-back:
 
@@ -766,16 +786,18 @@ Listed for `docs/CODE-GUIDE.md`. Each names the module and the one place to edit
 | Chunking strategy | Hash buckets, `CRC32(key) MOD B`, complete coverage by construction | Range chunking on a sort-key prefix with segment elimination for multi-billion-row tables; add a `RangePlan` in `copy.py` with NULL and open-ended buckets, and a coverage test |
 | Bucket cap | 32 per table | Raise for restart granularity, lower for scan cost; `copy.max_buckets_per_table` |
 | Freeze default | Read-only attachment | `freeze.mode: lockout`; the lockout loop also runs as a bridge during a slow detach |
-| Switch order | Retained branch first, then live | Live first saves one step; the current order keeps the live name unambiguous |
+| Switch order | Retained branch first, then the original record dropped (S2b), then live, then the replacement dropped (S4) | Live first saves one step; the current order keeps the live name unambiguous and ends with two entries |
 | Replacement after switch | Dropped at S4, inside the switch, after S3's checks; the live branch is independent of it | Leave it attached and drop it at C3 (the pre-1.0 flow): one more entry on the workspace and a DROP in the close-out instead of the window |
 | Verification depth | Count, newest, grouped fingerprint; a table over `full_fingerprint_max_rows` sampled as a range | Full fingerprint on every table (`full_fingerprint_max_rows` above the largest table, or `step O8 --full TABLE`) or count only |
 | View definers | Created by the owner session; the original DEFINER kept while its account exists and is not the runner, else the owner account | Always the owner account, or a named service account: `postcopy.definer_choice` |
+| Routine definers and order | The view policy through the owner session; functions and TVFs, then aggregates at O5, procedures at O7, each kind in rounds | A dependency order read from the bodies, or every routine at O7: `routines.O5_KINDS` and `routines.O7_KINDS` |
+| Retained copy | Kept until the customer runs `cleanup --delete` after `retain_until_utc`, typing the name twice | A configured retention that deletes it from a step: rejected on purpose; the copy is the way back |
 | Counters | The larger of the source counter and MAX+1, then sync on every aggregator (ALL) | MAX+1 only, or the source counter only; `postcopy.counter_value` |
 | Admin steps | Execute with gates when the owner profile exists | Print only (no owner profile) or the generated notebook |
 | Workers | 4 | Up to 32; watch leaf CPU; `copy.workers` |
 | Driver | PyMySQL in the terminal, singlestoredb in the notebook | Either everywhere; `connect.py` and the notebook template |
-| Secrets | Keychain or env | A secrets manager; `connect.py` |
-| Pipelines | Route `kit`: captured with the owner profile, credentials from env at replay | Route `customer`: the customer runs the placeholder file; the kit still verifies count, state and offsets. `pipelines.route` |
+| Secrets | Keychain (filled by the kit's prompts at P1 and P3) or env | A secrets manager; `connect.py` and `prompts.py` |
+| Pipelines | Route `kit`: captured with the owner profile, credentials asked at P3 and read from the Keychain at O9, env as the fallback | Route `customer`: the customer runs the placeholder file; the kit still verifies count, state and offsets. `pipelines.route` |
 | Pipeline start position | Recorded offsets from O2 | EARLIEST or LATEST for a pipeline whose offsets are past retention; edit the ALTER statement in the pipeline file and record the decision in the gate note |
 
 ## Appendix A: queries the kit issues
@@ -826,9 +848,16 @@ FROM information_schema.PIPELINES_BATCHES_SUMMARY WHERE DATABASE_NAME = %s AND S
 SELECT PIPELINE_NAME, ERROR_UNIX_TIMESTAMP, ERROR_MESSAGE FROM information_schema.PIPELINES_ERRORS
 WHERE DATABASE_NAME = %s AND ERROR_UNIX_TIMESTAMP >= UNIX_TIMESTAMP(%s);
 SHOW CREATE PIPELINE `db`.`pipeline` EXTENDED;   -- CREATE row, then ALTER ... SET OFFSETS rows
+SELECT MIN(`col`) AS lo, MAX(`col`) AS hi FROM `db`.`table`;   -- O8: the range of a sampled fingerprint, read on the source
+SELECT CRC32(key_expr) MOD B AS grp, COUNT(*) AS n, SUM(CRC32(key_expr)) AS key_hash, SUM(CRC32(CONCAT_WS('|', ...))) AS value_hash
+FROM `db`.`table` [WHERE `col` >= lo AND `col` <= cut] GROUP BY grp;   -- O8 tier 3, the same predicate on both sides
+SELECT SUM(NUM_CPUS) ... FROM information_schema.MV_NODES WHERE TYPE = 'LEAF';   -- P2: the leaf cores the estimate scales by
+SELECT VARIABLE_NAME, VARIABLE_VALUE FROM information_schema.GLOBAL_VARIABLES WHERE VARIABLE_NAME LIKE 'PASSWORD_%';   -- P1 (owner): the policy
+SELECT 1;   -- the keep-alive thread, every workspace.keepalive_minutes while a step runs
+SELECT @@memsql_version AS v;   -- engine-capture (owner), with COLUMNS of information_schema per view the kit reads
 ```
 
-Runner writes (replacement only):
+Runner writes (replacement only; `sample-database` issues the same CREATE DATABASE, CREATE TABLE LIKE, staging and INSERT ... SELECT forms naming the sample, with `WHERE CRC32(key_expr) MOD 100 < P`):
 
 ```sql
 CREATE DATABASE `replacement` PARTITIONS 32 SUB_PARTITIONS 512;
@@ -839,6 +868,10 @@ ALTER TABLE `replacement`.`t` AUTO_INCREMENT = <larger of source counter and max
 AGGREGATOR SYNC AUTO_INCREMENT ON `replacement`.`t` ALL;
 CREATE TABLE `replacement`.`t__fresh` LIKE `replacement`.`t`;            -- fresh-table fallback
 DROP TABLE `replacement`.`t`; ALTER TABLE `replacement`.`t__fresh` RENAME TO `t`;
+CREATE TABLE `replacement`.`r__stage` (cols);                            -- reference table: the staging path (fact 24)
+INSERT INTO `replacement`.`r__stage` SELECT cols FROM `source`.`r`;
+INSERT INTO `replacement`.`r` SELECT cols FROM `replacement`.`r__stage`; DROP TABLE `replacement`.`r__stage`;
+DELETE FROM `source`.`t` WHERE `k` = '<value that cannot exist>';       -- O3 and C3 write probe only; must be refused
 ```
 
 Admin statements (owner), always behind the checks in section 10:
@@ -856,6 +889,10 @@ USE `replacement`;                                                       -- O7, 
 SELECT COUNT(*) AS n FROM information_schema.USER_PRIVILEGES WHERE GRANTEE = %s;   -- O7: the original definer exists
 CREATE DEFINER=`user`@`host` VIEW `replacement`.`v` AS ...;              -- O7: original kept, or the clause removed
 SELECT DEFINER FROM information_schema.VIEWS WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s;    -- O7: a view found already created
+USE `replacement`; CREATE [DEFINER=`user`@`host`] FUNCTION `replacement`.`f` ...;   -- O5: functions and TVFs, then aggregates
+CREATE AGGREGATE `replacement`.`a` ... WITH STATE ... INITIALIZE WITH `f_init` ITERATE WITH `f_iter` MERGE WITH `f_merge` TERMINATE WITH `f_term`;
+CREATE [DEFINER=`user`@`host`] PROCEDURE `replacement`.`p` ... BEGIN ... END;    -- O7, after the views
+SELECT ROUTINE_NAME, ROUTINE_TYPE, DEFINER FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA = %s;   -- O5 and O7 gate; O10 S3 counts them on the live name
 CREATE PIPELINE ... ; ALTER PIPELINE ... SET OFFSETS ...;
 ATTACH DATABASE `source` AS `retained` READ ONLY STORAGEID <source_sid>;
 ATTACH DATABASE `replacement` AS `source` STORAGEID <replacement_sid>;
@@ -885,6 +922,8 @@ FROM information_schema.MV_CLOUD_BRANCHES WHERE DATABASE_NAME = %s AND STORAGE_I
 SELECT COUNT(*) AS n FROM information_schema.MV_CLOUD_BRANCHES WHERE PREV_DATABASE_NAME = %s AND STORAGE_ID = %s AND IS_DROPPED = 0;  -- abandon: no branch of the replacement, expect 0
 SELECT COUNT(*) AS n FROM information_schema.VIEWS
 WHERE TABLE_SCHEMA = %s AND SUBSTRING_INDEX(DEFINER, '@', 1) = %s;      -- C4: views of the live database the runner defines, expect 0
+SELECT COUNT(*) AS n FROM information_schema.ROUTINES
+WHERE ROUTINE_SCHEMA = %s AND SUBSTRING_INDEX(DEFINER, '@', 1) = %s;    -- C4: routines the runner defines, expect 0
 DROP USER 's2rebuild_runner'@'%';
 SELECT COUNT(*) FROM information_schema.USER_PRIVILEGES WHERE GRANTEE = "'s2rebuild_runner'@'%'";  -- expect 0
 ```

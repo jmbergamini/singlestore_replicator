@@ -79,10 +79,10 @@ estimate:
   band_percent: 15
   scale_up_cap: 1.0                     # credit for more leaf cores than the baseline's: 1.0 none, up to 4.0; fewer cores always slow the estimate
 closeout:
-  retain_days: 7
+  retain_days: 90                       # C2 records retain_until_utc; cleanup --delete refuses before it; minimum 1, under 90 noted on the plan sheet
   flexible_parallelism: 0.5             # SET GLOBAL query_parallelism_per_leaf_core; null to skip
 paths:
   runs_dir: customer/runs
 objects:
   routines:
-    ignore: []                          # procedures and functions left behind (not migrated in this pass): name or database.name
+    ignore: []                          # routines left behind on purpose (the default migrates every captured routine): name or database.name
