@@ -34,7 +34,7 @@ class HelpTests(unittest.TestCase):
     def test_help_lists_every_command_of_section_8(self):
         code, text = run_cli(['--help'])
         self.assertEqual(code, 0)
-        expected = ['check', 'account-sql', 'profile', 'plan', 'rehearse', 'run', 'step', 'gate', 'status', 'watch',
+        expected = ['check', 'account-sql', 'profile', 'plan', 'rehearse', 'sample-database', 'run', 'step', 'gate', 'status', 'watch',
                     'quiet-proof', 'lockout', 'owner-sql', 'owner-notebook', 'mark-recopy', 'pause', 'resume', 'abandon', 'report',
                     'calibrate', 'cleanup', 'bundle', 'engine-capture', 'docs-flags']
         self.assertEqual(cli.COMMAND_NAMES, expected)
@@ -1208,7 +1208,7 @@ def readme_sequence():
     return [words for words in (shlex.split(line, comments=True) for line in blocks[0].splitlines()) if words]
 
 
-def passed_rehearsal(ctx, prefix, rows=None, keep=False, kill_test=None):
+def passed_rehearsal(ctx, prefix, rows=None, keep=False, kill_test=None, from_database=None, percent=1, start_pipelines=False):
     """What a passed rehearsal leaves in the run (rehearse.run on the fake is tested in test_rehearse): timings with P5 passed."""
     folder = ctx.config.runs_dir() / ctx.run_id / 'rehearsal'
     folder.mkdir(parents=True, exist_ok=True)

@@ -18,7 +18,7 @@ import sys
 import traceback
 from pathlib import Path
 
-from . import __title__, __version__, abandon, bundle, cleanup, copy as copy_module, enginecapture, estimate, freeze, grants, inventory, lockout, notebook, ownersql, pipelines, postcopy, rehearse, report_md, report_xlsx, routines, steps, switch, watch
+from . import __title__, __version__, abandon, bundle, cleanup, copy as copy_module, enginecapture, estimate, freeze, grants, inventory, lockout, notebook, ownersql, pipelines, postcopy, rehearse, report_md, report_xlsx, routines, sample, steps, switch, watch
 from .common import EXIT_DONE, EXIT_GATE, EXIT_INCOMPLETE, EXIT_MISMATCH, EXIT_REFUSED, KitError, check_run_id, parse_utc, run_date, unique_run_id, utc_now
 from .sqlutil import ident, secret_forms, sql_literal
 from .config import load_config
@@ -39,7 +39,10 @@ COMMANDS = [
                               'owner profile; --drop prints or executes the DROP USER block and the zero-privilege check', None),
     ('profile', 'P3', 'Inventory, sizes, estimate and the profile workbook for the configured databases', None),
     ('plan', 'P4', 'Print the plan sheet: window, abort deadline, freeze path, step owners, estimate with bands', None),
-    ('rehearse', 'P5', 'Create throwaway databases, run O4 to O10 on them with a kill test, verify, switch, clean up', None),
+    ('rehearse', 'P5', 'Create throwaway databases (synthetic, or a sample of a real database) and run O2 to O11, C1 and C3 on them '
+                       'through the real steps: freeze, copy with a kill test, verify, switch with a rollback leg, release, end state; clean up', None),
+    ('sample-database', 'P5, lab', 'Build NAME as a percent sample of SOURCE: every table by LIKE, the rows whose CRC32 of the key MOD 100 '
+                                   'is under the percent, reference and small tables whole, then the views and routines with the owner profile', None),
     ('run', 'O1 to O11', 'Run the outage steps in order and stop at the first failed gate', None),
     ('step', 'any', 'Run one step by id', None),
     ('gate', 'admin, human', 'Record a gate result for a step the kit did not execute itself', None),
@@ -140,6 +143,16 @@ def build_parser():
     p['rehearse'].add_argument('--prefix', metavar='NAME', help='rehearsal database prefix, starting with s2rebuild_rehearsal_ (default s2rebuild_rehearsal_<run id>)')
     p['rehearse'].add_argument('--rows', metavar='N', type=int, default=1000000, help='rows in the keyed and keyless tables (default 1000000)')
     p['rehearse'].add_argument('--cleanup', action='store_true', help='drop the rehearsal databases of the prefix and exit (asks first unless --yes)')
+    p['rehearse'].add_argument('--from-database', metavar='NAME', help='build the rehearsal source as a sample of this database (sample-database) '
+                                                                        'instead of the synthetic tables')
+    p['rehearse'].add_argument('--percent', metavar='N', type=int, default=1, help='with --from-database: the sample percent (default 1)')
+    p['rehearse'].add_argument('--start-pipelines', action='store_true', help='start the recreated pipelines at the rehearsed O11 '
+                                                                               '(default: created stopped, never started)')
+    p['sample-database'].add_argument('source', metavar='SOURCE', help='the database to sample')
+    p['sample-database'].add_argument('name', metavar='NAME', help='the sample to create; must not be a database of the configured run')
+    p['sample-database'].add_argument('--percent', metavar='N', type=int, required=True, help='the rows to take: CRC32 of the key MOD 100 under N '
+                                                                                                '(1 to 100; 100 copies every table whole)')
+    p['sample-database'].add_argument('--tables', metavar='LIST', help='comma-separated tables that get rows (every table is still created)')
     p['run'].add_argument('--from', dest='from_id', metavar='ID', default='O1', help='first step to run (default O1)')
     p['run'].add_argument('--to', dest='to_id', metavar='ID', default='O11', help='last step to run (default O11)')
     p['run'].add_argument('--redo', action='store_true', help='run steps that already passed')
@@ -940,8 +953,10 @@ def handle_o4(step, ctx):
     env = ctx.options.get('env') or {}
     runner = ctx.runner_session(read_guard('runner O4'))
     owner = ctx.owner_session(read_guard('owner O4')) if ctx.owner_configured else None
+    # the rehearsal passes a no-op pause for the session samples of its throwaway source (ctx.options['capture_sleep'])
+    pause = {'sleep': ctx.options['capture_sleep']} if ctx.options.get('capture_sleep') else {}
     try:
-        data = inventory.capture(runner, db, config, owner, log=log, step='O4')
+        data = inventory.capture(runner, db, config, owner, log=log, step='O4', **pause)
     finally:
         for s in (runner, owner):
             if s is not None:
@@ -1493,27 +1508,64 @@ def cmd_rehearse(args, env, out, state):
         ctx = _step_context(inv, db, log)
         prefix = rehearse.check_prefix(args.prefix or rehearse.default_prefix(inv.run_id), inv.config)
         if args.cleanup:
-            session = sessions.runner(rehearse.rehearsal_guard(prefix))
+            owner = inv.config.owner is not None and not inv.dry_run
+            session = sessions.owner(rehearse.cleanup_guard(prefix)) if owner else sessions.runner(rehearse.rehearsal_guard(prefix))
             try:
                 if inv.dry_run:
                     for name in rehearse.rehearsal_names(prefix).values():
                         session.execute('DROP DATABASE ' + '`%s`' % name)
                     return EXIT_DONE
-                found = rehearse.existing_names(session, prefix)
+                found = rehearse.existing_names(session, prefix, records=owner)
                 if not found:
                     log('rehearsal cleanup: no database with the prefix %s exists' % prefix)
                     return EXIT_DONE
                 if not _confirm('Drop %s? Type yes: ' % ', '.join(found), args.yes):
                     raise KitError('rehearse --cleanup would drop %s; pass --yes or confirm at a terminal' % ', '.join(found))
-                rehearse.cleanup(session, prefix, log)
+                rehearse.cleanup(session, prefix, log, owner=owner)
             finally:
                 session.close()
             return EXIT_DONE
-        outcome = rehearse.run(ctx, prefix, rows=args.rows, keep=args.keep)
+        outcome = rehearse.run(ctx, prefix, rows=args.rows, keep=args.keep, from_database=args.from_database, percent=args.percent,
+                               start_pipelines=args.start_pipelines)
         log('rehearsal: ' + outcome.note)
         return outcome.exit_code
     finally:
         inv.close()
+
+
+def cmd_sample_database(args, env, out, state):
+    """sample-database SOURCE NAME --percent N: build NAME as a sample of SOURCE with the runner (views and routines with the owner profile).
+
+    No run is opened: the sample is a tool for the rehearsal and the lab. The log goes to the
+    terminal, redacted as every command's log is. A dry run opens no connection and prints what
+    the command would do; the table statements need the capture, so none is printed.
+    """
+    config = load_config(args.config, env=env)
+    sample.check_names(args.source, args.name, config)
+    tables = [t.strip() for t in str(args.tables or '').split(',') if t.strip()]
+    for table in tables:
+        ident(table)
+    percent = sample.check_percent(args.percent)
+    users = [config.runner.user] + ([config.owner.user] if config.owner is not None else [])
+    redactor = Redactor([config.workspace.host, str(config.resolve(config.workspace.ca_file))], soft=users)
+    state['redactor'] = redactor
+    log = Log(redactor=redactor, stream=out, verbose=state['verbose'])
+    state['log'] = log
+    if args.dry_run:
+        log('DRY RUN: sample-database would capture %s and build %s as a %d percent sample of it (every table by LIKE, the rows by CRC32 of the '
+            'key MOD 100 under %d, reference and small tables whole, then the views and routines%s); no connection was opened and the table '
+            'statements need the capture, so none is printed' % (args.source, args.name, percent, percent,
+                                                                  '' if config.owner is not None else ', which need the owner profile'))
+        return EXIT_DONE
+    sessions = SessionFactory(config, env, log, False)
+    try:
+        summary = sample.build(sessions.runner, sessions.owner if config.owner is not None else None, args.source, args.name, percent, config, log,
+                               tables or None)
+    finally:
+        sessions.close()
+    for line in sample.summary_lines(summary):
+        log(line)
+    return EXIT_DONE
 
 
 def _flag_rows(parser, command):
@@ -1650,7 +1702,8 @@ DISPATCH = {'run': cmd_run, 'step': cmd_step, 'gate': cmd_gate, 'status': cmd_st
             'profile': cmd_profile, 'plan': cmd_plan, 'calibrate': cmd_calibrate, 'mark-recopy': cmd_mark_recopy, 'pause': cmd_pause,
             'resume': cmd_resume, 'watch': cmd_watch, 'quiet-proof': cmd_quiet_proof, 'report': cmd_report, 'owner-sql': cmd_owner_sql,
             'owner-notebook': cmd_owner_notebook, 'account-sql': cmd_account_sql, 'lockout': cmd_lockout, 'rehearse': cmd_rehearse,
-            'check': cmd_check, 'bundle': cmd_bundle, 'abandon': cmd_abandon, 'engine-capture': cmd_engine_capture, 'cleanup': cmd_cleanup}
+            'check': cmd_check, 'bundle': cmd_bundle, 'abandon': cmd_abandon, 'engine-capture': cmd_engine_capture, 'cleanup': cmd_cleanup,
+            'sample-database': cmd_sample_database}
 for _name, _label, _help, _milestone in COMMANDS:
     if _milestone is not None:
         DISPATCH[_name] = not_implemented(_name, _milestone)

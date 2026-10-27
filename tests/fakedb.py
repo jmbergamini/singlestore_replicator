@@ -261,10 +261,12 @@ def _literal_compare(value, literal):
 
 
 def evaluate_predicate(pred, row):
-    """CRC32(expr) MOD n = k, a column range `c` >= lo AND `c` <= hi (the sampled fingerprint), or one column equal to a literal."""
-    m = re.fullmatch(r'CRC32\((.*)\) MOD (\d+) = (\d+)', pred)
+    """CRC32(expr) MOD n = k, CRC32(expr) MOD n < k (the sample of sample-database), a column range `c` >= lo AND `c` <= hi (the sampled
+    fingerprint), or one column equal to a literal."""
+    m = re.fullmatch(r'CRC32\((.*)\) MOD (\d+) (=|<) (\d+)', pred)
     if m:
-        return crc32(key_text(m.group(1), row)) % int(m.group(2)) == int(m.group(3))
+        remainder = crc32(key_text(m.group(1), row)) % int(m.group(2))
+        return remainder == int(m.group(4)) if m.group(3) == '=' else remainder < int(m.group(4))
     m = re.fullmatch(r"`([^`]+)` >= ('(?:[^']|'')*'|-?[\d.]+) AND `([^`]+)` <= ('(?:[^']|'')*'|-?[\d.]+)", pred)
     if m:
         assert m.group(1) == m.group(3), pred

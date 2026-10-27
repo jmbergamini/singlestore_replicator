@@ -1,4 +1,5 @@
-"""s2rebuild tests test_rehearse: the owner notebook, the rehearsal (prefix rules, fill, kill test, switch, cleanup) and the M4 commands.
+"""s2rebuild tests test_rehearse: the owner notebook, the rehearsal (prefix rules, fill, the real steps, kill test, rollback leg, cleanup by
+record), sample-database and the M4 commands.
 
 Author: John Bergamini
 """
@@ -9,12 +10,14 @@ import os
 import stat
 import unittest
 
-from s2rebuild import freeze, grants, inventory, notebook, ownersql, postcopy, rehearse, steps
+from s2rebuild import freeze, grants, inventory, notebook, ownersql, postcopy, rehearse, sample, steps
 from s2rebuild.common import EXIT_DONE, EXIT_GATE, EXIT_REFUSED, KitError
 from s2rebuild.journal import Journal
 from s2rebuild.sqlutil import GuardError, qualified
-from tests.helpers import FAULT_POINTS, config_from, run_cli
-from tests.test_copy import SRC, TGT, Harness, fixture_inventory
+from tests.fakedb import evaluate_predicate, multiset
+from tests.helpers import FAULT_POINTS, config_from, fake_driver, run_cli
+from tests.test_copy import REF_TABLES, SRC, TGT, Harness, fixture_inventory, fixture_rows
+from tests.test_identity import attach_writes
 from tests.test_pipelines import (ITEM, O3_STOP_WORD, assert_between_detach_and_attach, assert_frozen_once, fail_o3_at, names_of, o3_harness,
                                   owner_harness, run_dict, write_o2)
 
@@ -49,15 +52,31 @@ def rehearsal_rows():
     return rows
 
 
+def rehearsal_dir(h):
+    """The rehearsal folder of the harness run, where the rehearsal journal, its timings and the files of the rehearsed steps live."""
+    return h.tmp / 'runs' / h.run_id / 'rehearsal'
+
+
+def rehearsal_journal(test, h):
+    """The rehearsal's own journal (the rehearsed steps O2 to C3 are recorded there), closed at cleanup."""
+    j = Journal(rehearsal_dir(h) / 'journal.sqlite')
+    test.addCleanup(j.close)
+    return j
+
+
+def prefixed_entries(h):
+    """The Portal entries of the fake whose name carries the rehearsal prefix (the rows cleanup must remove)."""
+    return [e['DATABASE_NAME'] for e in h.fake.portal_entries() if e['DATABASE_NAME'].startswith(PREFIX)]
+
+
 def run_fake_rehearsal(test, h, kill_test='inprocess', rows=300, keep=False):
     """Run the rehearsal on the fake with the fill and the capture replaced by direct rows; returns the outcome.
 
     The view is created by the USE and CREATE VIEW statements of rehearse.fill_statements, and
     captured the way inventory.capture reads it (information_schema.TABLES, SHOW CREATE VIEW).
+    The capture replacement serves the P3 capture of the rehearsal and the O4 capture inside run.
     """
     specs = rehearsal_specs()
-    # the cleanup drops the retained rehearsal copy while it is attached READ ONLY, which Helios 10.8.0 refuses with 2720 (W12)
-    h.fake.refuse_read_only_drop = False
 
     def filled_source(session, names_, layout, rows_, log):
         taken = [n for n in names_.values() if n in h.fake.databases]
@@ -168,47 +187,133 @@ class RehearsalRulesTests(unittest.TestCase):
 
 class RehearsalRunTests(unittest.TestCase):
     def test_rehearsal_end_to_end_with_the_switch(self):
+        """P5 walks the real steps on the fake (W12): O2, O3 (DETACH, ATTACH READ ONLY), O4 to O9, S1 and S2, the rollback by the original
+        record (R2a), O10 from the rollback state (S2b, S3, S4, the gate), O11, C1, C3; then cleanup by record. Asserted on the statement log."""
         h = owner_harness(self)
         outcome = run_fake_rehearsal(self, h)
         self.assertEqual(outcome.status, steps.PASSED, h.text())
-        self.assertIn('switch live %s_src' % PREFIX, outcome.note)
+        names = rehearse.rehearsal_names(PREFIX)
+        src, rebuild, retained = names['source'], names['replacement'], names['retained']
+        self.assertIn('switch live %s' % src, outcome.note)
+        self.assertIn('not rehearsed: ', outcome.note)
         self.assertEqual(h.journal.step_status('P5'), 'passed')
-        timings = json.loads((h.tmp / 'runs' / h.run_id / 'rehearsal' / 'timings.json').read_text())
+        timings = json.loads((rehearsal_dir(h) / 'timings.json').read_text())
         self.assertEqual(timings['p5_status'], 'passed')
         self.assertEqual((timings['reconciled_chunks'], len(timings['interrupted_chunks'])), (1, 1), 'exactly the interrupted chunk was reconciled')
         self.assertIn('keyed_single', timings['bucketed_tables'], 'hash-bucket predicates are rehearsed')
-        for label in ('create and fill', 'O4 capture', 'O5', 'O6 kill test', 'O6 resume', 'O7', 'O8', 'O3 freeze', 'O10 switch'):
-            self.assertIn(label, timings['steps'])
-        self.assertIn('two entries', timings['portal_cleanup'][0])
+        self.assertEqual(list(timings['steps']), ['create and fill', 'P3 capture', 'O2', 'O3', 'O4', 'O5', 'O6 kill test', 'O6 resume', 'O7', 'O8', 'O9',
+                                                  'O10 switch and rollback', 'O10 switch again', 'O11', 'C1', 'C3'])
+        self.assertTrue(timings['end_state'].startswith('two entries: '), timings['end_state'])
         self.assertIn('refused as read only', h.text())
-        names = rehearse.rehearsal_names(PREFIX)
+        j = rehearsal_journal(self, h)
+        self.assertIsNotNone(j.get_meta('freeze_time'), 'O3 froze the throwaway source and recorded freeze_time')
+        self.assertEqual(len(j.events('endstate_probe')), 1, 'C3 ran the write probe on the retained rehearsal copy')
+        self.assertEqual({s: j.step_status(s) for s in ('O2', 'O3', 'O4', 'O5', 'O6', 'O7', 'O8', 'O9', 'O10', 'O11', 'C1', 'C2', 'C3')},
+                         dict({s: 'passed' for s in ('O2', 'O3', 'O4', 'O5', 'O6', 'O7', 'O8', 'O9', 'O10', 'O11', 'C1', 'C3')}, C2='skipped'))
+        self.assertTrue(j.events('rollback')[-1].startswith('R2a:'), 'the rollback leg re-attached the original record by its own syntax')
+        self.assertEqual(len(j.events('switch_go')), 1, 'O10 through run_step recorded the go once, after the rollback')
+        self.assertEqual(len(j.events('endstate_listing')), 1)
+        self.assertTrue((rehearsal_dir(h) / h.run_id / src / 'owner-sql' / 'O10.sql').is_file(), 'the rehearsed steps write under rehearsal/')
+        sid = j.attachment('retained')['storage_id']
+        writes = attach_writes(h)
+        self.assertEqual(writes[:4], ['DETACH DATABASE `%s`' % src, 'ATTACH DATABASE `%s` READ ONLY STORAGEID %s' % (src, sid),
+                                      'DETACH DATABASE `%s`' % src, 'ATTACH DATABASE `%s` AS `%s` READ ONLY STORAGEID %s' % (src, retained, sid)],
+                         'O3 freezes the throwaway source; S1 and S2 follow')
+        self.assertTrue(writes[4].startswith("ATTACH DATABASE `%s` AT MILESTONE '" % src) and writes[4].endswith('STORAGEID %s COMPUTEID %s' % (
+            sid, j.attachment('source')['compute_id'])), 'R2a: the original record by its own ATTACH_SYNTAX')
+        self.assertEqual(writes[5], 'DROP DATABASE `%s`' % src, 'S2b from the rollback state')
+        self.assertEqual(writes[6], 'ATTACH DATABASE `%s` AS `%s` STORAGEID %s' % (rebuild, src, j.attachment('live')['storage_id']), 'S3')
+        self.assertEqual(writes[7], 'DROP DATABASE `%s`' % rebuild, 'S4')
+        self.assertEqual(writes[8:10], ['DROP DATABASE `%s`' % src, 'DETACH DATABASE `%s`' % retained], 'cleanup: the live name, then the retained copy')
+        self.assertTrue(writes[10].startswith("ATTACH DATABASE `%s` AT MILESTONE '" % retained), 'the retained record re-attached read write by its syntax')
+        self.assertEqual(writes[11:], ['DROP DATABASE `%s`' % retained])
         for name in names.values():
             self.assertNotIn(name, h.fake.databases, 'cleanup dropped %s' % name)
-        dropped = [w for w in h.fake.writes if w.startswith('DROP DATABASE')]
-        # S2b drops the original rehearsal record and S4 the replacement; cleanup then drops the live rehearsal name and the retained copy
-        self.assertEqual(dropped, ['DROP DATABASE `%s`' % names['source'], 'DROP DATABASE `%s`' % names['replacement'],
-                                   'DROP DATABASE `%s`' % names['source'], 'DROP DATABASE `%s`' % names['retained']])
+        self.assertEqual(prefixed_entries(h), [], 'no entry of the prefix is left on the workspace')
         self.assertIn(SRC, h.fake.databases, 'the configured source is untouched')
         self.assertFalse(any(w.startswith(('DETACH', 'ATTACH', 'DROP DATABASE')) and '`%s`' % SRC in w for w in h.fake.writes))
         self.assertTrue(steps._rehearsal_evidence(h.ctx()))
 
-    def test_f12_rehearsal_on_path_b_switches_without_a_lockout_pass(self):
-        """P5 does not rehearse the lockout, so its switch leaves out the Path B last pass check that S1 of the real O10 applies."""
+    def test_f12_a_path_b_configuration_rehearses_with_path_a_and_the_note_lists_what_was_left_out(self):
+        """The lockout is about the customer's accounts, which the throwaway has none of: the rehearsal freezes with Path A whatever the
+        configured path, and the P5 note lists the lockout among what was not rehearsed, with the objects the rehearsal source lacks."""
         h = owner_harness(self, mutate=lambda d: d.update(freeze={'mode': 'lockout'}))
         outcome = run_fake_rehearsal(self, h)
         self.assertEqual(outcome.status, steps.PASSED, h.text())
-        self.assertIn('the rehearsal source stays READWRITE for the switch, and S1 does not check a lockout pass', h.text())
+        self.assertIn('[O3] Freeze', h.text())
         self.assertNotIn('the last lockout pass', h.text())
+        self.assertNotIn('REVOKE', ' '.join(h.fake.writes))
+        timings = json.loads((rehearsal_dir(h) / 'timings.json').read_text())
+        self.assertEqual(timings['not_rehearsed'], [
+            'the lockout freeze (Path B): the rehearsal freezes with Path A, the read-only attachment',
+            'reference tables (none on the rehearsal source)', 'routines (none on the rehearsal source)', 'pipelines (none on the rehearsal source)',
+            rehearse.R2B_NOTE, 'application writes at C1 (the throwaway has no application; C1 passed as an idle workload)',
+            'C2, C4 and the deletion of the retained copy (C5)'])
+        self.assertIn('not rehearsed: the lockout freeze (Path B)', h.journal.step('P5')['note'])
+        self.assertEqual(timings['freeze'].split(':')[0], 'Path A')
 
     def test_without_the_owner_profile_p5_stays_pending(self):
         h = Harness(self)
         outcome = run_fake_rehearsal(self, h)
         self.assertEqual((outcome.status, outcome.exit_code), (steps.PENDING, EXIT_GATE), h.text())
+        self.assertIn('P5 needs the owner profile for the freeze, the pipelines, the switch', outcome.note)
         self.assertEqual(h.journal.step_status('P5'), 'pending')
-        timings = json.loads((h.tmp / 'runs' / h.run_id / 'rehearsal' / 'timings.json').read_text())
+        timings = json.loads((rehearsal_dir(h) / 'timings.json').read_text())
         self.assertEqual(timings['p5_status'], 'pending')
+        self.assertEqual(timings['not_rehearsed'][0], rehearse.NEEDS_OWNER)
         self.assertFalse(steps._rehearsal_evidence(h.ctx()), 'a rehearsal without the switch is not O1 evidence')
         self.assertEqual(len([w for w in h.fake.writes if w.startswith('DROP DATABASE')]), 2, 'source and replacement were created and dropped')
+        self.assertEqual(prefixed_entries(h), [])
+
+    def test_w12_p5_fails_when_the_end_state_is_not_two_entries(self):
+        """A third entry on the original storage when C3 runs: the two-entry gate stops C3 (the journal shows S2b and S4, so no repair), P5 ends
+        failed with the listing, the evidence says so, and cleanup still drops only the names of the prefix, by record."""
+        h = owner_harness(self)
+        names = rehearse.rehearsal_names(PREFIX)
+
+        def stray_entry(db):
+            sid = next(a['STORAGE_ID'] for a in db.attachments if a['DATABASE_NAME'] == names['retained'])
+            db.branches.append(dict(db.record('stray_entry_of_another_run', sid, db.new_cid(), 'resume', names['retained']),
+                                    IS_DETACHED=1, IS_ATTACHED_TO_THIS_COMPUTE=0))
+        h.fake.change_before(r'AND LATEST_COMPUTE_ID <> %s$', stray_entry)  # the first C3 check that reads no other step
+        outcome = run_fake_rehearsal(self, h)
+        self.assertEqual((outcome.status, outcome.exit_code), (steps.FAILED, EXIT_GATE), h.text())
+        self.assertIn('Rehearsal C3 refused', outcome.note)
+        self.assertIn('the original storage holds one entry', outcome.note)
+        self.assertIn('stray_entry_of_another_run', outcome.note, 'the listing is in the note')
+        self.assertEqual(h.journal.step_status('P5'), 'failed')
+        timings = json.loads((rehearsal_dir(h) / 'timings.json').read_text())
+        self.assertEqual(timings['p5_status'], 'failed')
+        self.assertNotIn('C3', timings['steps'], 'a failed step has no timing')
+        self.assertFalse(steps._rehearsal_evidence(h.ctx()), 'a failed rehearsal is no evidence for O1')
+        j = rehearsal_journal(self, h)
+        self.assertEqual((j.step_status('C3'), j.events('endstate_repair')), ('pending', []), 'C3 refused without a repair')
+        self.assertEqual(prefixed_entries(h), [], 'cleanup dropped every entry of the prefix')
+        self.assertIn('stray_entry_of_another_run', [e['DATABASE_NAME'] for e in h.fake.portal_entries()], 'an entry outside the prefix is never touched')
+        self.assertIn(SRC, h.fake.databases)
+
+    def test_w12_rehearse_from_database_builds_the_source_as_a_sample(self):
+        """rehearse --from-database NAME --percent P: the rehearsal source is a sample of NAME (sample.build, the configured thresholds), and
+        the rehearsed steps run on it; the sampled database is read only, never changed."""
+        h = owner_harness(self, mutate=lambda d: d['copy'].update(min_rows_for_chunking=100))
+        outcome = rehearse.run(h.ctx(), PREFIX, kill_test='inprocess', from_database=SRC, percent=10)
+        self.assertEqual(outcome.status, steps.PASSED, h.text())
+        names = rehearse.rehearsal_names(PREFIX)
+        inserts = [w for w in h.fake.writes if w.startswith('INSERT INTO `%s`.' % names['source'])]
+        self.assertEqual(len(inserts), 4, 'one INSERT per table of the sampled database')
+        self.assertTrue(inserts[0].endswith('FROM `%s`.`t_single` WHERE CRC32(`id`) MOD 100 < 10' % SRC), inserts[0])
+        self.assertTrue(inserts[-1].endswith('FROM `%s`.`t_empty`' % SRC), 'a table under copy.min_rows_for_chunking is copied whole')
+        timings = json.loads((rehearsal_dir(h) / 'timings.json').read_text())
+        self.assertEqual((timings['from_database'], timings['percent'], list(timings['steps'])[0]), (SRC, 10, 'sample source'))
+        self.assertIn('sample %s built from %s at 10 percent: 4 tables (3 sampled by CRC32 of the key, 1 whole)' % (names['source'], SRC), h.text())
+        counts = {t['table_name']: t['source_count'] for t in rehearsal_journal(self, h).tables()}
+        expected = sum(1 for r in fixture_rows()['t_single'] if evaluate_predicate('CRC32(`id`) MOD 100 < 10', r))
+        self.assertEqual(counts['t_single'], expected)
+        self.assertTrue(0 < expected < 700)
+        self.assertEqual(len(h.fake.rows(SRC, 't_single')), 700, 'the sampled database keeps its rows')
+        self.assertFalse(any(w.startswith(('DETACH', 'ATTACH', 'DROP DATABASE')) and '`%s`' % SRC in w for w in h.fake.writes))
+        self.assertEqual(prefixed_entries(h), [])
+        self.assertEqual(h.journal.step_status('P5'), 'passed')
 
     def test_f7_the_rehearsal_view_is_captured_and_o7_creates_it_through_the_owner_or_ends_pending_without_it(self):
         """The rehearsal view is created after USE of the source with an unqualified body, so its capture names no database.
@@ -229,13 +334,14 @@ class RehearsalRunTests(unittest.TestCase):
             with self.subTest(mode=mode):
                 h = owner_harness(self) if mode == 'owner' else Harness(self)
                 outcome = run_fake_rehearsal(self, h, keep=True)
-                run_dir = h.tmp / 'runs' / h.run_id / 'rehearsal'
+                run_dir = rehearsal_dir(h)
                 timings = json.loads((run_dir / 'timings.json').read_text())
-                captured = inventory.load(inventory.inventory_dir(h.config, h.run_id, rehearse.rehearsal_spec(h.db, PREFIX), 'O4'))['views']
+                # the rehearsed steps write under rehearsal/: the O4 capture inside run lands there, under the rehearsal's own runs_dir
+                sub = rehearse.rehearsal_config(h.config, 300, run_dir)
+                captured = inventory.load(inventory.inventory_dir(sub, h.run_id, rehearse.rehearsal_spec(h.db, PREFIX), 'O4'))['views']
                 self.assertEqual([(v['name'], v['definer']) for v in captured], [('keyed_counts', '`s2rebuild_runner`@`%`')])
                 self.assertFalse(postcopy.names_database(captured[0]['definition'], names['source']))
-                j = Journal(run_dir / 'journal.sqlite')
-                self.addCleanup(j.close)
+                j = rehearsal_journal(self, h)
                 creates = [w for w in h.fake.writes if w.startswith('CREATE') and 'VIEW `%s`.' % names['replacement'] in w]
                 if mode == 'owner':
                     self.assertEqual(outcome.status, steps.PASSED, h.text())
@@ -249,7 +355,7 @@ class RehearsalRunTests(unittest.TestCase):
                     self.assertEqual(timings['views'], 'created through the owner session')
                 else:
                     self.assertEqual((outcome.status, outcome.exit_code), (steps.PENDING, EXIT_GATE), h.text())
-                    self.assertIn('the views and the switch', outcome.note)
+                    self.assertIn('needs the owner profile', outcome.note)
                     self.assertEqual(creates, [], 'the runner creates no view in the replacement')
                     self.assertEqual(j.step_status('O7'), 'skipped')
                     self.assertTrue(any(d.startswith('O7 ') for d in j.events('step_pending')), 'O7 ended pending before the rehearsal recorded it skipped')
@@ -281,6 +387,82 @@ class RehearsalRunTests(unittest.TestCase):
         started = rehearse.kill_sigkill(h.db, h.plans(), h.journal, h.ctx().runner_connector(), h.log, h.config.copy, wait_seconds=20)
         self.assertEqual(len(started), 1)
         self.assertEqual([s for _, _, s, _, _ in h.journal.chunk_states() if s == 'started'], ['started'])
+
+
+class SampleDatabaseTests(unittest.TestCase):
+    def test_w12_sample_database_issues_one_insert_per_table_with_the_predicate(self):
+        """sample-database SOURCE NAME --percent 10 on the fake: the layout of the source, every table by LIKE, one INSERT ... SELECT per table
+        with CRC32 of the key MOD 100 under 10 (the key columns, or every column of a keyless table), a table under
+        copy.min_rows_for_chunking whole; --tables limits the rows to the named tables; a run name is refused."""
+        h = Harness(self, mutate=lambda d: d['copy'].update(min_rows_for_chunking=100))
+        fake_driver(self, h.fake)
+        base = ['--config', str(h.config_path)]
+        code, text = run_cli(['sample-database', SRC, 'sample_db', '--percent', '10'] + base, env=h.env)
+        self.assertEqual(code, EXIT_DONE, text)
+        self.assertIn('CREATE DATABASE `sample_db` PARTITIONS 16 SUB_PARTITIONS 0', h.fake.writes)
+        self.assertEqual(len([w for w in h.fake.writes if w.startswith('CREATE TABLE `sample_db`.') and ' LIKE `%s`.' % SRC in w]), 4)
+        inserts = [w for w in h.fake.writes if w.startswith('INSERT INTO `sample_db`.')]
+        self.assertEqual(len(inserts), 4, 'one INSERT per table')
+        self.assertEqual(inserts[0], 'INSERT INTO `sample_db`.`t_single` (`id`, `payload`, `n`) SELECT `id`, `payload`, `n` FROM `%s`.`t_single` '
+                                     'WHERE CRC32(`id`) MOD 100 < 10' % SRC)
+        self.assertTrue(inserts[1].endswith("FROM `%s`.`t_nokey` WHERE CRC32(CONCAT_WS('|', COALESCE(`x`, ''), COALESCE(`y`, ''), COALESCE(`z`, ''))) "
+                                            'MOD 100 < 10' % SRC), 'a keyless table is sampled by its row hash (largest table first)')
+        self.assertTrue(inserts[2].endswith("FROM `%s`.`t_comp` WHERE CRC32(CONCAT_WS('|', `a`, `b`, `c`)) MOD 100 < 10" % SRC), inserts[2])
+        self.assertTrue(inserts[3].endswith('FROM `%s`.`t_empty`' % SRC), 'a table under copy.min_rows_for_chunking is copied whole')
+        expected = [r for r in h.fake.rows(SRC, 't_single') if evaluate_predicate('CRC32(`id`) MOD 100 < 10', r)]
+        self.assertEqual(multiset(h.fake.rows('sample_db', 't_single')), multiset(expected))
+        self.assertTrue(0 < len(expected) < 700)
+        self.assertIn('sample sample_db built from %s at 10 percent: 4 tables (3 sampled by CRC32 of the key, 1 whole), 0 of 0 views, 0 of 0 routines; '
+                      'views and routines need the owner profile' % SRC, text)
+        self.assertIn('    t_single: %d rows (sampled)' % len(expected), text)
+        code, text = run_cli(['sample-database', SRC, 'sample_two', '--percent', '10', '--tables', 't_comp'] + base, env=h.env)
+        self.assertEqual(code, EXIT_DONE, text)
+        self.assertEqual([w for w in h.fake.writes if w.startswith('INSERT INTO `sample_two`.')],
+                         ['INSERT INTO `sample_two`.`t_comp` (`a`, `b`, `c`, `note`) SELECT `a`, `b`, `c`, `note` FROM `%s`.`t_comp` '
+                          "WHERE CRC32(CONCAT_WS('|', `a`, `b`, `c`)) MOD 100 < 10" % SRC])
+        self.assertEqual(sorted(h.fake.databases['sample_two']['tables']), ['t_comp', 't_empty', 't_nokey', 't_single'], 'every table is created')
+        before = list(h.fake.writes)
+        code, text = run_cli(['sample-database', SRC, TGT, '--percent', '10'] + base, env=h.env)
+        self.assertEqual(code, EXIT_REFUSED)
+        self.assertIn('a database of the configured run', text)
+        code, text = run_cli(['sample-database', SRC, 'sample_three', '--percent', '0'] + base, env=h.env)
+        self.assertEqual(code, EXIT_REFUSED)
+        self.assertIn('--percent must be a whole number from 1 to 100', text)
+        code, text = run_cli(['sample-database', SRC, 'sample_three', '--percent', '10', '--tables', 'nope'] + base, env=h.env)
+        self.assertEqual(code, EXIT_REFUSED)
+        self.assertIn('--tables names nope', text)
+        self.assertEqual(h.fake.writes, before, 'a refusal issues nothing')
+        code, text = run_cli(['sample-database', SRC, 'sample_three', '--percent', '10', '--dry-run'] + base, env=h.env)
+        self.assertEqual(code, EXIT_DONE, text)
+        self.assertIn('DRY RUN: sample-database would capture %s and build sample_three as a 10 percent sample' % SRC, text)
+        self.assertEqual(h.fake.writes, before)
+
+    def test_w12_a_reference_table_in_the_sample_goes_through_staging(self):
+        """A reference table is copied whole: from a READ ONLY source through a sharded staging table in the sample (a plain INSERT would fail
+        with 1777), from a read-write source by one direct INSERT."""
+        rows = fixture_rows()
+        rows['t_ref'] = [{'k': i, 'label': 'l%d' % i} for i in range(7)]
+        h = Harness(self, tables=REF_TABLES, rows=rows)
+        h.fake.attachment(SRC)['ATTACH_TYPE'] = 'READONLY'
+        summary = sample.build(h.sessions.runner, None, SRC, 'sample_ref', 50, h.config, h.log)
+        self.assertEqual((summary['read_only'], summary['rows']['t_ref']), (True, 7))
+        self.assertIn('t_ref', summary['whole'])
+        writes = [w for w in h.fake.writes if 't_ref' in w and ' LIKE ' not in w]
+        self.assertTrue(writes[0].startswith('CREATE TABLE `sample_ref`.`t_ref__stage` (`k` int(11) DEFAULT NULL, `label` varchar(20)'), writes)
+        self.assertEqual(writes[1], 'INSERT INTO `sample_ref`.`t_ref__stage` (`k`, `label`) SELECT `k`, `label` FROM `%s`.`t_ref` WHERE '
+                                    "CRC32(CONCAT_WS('|', COALESCE(`k`, ''), COALESCE(`label`, ''))) MOD 1 = 0" % SRC)
+        self.assertEqual(writes[2], 'INSERT INTO `sample_ref`.`t_ref` (`k`, `label`) SELECT `k`, `label` FROM `sample_ref`.`t_ref__stage`')
+        self.assertEqual(writes[3], 'DROP TABLE `sample_ref`.`t_ref__stage`')
+        self.assertEqual(len(writes), 4)
+        self.assertEqual(multiset(h.fake.rows('sample_ref', 't_ref')), multiset(h.fake.rows(SRC, 't_ref')))
+        self.assertNotIn('t_ref__stage', h.fake.databases['sample_ref']['tables'], 'the staging table is dropped')
+        self.assertIn('t_ref: 7 rows, whole (reference table, through the staging table t_ref__stage)', h.text())
+        h.fake.attachment(SRC)['ATTACH_TYPE'] = 'READWRITE'
+        summary = sample.build(h.sessions.runner, None, SRC, 'sample_rw', 50, h.config, h.log)
+        self.assertEqual((summary['read_only'], summary['rows']['t_ref']), (False, 7))
+        direct = [w for w in h.fake.writes if 'sample_rw' in w and 't_ref' in w and ' LIKE ' not in w]
+        self.assertEqual(direct, ['INSERT INTO `sample_rw`.`t_ref` (`k`, `label`) SELECT `k`, `label` FROM `%s`.`t_ref`' % SRC],
+                         'a reference table of a read-write source is one direct INSERT, whole')
 
 
 class M4CliTests(unittest.TestCase):
@@ -406,6 +588,13 @@ class M4CliTests(unittest.TestCase):
         code, text = self.cli('rehearse', '--dry-run', '--prefix', 'rehearsal_x')
         self.assertEqual(code, EXIT_REFUSED)
         self.assertIn('must start with s2rebuild_rehearsal_', text)
+        code, text = self.cli('rehearse', '--dry-run', '--from-database', SRC, '--percent', '5')
+        self.assertEqual(code, EXIT_DONE, text)
+        self.assertIn('DRY RUN: the rehearsal would build s2rebuild_rehearsal_%s_src as a 5 percent sample of %s' % (self.h.run_id.replace('-', '_'), SRC), text)
+        self.assertNotIn('CREATE DATABASE', text, 'the sample statements need the capture, which a dry run does not read')
+        code, text = self.cli('rehearse', '--dry-run', '--from-database', SRC, '--percent', '101')
+        self.assertEqual(code, EXIT_REFUSED)
+        self.assertIn('--percent must be a whole number from 1 to 100', text)
 
     def test_gate_imports_what_a_notebook_result_carries(self):
         h = self.h

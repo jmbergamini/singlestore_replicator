@@ -412,7 +412,8 @@ ALLOWANCES = {
     'pipelines.py': {'pipeline', 'grant', 'revoke'},                   # pipeline statements, grant restore at O11 (grants revoked by the lockout)
     'notebook.py': {'grant', 'revoke', 'kill', 'pipeline', 'detach'},  # the lockout cell text and the run payload
     'abandon.py': {'detach', 'attach', 'drop', 'kill', 'revoke'},  # the abandon block, detach_kill of the escalation, the Path B refusal text
-    'rehearse.py': {'drop', 'kill', 'pipeline'},  # cleanup DROP DATABASE, the SIGKILL test, the pipelines count of the switch
+    'rehearse.py': {'drop', 'kill', 'pipeline', 'detach', 'attach'},  # cleanup by record (DETACH, ATTACH by syntax, DROP), the SIGKILL test, the pipelines of O9 and O11
+    'sample.py': {'attach', 'drop'},  # the READ ONLY attachment check of the source, DROP TABLE of the staging table
     'config.py': {'pipeline', 'detach', 'kill'},  # pipelines section, detach_wait_seconds, detach_kill
     'journal.py': {'pipeline', 'grant', 'attach', 'revoke', 'detach'},  # pipelines, grants_snapshot (never overwritten by a revoked state), the attachments table and its is_detached column
     'connect.py': set(),
