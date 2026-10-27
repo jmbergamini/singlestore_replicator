@@ -518,8 +518,9 @@ def calibration_lines(cal, size_gib=None):
 # ---------------------------------------------------------------------------
 # Plan sheet (P4, Appendix B)
 # ---------------------------------------------------------------------------
-def plan_sheet(config, db, run_id, inventory, est, fit, rehearsal=None, env=None, workspace=None):
-    """The plan sheet lines for one database; workspace is the facts P2 recorded (state, autoscale, auto-suspend) or None."""
+def plan_sheet(config, db, run_id, inventory, est, fit, rehearsal=None, env=None, workspace=None, skipped=None):
+    """The plan sheet lines for one database; workspace is the facts P2 recorded (state, autoscale, auto-suspend) or None;
+    skipped the pipeline source types the operator gave no credentials for at P3 (the journal's pipelines_skipped)."""
     from . import workspace as workspace_module
     env = {} if env is None else env
     lines = ['%s    run %s    database %s' % ('SingleStore Database Rebuild Kit', run_id, db.source)]
@@ -544,9 +545,16 @@ def plan_sheet(config, db, run_id, inventory, est, fit, rehearsal=None, env=None
         creds = []
         for source_type in sorted(by_type):
             var = config.pipelines.credentials_env.get(source_type)
-            creds.append('%s env %s' % (source_type, ('set' if var and env.get(var) else 'not set') if var else 'not configured'))
+            item = config.pipelines.credentials_keychain.get(source_type)
+            creds.append('%s %senv %s' % (source_type, ('Keychain item %s, ' % item) if item else '',
+                                           ('set' if var and env.get(var) else 'not set') if var else 'not configured'))
         lines.append('Pipelines  %d captured (%s); route %s; credentials: %s' % (
             len(items), ', '.join('%d %s' % (n, t) for t, n in sorted(by_type.items())), routes[config.pipelines.route], ', '.join(creds)))
+        from . import inventory as inventory_module, pipelines as pipelines_module
+        left_out = pipelines_module.skipped_names(pipelines_module.mark_skipped([dict(i) for i in items], set(skipped or ())))
+        if left_out:
+            lines.append('           not recreated at O9 (no credentials given at the P3 prompt; the count gate leaves them out): %s; '
+                         'recreate them later from pipelines/%s' % (', '.join('%s (%s)' % s for s in left_out), inventory_module.RECREATE_FILE))
         exposure = est.total_band[2]
         verdicts = []
         for source_type in sorted(by_type):

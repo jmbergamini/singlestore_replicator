@@ -816,7 +816,7 @@ def handle_p3(step, ctx):
 
 
 def handle_o4(step, ctx):
-    """O4 handler: the freeze capture is driven by the profile code path (cli); report presence of the capture.
+    """O4 with a capture present: check it and report it (cli.handle_o4 takes the capture inside run when none exists).
 
     A capture whose load target INTO PROCEDURE names a procedure the replacement will not hold is refused.
     """
@@ -824,7 +824,7 @@ def handle_o4(step, ctx):
     if (directory / INVENTORY_FILE).is_file():
         routines.refuse_pipeline_targets(load(directory), ctx.config, ctx.db, 'O4')
         return steps.Outcome(steps.PASSED, 'freeze capture present at %s' % directory)
-    note = 'run s2rebuild step O4 through the profile code path after the freeze (s2rebuild profile --step O4)'
+    note = 'run s2rebuild run --from O4, which takes the freeze capture (s2rebuild profile --step O4 for a rerun)'
     if ctx.dry_run:
         return steps.Outcome(steps.STUB, 'no freeze capture yet; ' + note)
     return steps.Outcome(steps.REFUSED, note, steps.EXIT_REFUSED)

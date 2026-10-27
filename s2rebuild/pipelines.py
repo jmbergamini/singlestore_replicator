@@ -17,6 +17,7 @@ leaves the CREATE statements to the customer and keeps the same verification. St
 through the owner guards: STOP PIPELINE (O2), USE, CREATE PIPELINE, ALTER PIPELINE (O9), GRANT,
 START PIPELINE, SET GLOBAL (O11); SELECT on the pipeline and privilege views.
 """
+import json
 import re
 import time
 
@@ -42,8 +43,41 @@ def starts_at_release(config):
 
 
 def expected_items(items):
-    """Captured pipelines the kit recreates (application-managed ones are stopped but not replayed)."""
-    return [i for i in items if not i.get('app_managed')]
+    """Captured pipelines the kit recreates: not application managed (stopped but not replayed) and not skipped for want of credentials."""
+    return [i for i in items if not i.get('app_managed') and not i.get('skipped')]
+
+
+SKIPPED_META = 'pipelines_skipped'
+
+
+def skipped_types(journal):
+    """The source types the operator skipped at the credential prompt (P3 or O9), from the journal; empty without a journal."""
+    if journal is None:
+        return set()
+    try:
+        return set(json.loads(journal.get_meta(SKIPPED_META) or '[]'))
+    except ValueError:
+        return set()
+
+
+def record_skip(journal, source_type, names, step):
+    """Record that the operator gave no credentials for a source type: the meta list and a pipeline_skip event. Returns the names."""
+    types = sorted(skipped_types(journal) | {str(source_type).upper()})
+    journal.set_meta(SKIPPED_META, json.dumps(types))
+    journal.event('pipeline_skip', '%s: no %s credentials given; not recreated at O9: %s' % (step, source_type, ', '.join(sorted(names))))
+    return sorted(names)
+
+
+def mark_skipped(items, skipped):
+    """Mark each pipeline of a skipped source type that needs credentials with skipped=True (expected_items leaves it out)."""
+    for item in items:
+        item['skipped'] = bool(skipped and str(item.get('source_type') or '').upper() in skipped and needs_credentials(item))
+    return items
+
+
+def skipped_names(items):
+    """The names of the pipelines marked skipped, with their source type: [(name, source_type)]."""
+    return sorted((i['name'], str(i.get('source_type') or '')) for i in items if i.get('skipped'))
 
 
 def needs_credentials(item):
@@ -73,14 +107,20 @@ def names_source(text, source):
 # Capture provenance
 # ---------------------------------------------------------------------------
 def capture_for(ctx):
-    """{'items', 'directory', 'step', 'exists'} of the newest pipeline capture: O2 (after the stop), else O4, else P3."""
+    """{'items', 'directory', 'step', 'exists'} of the newest pipeline capture: O2 (after the stop), else O4, else P3.
+
+    Each item of a source type the operator skipped at the credential prompt carries skipped=True
+    (mark_skipped from the journal), so every consumer of the capture leaves it out of the
+    expected pipelines.
+    """
     for step_id in ('O2', 'O4', 'P3'):
         directory = inventory.inventory_dir(ctx.config, ctx.run_id or '', ctx.db, step_id)
         if (directory / inventory.INVENTORY_FILE).is_file():
             data = inventory.load(directory)
             pipes = data.get('pipelines') or {}
             if pipes.get('captured'):
-                return {'items': pipes['items'], 'directory': directory, 'step': step_id, 'exists': True}
+                items = mark_skipped(pipes['items'], skipped_types(getattr(ctx, 'journal', None)))
+                return {'items': items, 'directory': directory, 'step': step_id, 'exists': True}
     return {'items': [], 'directory': None, 'step': None, 'exists': False}
 
 
@@ -163,6 +203,10 @@ def replay_block(names, items, capture_step='O2'):
         for alter in item.get('alter_statements') or []:
             b.statement(alter, 'set offsets of %s' % item['name'], pipeline=item['name'], source_type=item.get('source_type'))
     _verify_checks(b, names, expected)
+    skipped = skipped_names(items)
+    if skipped:
+        b.note('Not recreated, no credentials given at the prompt (the count above leaves them out): %s. Recreate them later from '
+               'pipelines/%s of the O2 capture.' % (', '.join('%s (%s)' % s for s in skipped), inventory.RECREATE_FILE))
     b.note('The kit then compares PIPELINES_OFFSETS in the replacement with the O2 capture, partition by partition. Never START here.')
     return b
 
@@ -232,16 +276,26 @@ def release_block(names, items, grant_snapshot, config=None):
 # Credentials
 # ---------------------------------------------------------------------------
 def credential_for(item, config, env):
-    """(value, variable) for a pipeline: the per-pipeline variable first, then the source-type variable; KitError when unset."""
+    """(value, source) for a pipeline: the Keychain item (per pipeline, then per source type; prompts.keychain_item_for), then the
+    variable (per pipeline, then per source type); the source is the item or variable name. KitError when nothing holds a value."""
+    from . import prompts
     if inventory.has_redaction_marker(item['definition']):
         raise KitError('Pipeline %s still carries a redaction marker in its definition; capture it again' % item['name'])
+    service = prompts.keychain_item_for(item, config)
+    if service:
+        value = prompts.read_item(service)
+        if value:
+            return value, service
     var = config.pipelines.per_pipeline_env.get(item['name']) or config.pipelines.credentials_env.get(item['source_type'])
-    if not var:
-        raise KitError('No credential variable is configured for pipeline %s (source type %s); set pipelines.credentials_env or per_pipeline_env' % (
-            item['name'], item['source_type']))
-    value = env.get(var)
+    if not var and not service:
+        raise KitError('No credential variable is configured for pipeline %s (source type %s); set pipelines.credentials_keychain or '
+                       'credentials_env (or the per-pipeline maps)' % (item['name'], item['source_type']))
+    value = env.get(var) if var else None
     if not value:
-        raise KitError('Environment variable %s for pipeline %s is not set; export it for O9 only, then unset it' % (var, item['name']))
+        raise KitError('%s for pipeline %s is not set; %sanswer the prompt at P3 or O9%s' % (
+            ('Environment variable %s' % var) if var else 'No credential',
+            item['name'], ('Keychain item %s is missing too; ' % service) if service else '',
+            (', or export %s for O9 only, then unset it' % var) if var else ''))
     return value, var
 
 
@@ -450,12 +504,19 @@ def handle_o2(step, ctx):
 
 
 def handle_o9(step, ctx):
-    """O9 handler: replay the O2 capture with credentials from the environment (or verify the customer's replay), then the offset checks."""
+    """O9 handler: replay the O2 capture with credentials from the Keychain or the environment (or verify the customer's replay),
+    then the offset checks. On the kit route a source type still without credentials is asked for first (prompts.pipeline_credentials);
+    a blank answer skips it and the gate leaves its pipelines out."""
+    from . import prompts
     cap = capture_for(ctx)
+    route = ctx.config.pipelines.route
+    env = ctx.options.get('env') or {}
+    if route == 'kit' and not ctx.dry_run and ctx.owner_configured and cap['step'] == 'O2' and cap['items']:
+        prompts.pipeline_credentials(cap['items'], ctx.config, ctx.journal, ctx.log, env, ctx.log.redactor, step='O9')
+        cap = capture_for(ctx)
     items = cap['items']
     expected = expected_items(items)
     names = ownersql.names_for(ctx)
-    route = ctx.config.pipelines.route
     if route == 'customer':
         placeholder = (cap['directory'] / inventory.PIPELINES_DIR / inventory.RECREATE_FILE) if cap['directory'] else None
         b = verify_block(names, items, cap['step'], placeholder)
@@ -488,7 +549,6 @@ def handle_o9(step, ctx):
         return ownersql.handle_admin(step, ctx, b)
     if route == 'customer':
         return ownersql.handle_admin(step, ctx, b, after=_after)
-    env = ctx.options.get('env') or {}
     check_credentials(items, ctx.config, env)
     return ownersql.handle_admin(step, ctx, b, after=_after, substitute=substitute_credentials(items, ctx.config, env, ctx.log.redactor))
 

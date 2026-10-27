@@ -99,6 +99,10 @@ SCHEMA = {
     'kit': Field('str', choices=('s2rebuild',)),
     'version': Field('int', choices=(1,)),
     'customer': Field('str', 'Customer'),
+    'run': {
+        # production asks at O1 for a replacement or retained name the configuration leaves to the kit; test applies the defaults
+        'mode': Field('str', 'production', choices=('production', 'test')),
+    },
     'workspace': {
         'host': Field('str'),
         'port': Field('int', 3306, minimum=1, maximum=65535),
@@ -156,6 +160,9 @@ SCHEMA = {
     },
     'pipelines': {
         'route': Field('str', 'kit', choices=('kit', 'customer')),
+        # the Keychain item per source type (or per pipeline) the P3 and O9 prompts fill; read before the variables
+        'credentials_keychain': Field('dict', {}),
+        'per_pipeline_keychain': Field('dict', {}),
         'credentials_env': Field('dict', {'KAFKA': 'S2REBUILD_KAFKA_CREDENTIALS', 'S3': 'S2REBUILD_S3_CREDENTIALS'}),
         'per_pipeline_env': Field('dict', {}),
         'retention_hours': Field('dict', {}),
@@ -308,7 +315,7 @@ class Section:
         return 'Section(%r)' % sorted(self._data)
 
 
-_FREE_FORM = frozenset({'credentials_env', 'per_pipeline_env', 'retention_hours'})
+_FREE_FORM = frozenset({'credentials_env', 'per_pipeline_env', 'credentials_keychain', 'per_pipeline_keychain', 'retention_hours'})
 
 
 @dataclasses.dataclass(frozen=True)
@@ -349,6 +356,7 @@ class DatabaseSpec:
     app_managed_pipelines: tuple
     tables: dict
     target: dict = dataclasses.field(default_factory=dict)
+    defaulted: tuple = ()  # the roles ('replacement', 'retained') the configuration left to the kit's date default
 
     @property
     def names(self):
@@ -401,6 +409,7 @@ class Config:
     closeout: Section
     paths: Section
     objects: Section = None
+    run: Section = None
 
     def database(self, name):
         """The DatabaseSpec whose source is name. Raises KitError when it is not configured."""
@@ -419,6 +428,24 @@ class Config:
         for db in self.databases:
             names.extend(db.names)
         return names
+
+    def with_names(self, source, replacement=None, retained=None):
+        """A Config whose database source carries the given replacement or retained name (the names O1 recorded for the run).
+
+        The raw mapping and its hash stay as they are; the names must stay unique across the run.
+        """
+        db = self.database(source)
+        changed = dataclasses.replace(db, replacement=replacement or db.replacement, retained=retained or db.retained)
+        for role in ('replacement', 'retained'):
+            _identifier(getattr(changed, role), 'databases.%s.%s' % (source, role))
+        databases = tuple(changed if d.source == source else d for d in self.databases)
+        seen = {}
+        for d in databases:
+            for name in d.names:
+                if name in seen:
+                    raise KitError('Database name %s is used twice (%s and %s); every run name must be unique' % (name, seen[name], d.source))
+                seen[name] = d.source
+        return dataclasses.replace(self, databases=databases)
 
     def resolve(self, relative):
         """Resolve a path from the file against the kit root."""
@@ -456,6 +483,7 @@ def _identifier(value, path):
 
 def _database(data, index, date_tag):
     source = _identifier(data['source'], 'databases.%d.source' % index)
+    defaulted = tuple(role for role in ('replacement', 'retained') if not data.get(role))
     replacement = data.get('replacement') or '%s_rebuild_%s' % (source, date_tag)
     retained = data.get('retained') or '%s_retained_%s' % (source, date_tag)
     _identifier(replacement, 'databases.%d.replacement' % index)
@@ -472,7 +500,7 @@ def _database(data, index, date_tag):
     data['replacement'] = replacement
     data['retained'] = retained
     return DatabaseSpec(source, replacement, retained, Layout(**data['layout']), tuple(data['time_column_candidates']),
-                        tuple(data['app_managed_pipelines']), tables, dict(data['target']))
+                        tuple(data['app_managed_pipelines']), tables, dict(data['target']), defaulted)
 
 
 def _check_env_map(mapping, path):
@@ -481,6 +509,14 @@ def _check_env_map(mapping, path):
             raise KitError('Configuration key %s has an empty name' % path)
         if not isinstance(value, str) or not _ENV_NAME.fullmatch(value):
             raise KitError('Configuration key %s.%s must name an upper-case environment variable' % (path, key))
+
+
+def _check_item_map(mapping, path):
+    for key, value in mapping.items():
+        if not isinstance(key, str) or not key:
+            raise KitError('Configuration key %s has an empty name' % path)
+        if not isinstance(value, str) or not value.strip():
+            raise KitError('Configuration key %s.%s must name a Keychain item' % (path, key))
 
 
 def build_config(data, path=None, run_date=None, root=None):
@@ -523,6 +559,8 @@ def build_config(data, path=None, run_date=None, root=None):
             raise KitError('freeze.lockout.protected_accounts must hold account names')
     _check_env_map(raw['pipelines']['credentials_env'], 'pipelines.credentials_env')
     _check_env_map(raw['pipelines']['per_pipeline_env'], 'pipelines.per_pipeline_env')
+    _check_item_map(raw['pipelines']['credentials_keychain'], 'pipelines.credentials_keychain')
+    _check_item_map(raw['pipelines']['per_pipeline_keychain'], 'pipelines.per_pipeline_keychain')
     for key, value in raw['pipelines']['retention_hours'].items():
         if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0:
             raise KitError('pipelines.retention_hours.%s must be a number of hours' % key)
@@ -535,7 +573,8 @@ def build_config(data, path=None, run_date=None, root=None):
                   workspace=Section(raw['workspace']), runner=runner, owner=owner, databases=databases, window=window,
                   freeze=Section(raw['freeze']), copy=Section(copy), verify=Section(raw['verify']),
                   pipelines=Section(raw['pipelines']), estimate=Section(raw['estimate']),
-                  closeout=Section(raw['closeout']), paths=Section(raw['paths']), objects=Section(raw['objects']))
+                  closeout=Section(raw['closeout']), paths=Section(raw['paths']), objects=Section(raw['objects']),
+                  run=Section(raw['run']))
 
 
 def config_path(explicit=None, env=None):

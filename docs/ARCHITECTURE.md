@@ -135,7 +135,7 @@ Two SQL identities. The split is forced by Helios: SUPER cannot be granted, the 
 
 P2 checks the runner's privileges against the list above by reading `information_schema.USER_PRIVILEGES` for the runner's grantee string (`'user'@'host'`, built from `CURRENT_USER()`) and reports each missing one by name. It also attempts to detect whether the runner can ATTACH or DETACH (the branching documentation says CREATE DATABASE or ATTACH DATABASE permission allows branches); the result is recorded, not assumed.
 
-Password handling: `password_keychain` (macOS `security find-generic-password -a "$USER" -s <service> -w`, run by the kit) or `password_env`. Passwords are never written, logged or echoed. A redactor masks host, password and CA path in every log line, and the runner and owner user names where they stand as a user (`user@host`, a quoted account such as `'user'@'%'`, `USER = 'user'`), never inside a word or a label, so a step line such as "[O3] Freeze (admin; owner)" stays readable when the owner user is admin (`connect.mask_user`).
+Password handling: `password_keychain` (macOS `security find-generic-password -a "$USER" -s <service> -w`, run by the kit) or `password_env`. At P1, `account-sql --execute` fills the items itself: the owner password is asked for (hidden, through `prompts.ask`) when its item is missing and stored with `security add-generic-password -U` (`prompts.write_keychain`, the one writer); the runner password is generated from the workspace policy (the `PASSWORD_` variables read through the owner session and printed before CREATE USER: 32 characters or the policy minimum, every character class, no character twice in a row, no three sequential characters) and stored the same way, never asked and never printed. Pipeline credentials are asked for by field at P3 or O9 and stored in the items of `pipelines.credentials_keychain`. Passwords are never written, logged or echoed. A redactor masks host, password and CA path in every log line, and the runner and owner user names where they stand as a user (`user@host`, a quoted account such as `'user'@'%'`, `USER = 'user'`), never inside a word or a label, so a step line such as "[O3] Freeze (admin; owner)" stays readable when the owner user is admin (`connect.mask_user`).
 
 ## 6. Folder layout
 
@@ -189,6 +189,8 @@ One YAML file, default path `customer/config.yaml`, selected with `--config`. Ev
 kit: s2rebuild
 version: 1
 customer: "Example Customer"            # label for reports; never used in the static tree
+run:
+  mode: production                      # production asks at O1 for a replacement or retained name left out; test applies the defaults
 workspace:
   host: svc-xxxx-dml.svc.singlestore.com
   port: 3306
@@ -200,14 +202,14 @@ workspace:
 connections:
   runner:
     user: s2rebuild_runner
-    password_keychain: s2rebuild-runner # or password_env: S2REBUILD_RUNNER_PASSWORD
+    password_keychain: s2rebuild-runner # filled by account-sql --execute at P1; or password_env: S2REBUILD_RUNNER_PASSWORD
   owner:                                # optional; when present, admin steps execute with gates
     user: admin
-    password_keychain: s2rebuild-owner
+    password_keychain: s2rebuild-owner  # asked for at P1 when the item is missing
 databases:
   - source: acme_orders_db
-    replacement: acme_orders_db_rebuild_20261101    # default <source>_rebuild_<YYYYMMDD>
-    retained: acme_orders_db_retained_20261101      # default <source>_retained_<YYYYMMDD>
+    replacement: acme_orders_db_rebuild_20261101    # default <source>_rebuild_<YYYYMMDD>; left out, O1 asks in production mode
+    retained: acme_orders_db_retained_20261101      # default <source>_retained_<YYYYMMDD>; left out, O1 asks in production mode
     layout: { partitions: 32, sub_partitions: 512 }
     time_column_candidates: [_modified_time, updated_at, modified_at, _created_time, created_at, event_date]
     app_managed_pipelines: []           # pipelines the application drops and recreates itself
@@ -251,7 +253,9 @@ verify:
   value_columns: 4
 pipelines:
   route: kit                            # kit = the kit replays at O9; customer = the customer runs the placeholder file
-  credentials_env: { KAFKA: S2REBUILD_KAFKA_CREDENTIALS, S3: S2REBUILD_S3_CREDENTIALS }
+  credentials_keychain: { KAFKA: s2rebuild-pipelines-kafka, S3: s2rebuild-pipelines-s3 }  # filled by the P3 prompt, read at O9 first
+  per_pipeline_keychain: {}             # pipeline_name: Keychain item, read before the source-type item
+  credentials_env: { KAFKA: S2REBUILD_KAFKA_CREDENTIALS, S3: S2REBUILD_S3_CREDENTIALS }  # the fallback when no item holds the value
   per_pipeline_env: {}                  # pipeline_name: ENV_VAR, overrides the source-type entry
   retention_hours: { KAFKA: 168 }       # stated by the customer per source type, for the plan sheet
 estimate:
@@ -279,15 +283,17 @@ Global flags: `--config PATH`, `--run ID` (default: `S2REBUILD_RUN`, else the mo
 
 Database selection: with one database configured, nothing to choose. With several and no `--db`, the kit lists them and asks "all, or which?" before any step; `--yes` means all, in config order.
 
+Prompts: every question the kit asks goes through `prompts.ask` (a hidden value through getpass, never echoed; None without a terminal, so a non-interactive command never blocks), and every Keychain write through `prompts.write_keychain` (`security add-generic-password -U`); tests replace both. The kit asks for the owner password at P1 when its item is missing, for the pipeline credentials at P3 (or O9) when the capture shows pipelines on route kit, and for the replacement and retained names at O1 in production mode when the configuration leaves them to the kit. Nothing typed is printed, logged or written to a file; the generated runner password is never asked for.
+
 | Command | Step | What it does |
 |---|---|---|
 | `check` | P2 | Connect as runner (and owner if configured), privilege check, engine version, source layout and STORAGE_ID, target names free, compute cores × 8 ≥ partitions; refused until P1 is recorded, rerun any time |
-| `account-sql` | P1, C4 | Print the CREATE USER and GRANT block for the runner account; `--execute` runs it with the owner profile; `--drop` prints or executes the DROP USER block and the zero-privilege check. The password comes from the configured Keychain item or env and is never printed |
+| `account-sql` | P1, C4 | Print the CREATE USER and GRANT block for the runner account; `--execute` runs it with the owner profile: the owner password is asked for when its Keychain item is missing, the password policy is printed, the runner password is generated to it and stored in its Keychain item (with `password_env` the variable is used as it is); `--drop` prints or executes the DROP USER block and the zero-privilege check. No password is ever printed |
 | `profile` | P3, O4 | Inventory, sizes, estimate, profile Excel for the configured databases; `--step O4` is the freeze capture with drift and the copy plan. Refused until the step's preconditions passed; a passed step is captured again only with `--redo`; `--dry-run` writes the `-dry-run` workbook only, nothing under `inventory/`. `--exact-counts` runs COUNT(*) per table; `--baseline FILE` overrides the throughput baseline; `--all-databases` adds a system sheet with every database in the workspace (partitions, sub-partitions, tables, rows, GiB, pipelines, estimated copy time) for ranking and sequencing |
 | `plan` | P4 | Print the plan sheet: window, abort deadline, freeze path, step owners, estimate with bands |
 | `rehearse` | P5 | Create throwaway databases, run O4 to O10 on them, kill test mid-chunk, resume, verify, switch, cleanup. `--keep` leaves them for inspection |
-| `run` | O1 to O11 | Run steps in order in the most recent run, skipping passed steps; `--from ID`, `--to ID`, `--redo`; `--new` starts a new run at O1; `--no-rehearsal NOTE` lets O1 start without rehearsal evidence |
-| `step ID` | any | Run one step; `--no-rehearsal NOTE` lets O1 start without rehearsal evidence; `--idle-workload NOTE` lets C1 pass on a live database that is idle on purpose |
+| `run` | O1 to O11 | Run steps in order in the most recent run, skipping passed steps; `--from ID`, `--to ID`, `--redo`; `--new` starts a new run at O1; `--no-rehearsal NOTE` lets O1 start without rehearsal evidence; `--mode production|test` overrides `run.mode` for the names O1 asks for; O4 is captured inside the run (`profile --step O4` stays for a rerun) |
+| `step ID` | any | Run one step; `--no-rehearsal NOTE` lets O1 start without rehearsal evidence; `--mode` as for `run`; `--idle-workload NOTE` lets C1 pass on a live database that is idle on purpose |
 | `gate ID --pass|--fail --note TEXT [--evidence FILE] [--override NOTE]` | admin, human, decision; C1 and C2 | Record a gate result for a step the kit did not execute itself; warns when earlier steps are not passed; the P1 gate starts the first run; C1 and C2, python steps, only with `--override NOTE`, journaled as a `gate_override` event |
 | `status` | any | Board of steps per database: status, start, end, evidence path |
 | `watch` | O3, C1 | Writer watch: non-runner sessions with statement kind every `--interval` seconds (default 5) and count deltas on the largest `--tables N` every 60 seconds |
@@ -338,7 +344,7 @@ Package `s2rebuild/`. Every module starts with a docstring whose first line is `
 
 ### 10.1 config.py
 
-Load, validate and default the YAML. Expose `Config`, `DatabaseSpec`, `Window`. Compute defaults for replacement and retained names from the run date. Reject unknown keys. Provide `config_hash()` for the journal.
+Load, validate and default the YAML. Expose `Config`, `DatabaseSpec`, `Window`. Compute defaults for replacement and retained names from the run date and remember which roles were defaulted (`DatabaseSpec.defaulted`): in `run.mode` production O1 asks for those names (`prompts.ask_names`, the default as the suggestion), records the answers in the journal, and every later command replaces the defaults with the recorded names before the journal's names check (`cli.Invocation.apply_recorded_names`, `Config.with_names`); test mode applies the defaults silently and `--mode` overrides the file. Reject unknown keys. Provide `config_hash()` for the journal; the hash is taken on the raw mapping, so a typed name does not change it.
 
 ### 10.2 connect.py and secrets
 
@@ -513,14 +519,14 @@ Why credentials cannot be extracted: Helios redacts CREDENTIALS in `SHOW CREATE 
 
 P3 (admin profile): capture every pipeline into `pipelines/<name>.sql` (mode 0600) and the journal `pipelines` table: name, state, source type, source location (brokers and topic, or bucket and prefix), target, batch interval, duplicate handling, the full CREATE statement with `<<CREDENTIALS>>` in place of the redacted clause, the server-supplied ALTER statements, the current offsets, the last batch time and the error count from `PIPELINES_BATCHES_SUMMARY` and `PIPELINES_ERRORS` for the last 24 hours. The profile workbook's Pipelines tab (10.16) is built from this.
 
-Credential handover (P4): the plan sheet lists each source type and the environment variable expected for it, and whether it is set. The customer supplies one CREDENTIALS JSON per source type, or per pipeline where they differ, in the same form they used when the pipeline was created (for Kafka typically the SASL user and password or the SSL material; for S3 the access key pair or a role). The customer decides between two routes and the decision is recorded:
+Credential handover (P3 and P4): on route 1 the kit asks at P3, once the capture shows pipelines with a CREDENTIALS clause, for the credentials of each source type that has none yet, by field (`prompts.CREDENTIAL_FIELDS`: S3 access key ID shown, secret access key hidden, session token hidden and optional; Kafka SASL user shown and password hidden; for another type the CONFIG keys of the pipelines are printed and credential keys and values are asked for until a blank key), assembles the CREDENTIALS JSON and stores it in the Keychain item of `pipelines.credentials_keychain` for that type. A blank first answer skips the type: the journal records `pipelines_skipped` and a `pipeline_skip` event, `pipelines.capture_for` marks its pipelines `skipped`, and every consumer of the capture (the O9 count gate and block, S3's count on the live name, O11, C1, the notebook, the plan sheet and the final report) leaves them out and names them with the placeholder file. A type without a Keychain item configured is not asked; its variable stays the way. The plan sheet lists each source type with its Keychain item and the environment variable expected for it, whether it is set, and the pipelines not recreated. The customer supplies one CREDENTIALS JSON per source type, or per pipeline where they differ, in the same form they used when the pipeline was created (for Kafka typically the SASL user and password or the SSL material; for S3 the access key pair or a role). The customer decides between two routes and the decision is recorded:
 
-- Route 1, the kit replays: the customer sets the variables in the operator's terminal (or types them into the notebook cell) for O9 only, then unsets them.
+- Route 1, the kit replays: the credentials are typed at the P3 prompt (or at O9, which asks for a type still without them) and live in the Keychain; the variables set in the operator's terminal (or typed into the notebook cell) for O9 only, then unset, are the fallback.
 - Route 2, the customer replays: the customer runs the placeholder file `pipelines/recreate-with-placeholders.sql` themselves inside the replacement at O9, filling in CREDENTIALS. The kit still verifies the result and the gate is the same.
 
 O2 (admin): `STOP PIPELINE <source>.<name>` for every pipeline in one block (skipped only for a pipeline already Stopped, so one in state Error is stopped too), verify none Running, then capture definitions and offsets again. The offsets captured after the stop are the final bookmark and are the ones replayed. After the stop LATEST_LOADED_OFFSET must equal LATEST_SUCCESSFUL_OFFSET on every partition; a NULL successful offset beside a loaded one is a difference, and only both NULL passes. Otherwise O2 refuses the capture with the partitions listed, on the kit route and at the import of a notebook result, and the operator reruns O2 once they agree. Pipelines named in `app_managed_pipelines` are stopped too; the capture records that the application recreates them.
 
-O9 (admin): for each captured pipeline not already in the replacement: replace `<<CREDENTIALS>>` with the SQL literal from the environment variable (per-pipeline entry first, then the source-type entry); refuse when no value is set or a redaction marker remains; `USE <replacement>`; execute the CREATE PIPELINE (pipelines are created stopped) and every server-supplied `ALTER PIPELINE ... SET OFFSETS` statement. Never START. Gate: count equals the capture minus `app_managed_pipelines`, zero Running, and for every pipeline and partition the committed offset in the replacement equals the O2 capture. The block carries one check per pipeline and partition, so the notebook and hand routes hold the same gate as the kit's compare after the block.
+O9 (admin): a source type still without credentials is asked for first, as at P3 (a blank answer skips it); then for each expected pipeline not already in the replacement: replace `<<CREDENTIALS>>` with the SQL literal from the Keychain item (`pipelines.per_pipeline_keychain`, then `credentials_keychain` by source type), else from the environment variable (per-pipeline entry first, then the source-type entry); refuse when no value is held anywhere or a redaction marker remains; `USE <replacement>`; execute the CREATE PIPELINE (pipelines are created stopped) and every server-supplied `ALTER PIPELINE ... SET OFFSETS` statement. Never START. Gate: count equals the capture minus `app_managed_pipelines`, zero Running, and for every pipeline and partition the committed offset in the replacement equals the O2 capture. The block carries one check per pipeline and partition, so the notebook and hand routes hold the same gate as the kit's compare after the block.
 
 O11 (admin): the retention check above, then `START PIPELINE <live>.<name>` for each in one block. Pipelines in the retained copy stay stopped. With the owner profile the kit records `release_started_utc` inside the open owner session, once the retention check and every check of the block ahead of the first statement passed, just before that statement (or just before it is found already done). An O11 that stops part way (a lost reply after a GRANT or a START, a crash) therefore still refuses a rollback. An O11 that stops before its first statement (a failed check, a lost connection, an owner session that cannot open) records nothing and leaves the rollback open; `released_utc` follows once the block and the grants compare passed, or when the gate is recorded by hand.
 

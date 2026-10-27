@@ -153,6 +153,8 @@ def summary_rows(inventory, plans, est, fit, config, db, run_id, baseline, steps
         rows.append(('Credential route', '1 (kit replays at O9)' if config.pipelines.route == 'kit' else '2 (customer runs the placeholder file)'))
         for source_type in sorted(by_type):
             rows.append(('Credential variable ' + source_type, config.pipelines.credentials_env.get(source_type) or 'not configured'))
+            rows.append(('Credential Keychain item ' + source_type, config.pipelines.credentials_keychain.get(source_type)
+                         or 'not configured (the P3 prompt needs one)'))
     else:
         rows.append(('Captured', pipelines.get('note') or 'not captured'))
     rows.append((None, None))
@@ -442,6 +444,18 @@ def final_summary_rows(inventory, plans, journal, config, db, run_id, name_map=N
         rows.append(('In journal', '%d; started %d' % (len(pipelines), sum(1 for p in pipelines if p.get('started_utc')))))
     captured = (inventory.get('pipelines') or {})
     rows.append(('Captured at P3', '%d' % len(captured.get('items') or []) if captured.get('captured') else (captured.get('note') or 'not captured')))
+    from . import inventory as inventory_module, pipelines as pipelines_module
+    left_out = pipelines_module.skipped_names(pipelines_module.mark_skipped([dict(i) for i in captured.get('items') or []],
+                                                                            pipelines_module.skipped_types(journal)))
+    placeholder = None
+    for step_id in ('O2', 'O4', 'P3'):
+        candidate = inventory_module.inventory_dir(config, run_id, db, step_id) / inventory_module.PIPELINES_DIR / inventory_module.RECREATE_FILE
+        if candidate.is_file():
+            placeholder = candidate
+            break
+    rows.append(('Not recreated (no credentials given)', ('%s; recreate from %s' % (', '.join('%s (%s)' % s for s in left_out),
+                                                                                    placeholder or 'pipelines/%s of the O2 capture' % inventory_module.RECREATE_FILE))
+                 if left_out else 'none'))
     rows.append((None, None))
     rows.append(('Switch', None))
     for role in ('source', 'replacement', 'retained', 'live'):

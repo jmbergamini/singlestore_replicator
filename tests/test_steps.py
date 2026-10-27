@@ -213,8 +213,9 @@ class RealRunTests(unittest.TestCase):
         steps.record_gate(h.journals, 'O2', True, 'pipelines stopped')
         steps.record_gate(h.journals, 'O3', True, 'read only verified')
         code = h.run(from_id='O4')
+        # W9: run performs the O4 capture itself; this harness has no session factory, so the live capture refuses and O4 stays pending
         self.assertEqual(code, EXIT_REFUSED, 'a python step without its input refuses in a real run')
-        self.assertIn('profile --step O4', h.text())
+        self.assertIn('No connection factory is available for a live step', h.text())
         self.assertEqual(h.journal.step_status('O4'), 'pending')
         with self.assertRaisesRegex(KitError, 'needs --note'):
             steps.record_gate(h.journals, 'O3', True, '  ')
@@ -549,7 +550,9 @@ class RealRunTests(unittest.TestCase):
         from tests.helpers import FAULT_POINTS, RUN_DATE, crash_journal
 
         def two(d):
+            # W9: the second database leaves its names to the kit; run.mode test applies the defaults without a prompt
             d['databases'].append({'source': 'second_db', 'layout': {'partitions': 8, 'sub_partitions': 64}})
+            d['run'] = {'mode': 'test'}
 
         def edited(h, mutate):
             """The harness configuration after an operator's edit."""

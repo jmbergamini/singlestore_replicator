@@ -1165,7 +1165,8 @@ class EntryPointRuleTests(unittest.TestCase):
         second database's O1 writes are in tests/test_steps.py test_f5_o1_runs_for_every_database_before_the_run_stops."""
         h = LiveRun(self, lambda d: d['databases'].append({'source': 'second_db', 'layout': {'partitions': 8, 'sub_partitions': 64}}))
         record_passed(h.config, RUN, ('P1', 'P2'))
-        code, text = h.cli('run', '--no-rehearsal', 'no rehearsal for this test', '--yes')
+        # W9: the second database leaves its names to the kit; --mode test applies the defaults without a prompt
+        code, text = h.cli('run', '--no-rehearsal', 'no rehearsal for this test', '--yes', '--mode', 'test')
         self.assertEqual(code, EXIT_GATE, text)
         self.assertEqual(text.count('Stopped at O1'), 1, text)
         code, text = h.cli('gate', 'O1', '--pass', '--note', 'go', '--yes')

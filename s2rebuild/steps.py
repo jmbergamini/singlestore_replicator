@@ -324,6 +324,41 @@ def o1_readiness(ctx):
     return lines, problems, waiver
 
 
+def run_mode(ctx):
+    """The run mode for O1: --mode (ctx.options['mode']) over run.mode of the configuration (production unless set)."""
+    override = str(ctx.options.get('mode') or '').strip()
+    if override:
+        return override
+    run = getattr(ctx.config, 'run', None)
+    return (run.get('mode') if run is not None else None) or 'production'
+
+
+def o1_names(ctx, mode, ask=True):
+    """(names, typed, lines): the run's three names for O1, and the roles typed at the prompt.
+
+    In production mode a replacement or retained name the configuration left to the kit's date
+    default is asked for at O1 (prompts.ask_names, the default as the suggestion) unless the journal
+    already records the names (a rerun, or an earlier O1); test mode applies the defaults silently
+    and a dry run never asks. With ask False the defaults come back with a line saying the prompt
+    follows (O1 asks only after its checks passed). The answers are the names the journal records,
+    and every later command reads them back from the journal (cli.Invocation.apply_recorded_names).
+    """
+    db = ctx.db
+    recorded = ctx.journal.get_meta('replacement_db') or ctx.journal.get_meta('target_db')
+    if not db.defaulted or recorded or mode != 'production':
+        note = ''
+        if db.defaulted and not recorded:
+            note = ' (%s by the kit\'s date default: run.mode %s)' % (' and '.join(db.defaulted), mode)
+        return db.names, (), ['names: source %s, replacement %s, retained %s%s' % (db.names + (note,))]
+    if ctx.dry_run or not ask:
+        return db.names, (), ['names: source %s, replacement %s, retained %s (defaults; %s run in production mode asks for the %s name(s))'
+                              % (db.names + ('a real' if ctx.dry_run else 'this', ' and '.join(db.defaulted)))]
+    from . import prompts
+    chosen = prompts.ask_names(db, ctx.config, say=ctx.log.plain)
+    names = (db.source, chosen.get('replacement', db.replacement), chosen.get('retained', db.retained))
+    return names, tuple(sorted(chosen)), ['names: source %s, replacement %s, retained %s (%s typed at O1)' % (names + (' and '.join(sorted(chosen)),))]
+
+
 def o1_start(step, ctx):
     """O1: check the window, P2 and the rehearsal evidence, record window and deadline, then wait for the go decision.
 
@@ -331,12 +366,14 @@ def o1_start(step, ctx):
     the switch and the lockout run without a time limit. With one, a past deadline fails the gate.
     A real run then refuses, before any journal write, when P2 is not passed in this run or there
     is no rehearsal evidence and no --no-rehearsal NOTE (o1_readiness); a dry run reports both and
-    goes on. A waiver is recorded as a no_rehearsal event and in the O1 note.
+    goes on. A waiver is recorded as a no_rehearsal event and in the O1 note. The names come from
+    o1_names: in production mode a name the configuration left to the kit is typed here.
     """
     config = ctx.config
     window = config.window
     deadline = None
-    lines = ['names: source %s, replacement %s, retained %s' % ctx.db.names]
+    mode = run_mode(ctx)
+    names, typed, lines = o1_names(ctx, mode, ask=False)
     if window is None:
         lines.append('window: none configured, so no abort deadline; the copy and the switch run without a time limit')
     else:
@@ -375,12 +412,17 @@ def o1_start(step, ctx):
                 ctx.log.plain('    ' + line)
             return Outcome(REFUSED, 'O1 refused: ' + '; '.join(problems), EXIT_REFUSED)
     if not ctx.dry_run:
+        # the names are asked only now, after every check passed, so a refused O1 never asks
+        names, typed, name_lines = o1_names(ctx, mode)
+        lines[0] = name_lines[0]
         journal = ctx.journal
         journal.set_meta('run_id', ctx.run_id or '')
-        journal.set_meta('source_db', ctx.db.source)
-        journal.set_meta('replacement_db', ctx.db.replacement)
-        journal.set_meta('retained_db', ctx.db.retained)
+        journal.set_meta('source_db', names[0])
+        journal.set_meta('replacement_db', names[1])
+        journal.set_meta('retained_db', names[2])
         journal.set_meta('config_hash', config.config_hash())
+        if typed:
+            journal.event('names', 'O1 names typed in production mode: replacement %s, retained %s' % names[1:])
         # empty values clear a window an earlier O1 recorded; resolve_abort_at ignores an empty deadline
         journal.set_meta('window_start', iso(window.start) if window else '')
         journal.set_meta('window_end', iso(window.end) if window else '')
@@ -395,6 +437,8 @@ def o1_start(step, ctx):
         for kind, detail in workspace_events:
             journal.event(kind, detail)
     outcome = gate_pending(step, ctx, lines + ['go decision recorded by the operator'])
+    if typed:
+        outcome.note += '; names typed at O1: replacement %s, retained %s' % names[1:]
     if waiver:
         outcome.note += '; rehearsal waived with --no-rehearsal: %s' % waiver
     for kind, detail in workspace_events:

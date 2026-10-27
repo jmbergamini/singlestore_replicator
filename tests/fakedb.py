@@ -949,6 +949,9 @@ class FakeCursor:
             db.writes.append(s)
             if m.group(2) == '<password>':
                 raise FakeDisconnect('the password placeholder reached the server')
+            if db.password_policy_problems(m.group(2)):
+                # fact 20: a password under the PASSWORD_ policy of the workspace is refused with 1144
+                raise db.error(1144)
             db.users.add(m.group(1))
             return
         m = re.match(r"DROP USER ('[^']+'@'[^']+')$", s)
@@ -1399,6 +1402,19 @@ class FakeDB:
 
     def rows(self, db, table):
         return self.databases[db]['tables'][table]['rows']
+
+    def password_policy_problems(self, password):
+        """The PASSWORD_ rules of self.globals a CREATE USER password misses (fact 20): length and the four character classes."""
+        def minimum(key):
+            try:
+                return int(self.globals.get(key) or 0)
+            except ValueError:
+                return 0
+        counts = {'PASSWORD_MIN_LENGTH': len(password), 'PASSWORD_MIN_UPPERCASE_CHARS': sum(c.isupper() for c in password),
+                  'PASSWORD_MIN_LOWERCASE_CHARS': sum(c.islower() for c in password),
+                  'PASSWORD_MIN_NUMERIC_CHARS': sum(c.isdigit() for c in password),
+                  'PASSWORD_MIN_SPECIAL_CHARS': sum(not c.isalnum() for c in password)}
+        return [key for key, have in counts.items() if have < minimum(key)]
 
 
 def row_key(r):

@@ -401,6 +401,7 @@ ALLOWANCES = {
     'routines.py': {'pipeline'},  # the load target refusal (a pipeline INTO PROCEDURE whose procedure the replacement will not hold)
     'watch.py': {'pipeline', 'drop', 'truncate', 'grant'},     # PIPELINES state query, the write regex (DROP, TRUNCATE), grantee lookup
     'workspace.py': set(),  # the Management API read (P2) and the O1 workspace guard; no statement
+    'prompts.py': {'pipeline'},  # the pipeline credential prompts (P3, O9); the only statement is the PASSWORD_ variables read
     'report_md.py': set(),
     'ownersql.py': {'drop', 'grant', 'attach', 'pipeline', 'detach', 'kill'},  # account and cleanup blocks, attachment checks, pipeline block dispatch
     'switch.py': {'detach', 'attach', 'drop', 'pipeline', 'kill'},     # the state machine's statements, DROP at S2b and S4, pipeline count, DETACH KILL

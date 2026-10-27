@@ -547,8 +547,10 @@ class SystemProfileTests(unittest.TestCase):
 
 class HandlerTests(unittest.TestCase):
     def test_p3_and_o4_handlers_are_registered(self):
+        from s2rebuild import cli
         self.assertIs(steps.HANDLERS['P3'], I.handle_p3)
-        self.assertIs(steps.HANDLERS['O4'], I.handle_o4)
+        # W9: run takes the O4 capture itself (cli.handle_o4), which hands a capture already present to the inventory handler
+        self.assertIs(steps.HANDLERS['O4'], cli.handle_o4)
         cfg = config_from()
         with tempfile.TemporaryDirectory() as tmp:
             cfg = config_from(lambda d: d.update(paths={'runs_dir': tmp}))
