@@ -148,12 +148,17 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(est.tables, 6)
         self.assertEqual(est.rows, 639003650)
         labels = [label for label, _ in est.allowances]
-        self.assertEqual(labels, ['O3 freeze', 'O5 create replacement', 'O6 count proof', 'O7 post-copy', 'O8 fingerprints (budget)',
+        self.assertEqual(labels, ['O3 freeze', 'O5 create replacement', 'O6 count proof', 'O7 post-copy', 'O8 fingerprints (estimate)',
                                   'O9 pipelines', 'O10 switch', 'O11 release'])
         by = dict(est.allowances)
         self.assertEqual(by['O3 freeze'], 600.0)
         self.assertEqual(by['O9 pipelines'], 120.0)
-        self.assertEqual(by['O8 fingerprints (budget)'], 1800.0)
+        self.assertAlmostEqual(by['O8 fingerprints (estimate)'], 2 * 639003650 * E.DEFAULT_SCAN_S_PER_ROW / 4,
+                               msg='no budget: two scans per table over copy.workers sessions')
+        budgeted = config_from(lambda d: d.update(verify={'fingerprint_budget_minutes': 30, 'sessions': 8, 'full_fingerprint_max_rows': 100_000_000}))
+        self.assertEqual(dict(E.estimate(plans, budgeted, E.DEFAULT_BASELINE).allowances)['O8 fingerprints (budget)'], 1800.0)
+        self.assertAlmostEqual(E.fingerprint_seconds(plans, budgeted, E.DEFAULT_BASELINE, 8),
+                               2 * (639003650 - 600_000_000 * 0.95) * E.DEFAULT_SCAN_S_PER_ROW / 8, msg='the table over the threshold at 5 percent')
         self.assertAlmostEqual(by['O6 count proof'], 2 * 639003650 * E.DEFAULT_SCAN_S_PER_ROW / 4)
         low, expected, high = est.copy_band
         self.assertAlmostEqual(low, expected * 0.85)
@@ -174,7 +179,7 @@ class ModelTests(unittest.TestCase):
         self.assertLess(tight.spare_seconds, 0)
         self.assertIn('DOES NOT FIT', E.fit_lines(est, tight)[2])
         no_fp = config_from(lambda d: d.update(verify={'tiers': ['count']}))
-        self.assertEqual(dict(E.estimate(plans, no_fp, E.DEFAULT_BASELINE).allowances)['O8 fingerprints (budget)'], 0.0)
+        self.assertEqual(dict(E.estimate(plans, no_fp, E.DEFAULT_BASELINE).allowances)['O8 fingerprints (estimate)'], 0.0)
 
     def test_plan_sheet(self):
         cfg = config_from()

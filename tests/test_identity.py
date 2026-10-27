@@ -13,7 +13,7 @@ from pathlib import Path
 
 from s2rebuild import abandon, ownersql, switch
 from s2rebuild.common import KitError
-from s2rebuild.journal import COLUMNS, Journal, create_table_sql
+from s2rebuild.journal import COLUMNS, SCHEMA_VERSION, Journal, create_table_sql
 from s2rebuild.sqlutil import read_guard
 from tests.test_abandon import frozen_with_replacement
 from tests.test_copy import SRC, TGT
@@ -164,7 +164,7 @@ class RecordIdentityTests(unittest.TestCase):
             conn.close()
             j = Journal(path)
             self.addCleanup(j.close)
-            self.assertEqual(j.schema_version(), 3)
+            self.assertEqual(j.schema_version(), SCHEMA_VERSION)
             old = j.attachment('source')
             self.assertEqual((old['storage_id'], old['compute_id'], old['attach_type']), ('sid-1', 'cid-1', 'READWRITE'))
             self.assertEqual((old['record_type'], old['attach_syntax'], old['is_detached']), (None, None, None), 'a version 2 row has no record')

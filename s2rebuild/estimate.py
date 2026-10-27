@@ -271,6 +271,27 @@ class Estimate:
         return round(low / 60.0, 1), round(expected / 60.0, 1), round(high / 60.0, 1)
 
 
+def fingerprint_seconds(plans, config, baseline, sessions):
+    """Tier 3 wall seconds without a budget: two scans per table at the baseline scan rate, a table over
+    verify.full_fingerprint_max_rows at verify.sample_percent of it, spread over the sessions."""
+    total = 0.0
+    for p in plans:
+        fraction = config.verify.sample_percent / 100.0 if p.est_rows > config.verify.full_fingerprint_max_rows else 1.0
+        total += 2.0 * p.est_rows * baseline.scan_s_per_row * fraction
+    return total / max(1, int(sessions))
+
+
+def fingerprint_allowance(config, plans, baseline, workers):
+    """('O8 fingerprints (budget)', the budget) when verify.fingerprint_budget_minutes is set, else ('O8 fingerprints (estimate)',
+    fingerprint_seconds on verify.sessions or the workers); 0.0 without tier 3."""
+    budget = config.verify.fingerprint_budget_minutes
+    if 'fingerprint' not in config.verify.tiers:
+        return ('O8 fingerprints (estimate)', 0.0)
+    if budget is not None:
+        return ('O8 fingerprints (budget)', float(budget) * 60.0)
+    return ('O8 fingerprints (estimate)', fingerprint_seconds(plans, config, baseline, config.verify.sessions or workers))
+
+
 def allowances(config, plans, baseline, workers, pipeline_count=0):
     """The fixed allowances of section 10.6 as (label, seconds), in step order."""
     total_rows = sum(p.est_rows for p in plans)
@@ -279,7 +300,7 @@ def allowances(config, plans, baseline, workers, pipeline_count=0):
         ('O5 create replacement', ALLOWANCE_MINUTES['create_replacement'] * 60.0),
         ('O6 count proof', 2.0 * total_rows * baseline.scan_s_per_row / max(1, workers)),
         ('O7 post-copy', ALLOWANCE_MINUTES['post_copy'] * 60.0),
-        ('O8 fingerprints (budget)', config.verify.fingerprint_budget_minutes * 60.0 if 'fingerprint' in config.verify.tiers else 0.0),
+        fingerprint_allowance(config, plans, baseline, workers),
         ('O9 pipelines', PIPELINE_MINUTES_EACH * 60.0 * pipeline_count),
         ('O10 switch', ALLOWANCE_MINUTES['switch'] * 60.0),
         ('O11 release', ALLOWANCE_MINUTES['release'] * 60.0),

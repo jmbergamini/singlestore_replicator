@@ -17,7 +17,9 @@ re-copy of the stale check, so a re-copy never leaves a counter computed before 
 round that completes (every chunk done, count proof all match) marks O6 passed again. Before an O7 or O8 re-copy mark, the
 O10 block files of the database get a STOP (ownersql.retire_o10_blocks). An O7 re-copy round
 holds the copy lock (copy.copy_lock) from its mark through its copy, so it never runs while an
-O10 of another process waits for its go. Statements issued
+O10 of another process waits for its go. O8 runs the tiers of verify.py; with --yes and no
+chunk copied since the last O8 run it accepts the recorded result without a rerun, and with
+--fingerprint TABLE or --full TABLE it runs tier 3 for the named tables only. Statements issued
 through the owner guard of O7 naming the replacement: USE and CREATE VIEW, with SELECT on
 information_schema.VIEWS and USER_PRIVILEGES. Through the runner guard naming the replacement:
 SELECT MAX and COUNT, SHOW CREATE TABLE, ALTER TABLE AUTO_INCREMENT, AGGREGATOR SYNC
@@ -473,14 +475,37 @@ def handle_o7(step, ctx):
         session.close()
 
 
+def _o8_rerun(verifier, plans, ctx):
+    """Tier 3 for the tables named by --fingerprint TABLE (sampled at --percent N or verify.sample_percent) and --full TABLE."""
+    sampled = list(ctx.options.get('fingerprint') or [])
+    full = list(ctx.options.get('full') or [])
+    percent = ctx.options.get('percent')
+    both = sorted(set(sampled) & set(full))
+    if both:
+        raise KitError('%s named by both --fingerprint and --full; name a table once' % ', '.join(both))
+    results = []
+    if sampled:
+        results.extend(verifier.rerun(sampled, percent=percent))
+    if full:
+        results.extend(verifier.rerun(full, full=True))
+    return results
+
+
 def handle_o8(step, ctx):
-    """O8 handler: the configured tiers over every table, journal rows, the final workbook and report."""
+    """O8 handler: the configured tiers over every table, journal rows, the final workbook and report.
+
+    --fingerprint TABLE (--percent N) and --full TABLE run tier 3 for the named tables only.
+    --yes accepts the recorded result without a rerun when no chunk was copied since the last
+    O8 run (verify.recorded_state), and records an accepted event per sampled or not
+    fingerprinted table; a table sampled or left out by the budget otherwise ends the step pending.
+    """
     try:
         data, plans, directory = copy_module.load_plans(ctx)
     except KitError as exc:
         return copy_module._no_plans(step, ctx, exc)
     if not ctx.dry_run and ctx.journal.is_empty():
         return steps.Outcome(steps.REFUSED, 'the copy has not run in this journal; run O5 to O7 first', EXIT_REFUSED)
+    named = bool(ctx.options.get('fingerprint') or ctx.options.get('full'))
     session = ctx.runner_session(read_guard('runner O8'))
     try:
         if ctx.dry_run:
@@ -488,11 +513,24 @@ def handle_o8(step, ctx):
             return steps.Outcome(steps.PASSED, 'dry run: verification statements for %d tables printed' % len(plans))
         ctx.journal.check_plan(plans, ctx.db.source, ctx.db.replacement)
         baseline = estimate.load_baseline(ctx.config.resolve(ctx.config.estimate.baseline) if ctx.config.estimate.baseline else None)
-        verifier = verify.Verifier(session, ctx.db.source, ctx.db.replacement, plans, ctx.journal, ctx.config, baseline, ctx.log)
-        results = verifier.run()
+        tiers = list(ctx.config.verify.tiers)
+        verifier = verify.Verifier(session, ctx.db.source, ctx.db.replacement, plans, ctx.journal, ctx.config, baseline, ctx.log,
+                                   connector=ctx.runner_connector())
+        if named:
+            results = _o8_rerun(verifier, plans, ctx)
+        else:
+            recorded, reason = verify.recorded_state(ctx.journal, plans, tiers) if ctx.yes else (None, 'no --yes')
+            if recorded is not None:
+                to_accept, _ = verify.tables_to_accept(ctx.journal, plans, tiers)
+                lines = verify.accept_recorded(ctx.journal, to_accept, ctx.log)
+                _write_final_reports(ctx, data, plans, baseline)
+                return steps.Outcome(steps.PASSED, 'recorded result accepted without a rerun: no chunk was copied since the last O8 run%s' % (
+                    ('; ' + '; '.join(lines)) if lines else ''))
+            if ctx.yes:
+                ctx.log('O8 runs the tiers again: ' + reason)
+            results = verifier.run()
         for line in verify.summary_lines(results):
             ctx.log(line)
-        summary = verify.summarize(results)
         _write_final_reports(ctx, data, plans, baseline)
         targets = verify.recopy_targets(results, plans)
         if targets:
@@ -505,11 +543,25 @@ def handle_o8(step, ctx):
             hint = '; '.join('mark-recopy %s%s' % (t, '' if b is None else ' --bucket %d' % b) for t, b in targets)
             return steps.Outcome(steps.MISMATCH, 'verification mismatch; buckets marked for re-copy (%s); rerun O6 to O8 '
                                  '(s2rebuild run --from O6): the re-copy reopens O7 for the counters and the stale check' % hint, EXIT_MISMATCH)
-        sampled = summary.get(verify.TIER_FINGERPRINT, {}).get('sampled', [])
-        if sampled and not ctx.yes:
-            return steps.Outcome(steps.PENDING, 'tier 1 and 2 pass; tier 3 was sampled beyond the budget on %s; rerun step O8 --yes%s to accept, '
-                                 'or raise verify.fingerprint_budget_minutes' % (', '.join(sampled), steps.run_flag(ctx.run_id)), steps.EXIT_GATE)
-        return steps.Outcome(steps.PASSED, 'every tier passed (%d tables%s)' % (len(plans), ('; sampled accepted: ' + ', '.join(sampled)) if sampled else ''))
+        to_accept, missing = verify.tables_to_accept(ctx.journal, plans, tiers)
+        if missing:
+            return steps.Outcome(steps.PENDING, 'tier 3 of the named table(s) recorded; %s have no tier 3 result at the current re-copy epoch: '
+                                 'run step O8 without --fingerprint or --full%s' % (', '.join(missing), steps.run_flag(ctx.run_id)), steps.EXIT_GATE)
+        sampled = sorted(t for t, r in to_accept.items() if r['result'] == verify.SAMPLED)
+        budget = sorted(t for t, r in to_accept.items() if r['result'] == verify.NOT_FINGERPRINTED)
+        if to_accept and not ctx.yes:
+            parts = []
+            if sampled:
+                parts.append('tier 3 was sampled on ' + ', '.join('%s (%s rows, WHERE %s)' % (t, to_accept[t].get('sample_rows'), to_accept[t].get('predicate'))
+                                                                  for t in sampled))
+            if budget:
+                parts.append('not fingerprinted within verify.fingerprint_budget_minutes: ' + ', '.join(budget))
+            return steps.Outcome(steps.PENDING, 'tier 1 and 2 pass; %s; rerun step O8 --yes%s to accept the recorded result, step O8 --full TABLE%s '
+                                 'for a full fingerprint of one table, or raise verify.full_fingerprint_max_rows or '
+                                 'verify.fingerprint_budget_minutes and rerun' % ('; '.join(parts), steps.run_flag(ctx.run_id), steps.run_flag(ctx.run_id)),
+                                 steps.EXIT_GATE)
+        lines = verify.accept_recorded(ctx.journal, to_accept, ctx.log)
+        return steps.Outcome(steps.PASSED, 'every tier passed (%d tables%s)' % (len(plans), ('; ' + '; '.join(lines)) if lines else ''))
     finally:
         session.close()
 

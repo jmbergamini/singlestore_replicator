@@ -144,9 +144,12 @@ SCHEMA = {
     },
     'verify': {
         'tiers': Field('list', list(TIERS)),
-        'fingerprint_budget_minutes': Field('int', 30, minimum=0),
-        'fingerprint_groups': Field('int', 64, minimum=1),
-        'sample_percent_over_budget': Field('int', 5, minimum=0, maximum=100),
+        'sessions': Field('int', None, minimum=1, maximum=32, nullable=True),
+        'full_fingerprint_max_rows': Field('int', 1_000_000_000, minimum=0),
+        'sample_percent': Field('int', 5, minimum=1, maximum=100),
+        'fingerprint_budget_minutes': Field('int', None, minimum=1, nullable=True),
+        'fingerprint_groups': Field('int', 64, minimum=1, maximum=4096),
+        'value_columns': Field('int', 4, minimum=0, maximum=16),
     },
     'pipelines': {
         'route': Field('str', 'kit', choices=('kit', 'customer')),

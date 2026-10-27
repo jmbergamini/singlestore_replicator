@@ -239,9 +239,12 @@ copy:
   progress_seconds: 60
 verify:
   tiers: [count, newest, fingerprint]
-  fingerprint_budget_minutes: 30
+  sessions: null
+  full_fingerprint_max_rows: 1000000000
+  sample_percent: 5
+  fingerprint_budget_minutes: null
   fingerprint_groups: 64
-  sample_percent_over_budget: 5
+  value_columns: 4
 pipelines:
   route: kit                            # kit = the kit replays at O9; customer = the customer runs the placeholder file
   credentials_env: { KAFKA: S2REBUILD_KAFKA_CREDENTIALS, S3: S2REBUILD_S3_CREDENTIALS }
@@ -306,14 +309,14 @@ One SQLite journal per run per database: `customer/runs/<run>/<db>/journal.sqlit
 - `steps(step_id, status, started_utc, ended_utc, note, evidence_path)`: status is pending, running, passed, failed, skipped.
 - `tables(...)`: as in the reference runner plus `size_gib`, `time_column`, `key_kind`, `unique_key_lock_risk`, `concurrency`, `verified_at_utc`, `recopy_epoch` (0, plus one per re-copy mark).
 - `chunks(...)`: as in the reference runner (state, rows_inserted, timings, attempts, error, counts).
-- `verification(table_name, tier, result, source_value, target_value, sql_source, sql_target, detail, checked_utc, epoch)`: epoch is the table's `recopy_epoch` when the row was written.
+- `verification(table_name, tier, result, source_value, target_value, sql_source, sql_target, detail, checked_utc, epoch, predicate, sample_rows)`: epoch is the table's `recopy_epoch` when the row was written; predicate and sample_rows are the WHERE text and the source rows of a sampled fingerprint, NULL for a full one.
 - `attachments(role, database_name, storage_id, compute_id, attach_type, observed_utc)`: role is source, replacement, retained, live.
 - `grants_snapshot(grantee, privileges_json, captured_utc, restored_utc)`.
 - `pipelines(name, state_at_capture, source_type, source_location, target, batch_interval, duplicate_handling, definition_file, app_managed, created_in_replacement_utc, started_utc, state_after_start)`.
 - `pipeline_offsets(pipeline_name, source_partition, phase, earliest, latest, loaded, successful, observed_utc)`: phase is capture, before_start or after_release.
 - `events(ts, kind, detail)`.
 
-The `schema_version` row in meta is 3. Version 2 added `tables.recopy_epoch` and `verification.epoch`; version 3 added the branch record columns of `attachments` (`record_type`, `attach_syntax`, `is_detached`). A writable open upgrades an older journal in place, and the read-only opens of `status` and `owner-sql` read it as it is (every table at epoch 0 with no row at that epoch; attachment rows with the record fields unknown). Rows written before version 2 carry no epoch, so S0 asks for a new O8 on them.
+The `schema_version` row in meta is 4. Version 2 added `tables.recopy_epoch` and `verification.epoch`; version 3 added the branch record columns of `attachments` (`record_type`, `attach_syntax`, `is_detached`); version 4 added `verification.predicate` and `verification.sample_rows`. A writable open upgrades an older journal in place, and the read-only opens of `status` and `owner-sql` read it as it is (every table at epoch 0 with no row at that epoch; attachment rows with the record fields unknown; verification rows as full fingerprints). Rows written before version 2 carry no epoch, so S0 asks for a new O8 on them.
 
 Restart rules:
 
@@ -339,7 +342,7 @@ Load, validate and default the YAML. Expose `Config`, `DatabaseSpec`, `Window`. 
 
 ### 10.3 journal.py
 
-The schema in section 9 plus migrations keyed by a `schema_version` row (version 1 from the reference runner, version 2 for the re-copy epoch). All writes go through one lock. `init_plan`, `check_plan`, chunk state transitions, step transitions, verification rows, attachment rows.
+The schema in section 9 plus migrations keyed by a `schema_version` row (version 1 from the reference runner, version 2 for the re-copy epoch, 3 for the branch records, 4 for the sampling columns). All writes go through one lock. `init_plan`, `check_plan`, chunk state transitions, step transitions, verification rows, attachment rows.
 
 ### 10.4 steps.py
 
@@ -450,11 +453,21 @@ Tier 3, fingerprint, grouped so a mismatch maps to a re-copy unit:
 ```sql
 SELECT CRC32(<key_expr>) MOD <B> AS grp, COUNT(*) AS n,
        SUM(CRC32(<key_expr>)) AS key_hash,
-       SUM(CRC32(CONCAT_WS('|', <time_column or up to 4 value columns, COALESCE each>))) AS value_hash
-FROM <db>.<table> GROUP BY grp
+       SUM(CRC32(CONCAT_WS('|', <time_column>, <up to value_columns supported columns>, COALESCE each))) AS value_hash
+FROM <db>.<table> [WHERE <range predicate>] GROUP BY grp
 ```
 
-`B` is the table's bucket count, or `fingerprint_groups` for single-bucket tables. Both sides are compared group by group; a mismatching group names the bucket to re-copy with `mark-recopy TABLE --bucket N`. Cost is estimated as two scans per table at the baseline scan rate; tables are fingerprinted smallest first until `fingerprint_budget_minutes` is used. Tables beyond the budget get a sampled fingerprint (`WHERE CRC32(<key_expr>) MOD 100 < sample_percent_over_budget`) and are marked "sampled" in the report. The SQL for both sides is stored in the journal and shown on the table's Excel tab.
+`B` is the table's bucket count, or `fingerprint_groups` for single-bucket tables. Both sides are compared group by group; a mismatching group names the bucket to re-copy with `mark-recopy TABLE --bucket N`. The value hash always takes the time column plus up to `verify.value_columns` (default 4) supported non-key columns (JSON, BSON, GEOGRAPHY, GEOGRAPHYPOINT, VECTOR and binary types are left out), so a payload change with the key and the timestamp intact is seen.
+
+Parallel: tier 3 runs on `verify.sessions` connections (default `copy.workers`), each a worker thread with its own runner connection (`ctx.runner_connector`, as the copy workers). The tables are queued largest first, the source and replacement sides of a table as neighbors, so the two sides run at the same time and the long tables overlap the short ones. One log line per table carries the result and the elapsed seconds. Tiers 1 and 2 stay on the step session, table by table.
+
+Sampling by design: a table with more rows than `verify.full_fingerprint_max_rows` (default 1,000,000,000; the journal's source count from tier 1, else the estimate) gets a `verify.sample_percent` (default 5) sample as a contiguous range on its first sort key column, or on its time column when the sort key is empty or not orderable: `MIN` and `MAX` of that column are read from the source, the range runs from the minimum over that percent of the value span, and the same `WHERE <column> >= lo AND <column> <= cut` predicate goes to both sides, so segment elimination skips the rest. A table over the threshold with no orderable sort key or time column gets a full fingerprint with a note in its detail. The verification row carries the predicate and the rows in the sample, the table's Excel tab shows both, and the result is "sampled". Hash buckets are not used for sampling: `CRC32(key) MOD 100 < p` scans the whole table (fact 39).
+
+Budget: `verify.fingerprint_budget_minutes` (default none) is an elapsed deadline from the start of tier 3. A table whose turn comes after it is recorded "not fingerprinted" with the budget in its detail; a table started before it finishes. O8 then ends pending, and passes only with `--yes`.
+
+Rerun flags: `s2rebuild step O8 --fingerprint TABLE --percent N` (repeatable; the percent defaults to `verify.sample_percent`) and `--full TABLE` run tier 3 for the named tables only and record the result at the current re-copy epoch; the other tables keep their recorded result, and the step's outcome is read from the newest tier 3 row of every table at that epoch. A table named that is not in the plan is refused before any statement.
+
+Acceptance without a rerun: `step O8 --yes` accepts the recorded result when no chunk was copied since the last O8 run: every planned table has every chunk done, a row of every configured tier at its current re-copy epoch, none a mismatch, and no chunk ended after those rows (`verify.recorded_state`). Then no tier runs, and an `accepted` event records "accepted sampled fingerprint for TABLE at re-copy epoch N" (or "accepted not fingerprinted TABLE ... (budget)") per table; a later `--yes` at the same epoch records nothing twice. When a chunk was copied since (a re-copy at a new epoch), `--yes` runs the tiers again first. `gate O8` stays refused: O8 is a python step the kit records itself.
 
 Stale check (O7): tier 1 and tier 2 across all tables, 40 seconds on the reference run. A mismatch marks the table for re-copy; the kit re-runs O6 for the marked buckets and repeats the check until zero mismatches. A round that completes (every chunk done, count proof all match) marks O6 passed again, since it did the O6 work for those buckets.
 
@@ -661,6 +674,7 @@ Verified on the reference run or in the documentation. `docs/LESSONS.md` carries
 36. Engine 10.8.0: `TABLE_STATISTICS` reports no rows for a reference table, so its estimate would be 0 and its plan would schedule nothing. The capture marks each `CREATE [ROWSTORE] REFERENCE TABLE` as `reference` (`inventory.is_reference`) and counts it with `SELECT COUNT(*)` at P3 and O4 whatever `--exact-counts` says; the plan gives it one bucket on the staging path (`TablePlan.copy_path`), the estimate charges its rows at the insert rate twice (`estimate.reference_seconds`), and `tables.csv` and the table tab carry the mark. The test fake answers TABLE_STATISTICS without the reference tables.
 37. Engine 10.8.0: the runner sees no routine in `information_schema.ROUTINES` (fact 21) and no other account's grants, so `routines.capture` and the write-capable account list read through the owner session only: ROUTINES with DEFINER, `SHOW AGGREGATES` in the database, and `SHOW CREATE FUNCTION`, `SHOW CREATE AGGREGATE` or `SHOW CREATE PROCEDURE` per routine. P2 without the owner profile prints "routines: not visible to the runner; owner profile needed" and never "none". The replacement gets the routines in dependency order (`routines.O5_KINDS` after the tables, `routines.O7_KINDS` after the views), and the S3 count is the ROUTINES number the O7 gate recorded (`routines.ROUTINE_COUNT_META`). The test fake lists ROUTINES to the admin only.
 38. Engine 10.8.0, Portal, October 27: the Portal may show 0 rows for the tables of a READ ONLY attachment (the frozen source). The kit's own counts in the journal and the O4 capture are the reference; `freeze.finish_freeze` logs `PORTAL_ROWS_NOTE` after the probe. On Path A the O4 capture records `PIPELINES_READ_ONLY_NOTE` instead of listing `PIPELINES` (empty there, fact 23), `inventory.pipeline_drift` compares nothing and the drift report carries the note; O9 replays the O2 capture.
+39. Engine 10.8.0, tpcds3tb, October 27: a sampled fingerprint with `CRC32(key) MOD 100 < p` reads every row, so a 5 percent sample cost as much as a full fingerprint, and one session fingerprinted one side of one table at a time. Tier 3 samples a contiguous range on the first sort key column or the time column (`MIN` and `MAX` from the source, the same predicate on both sides), so segment elimination skips the rest, and runs on `verify.sessions` connections, largest table first with its two sides at once (`Verifier.tier3_all`); `--yes` accepts the recorded result without a rerun when no chunk was copied since (`verify.recorded_state`).
 
 ## 12. Documentation and branding
 
@@ -723,7 +737,7 @@ Listed for `docs/CODE-GUIDE.md`. Each names the module and the one place to edit
 | Freeze default | Read-only attachment | `freeze.mode: lockout`; the lockout loop also runs as a bridge during a slow detach |
 | Switch order | Retained branch first, then live | Live first saves one step; the current order keeps the live name unambiguous |
 | Replacement after switch | Dropped at S4, inside the switch, after S3's checks; the live branch is independent of it | Leave it attached and drop it at C3 (the pre-1.0 flow): one more entry on the workspace and a DROP in the close-out instead of the window |
-| Verification depth | Count, newest, grouped fingerprint within a budget | Full fingerprint on every table (`fingerprint_budget_minutes` very large) or count only |
+| Verification depth | Count, newest, grouped fingerprint; a table over `full_fingerprint_max_rows` sampled as a range | Full fingerprint on every table (`full_fingerprint_max_rows` above the largest table, or `step O8 --full TABLE`) or count only |
 | View definers | Created by the owner session; the original DEFINER kept while its account exists and is not the runner, else the owner account | Always the owner account, or a named service account: `postcopy.definer_choice` |
 | Counters | The larger of the source counter and MAX+1, then sync on every aggregator (ALL) | MAX+1 only, or the source counter only; `postcopy.counter_value` |
 | Admin steps | Execute with gates when the owner profile exists | Print only (no owner profile) or the generated notebook |

@@ -148,16 +148,17 @@ class SchemaTests(unittest.TestCase):
 
     def test_f4_version_1_journal_upgrades_in_place_to_version_2(self):
         """A version 1 journal gains tables.recopy_epoch (0) and verification.epoch (unknown for the rows it holds), then the version 3
-        attachment record columns, and keeps its data."""
+        attachment record columns and the version 4 sampling columns of verification, and keeps its data."""
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'v1.sqlite'
             version_1_journal(path)
             j = Journal(path)
-            self.assertEqual((j.schema_version(), SCHEMA_VERSION), (3, 3))
+            self.assertEqual((j.schema_version(), SCHEMA_VERSION), (4, 4))
             for table, cols in COLUMNS.items():
                 self.assertEqual(set(j._existing_columns(table)), {c for c, _ in cols}, table)
             self.assertEqual(j.recopy_epoch('t1'), 0)
             self.assertIsNone(j.verifications('t1')[0]['epoch'], 'a version 1 row has no epoch: S0 asks for a new O8')
+            self.assertEqual((j.verifications('t1')[0]['predicate'], j.verifications('t1')[0]['sample_rows']), (None, None), 'a full fingerprint')
             self.assertEqual(j.step_status('O8'), 'passed')
             state = j.verification_state()[0]
             self.assertEqual((state['table_name'], state['verified_at_utc'], state['epoch_verified']), ('t1', '2026-11-01T06:00:00Z', 0))
@@ -166,7 +167,7 @@ class SchemaTests(unittest.TestCase):
             self.assertEqual(j.verification_state()[0]['epoch_verified'], 1)
             j.close()
             again = Journal(path)
-            self.assertEqual(again.schema_version(), 3)
+            self.assertEqual(again.schema_version(), 4)
             again.close()
 
     def test_f4_read_only_open_reads_a_version_1_journal_without_changing_it(self):

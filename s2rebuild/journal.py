@@ -12,8 +12,9 @@ switch state in their own BEGIN IMMEDIATE transaction, so of a re-copy and a go 
 to commit goes ahead. The attachments table holds the branch record per role (source,
 replacement, retained, live): name, STORAGE_ID, COMPUTE_ID, the attachment type, the record type
 (create, resume, pitr), the ATTACH_SYNTAX and whether it is detached; a row of either attachment
-view completes the latest row of the same record (schema version 3). Statements issued by this
-module: SQLite statements against the journal file only.
+view completes the latest row of the same record (schema version 3). A verification row carries
+the sampling predicate and the rows in the sample when tier 3 sampled (schema version 4).
+Statements issued by this module: SQLite statements against the journal file only.
 """
 import json
 import sqlite3
@@ -22,7 +23,7 @@ from pathlib import Path
 
 from .common import KitError, iso, utc_now
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 MEMORY = ':memory:'
 STEP_STATUSES = ('pending', 'running', 'passed', 'failed', 'skipped')
 CHUNK_STATES = ('pending', 'started', 'done', 'failed')
@@ -53,7 +54,7 @@ COLUMNS = {
     'verification': [('id', 'INTEGER PRIMARY KEY AUTOINCREMENT'), ('table_name', 'TEXT NOT NULL'), ('tier', 'TEXT NOT NULL'),
                      ('result', 'TEXT NOT NULL'), ('source_value', 'TEXT'), ('target_value', 'TEXT'),
                      ('sql_source', 'TEXT'), ('sql_target', 'TEXT'), ('detail', 'TEXT'), ('checked_utc', 'TEXT NOT NULL'),
-                     ('epoch', 'INTEGER')],
+                     ('epoch', 'INTEGER'), ('predicate', 'TEXT'), ('sample_rows', 'INTEGER')],
     'attachments': [('id', 'INTEGER PRIMARY KEY AUTOINCREMENT'), ('role', 'TEXT NOT NULL'), ('database_name', 'TEXT NOT NULL'),
                     ('storage_id', 'TEXT'), ('compute_id', 'TEXT'), ('attach_type', 'TEXT'), ('observed_utc', 'TEXT NOT NULL'),
                     ('record_type', 'TEXT'), ('attach_syntax', 'TEXT'), ('is_detached', 'INTEGER')],
@@ -71,7 +72,8 @@ COLUMNS = {
 TABLE_CONSTRAINTS = {'chunks': 'PRIMARY KEY (table_name, bucket)'}
 # Columns a later schema version added to a version 1 journal, by the version that added them.
 ADDED_COLUMNS = {2: {'tables': [('recopy_epoch', 'INTEGER NOT NULL DEFAULT 0')], 'verification': [('epoch', 'INTEGER')]},
-                 3: {'attachments': [('record_type', 'TEXT'), ('attach_syntax', 'TEXT'), ('is_detached', 'INTEGER')]}}
+                 3: {'attachments': [('record_type', 'TEXT'), ('attach_syntax', 'TEXT'), ('is_detached', 'INTEGER')]},
+                 4: {'verification': [('predicate', 'TEXT'), ('sample_rows', 'INTEGER')]}}
 # Steps whose evidence a re-copy invalidates, with the note mark_recopy records when it reopens them.
 RECOPY_REOPENS = (('O6', 'buckets of %s marked for re-copy; rerun O6'),
                   ('O7', 'counters and stale check predate the re-copy of %s; rerun O7 after O6'),
@@ -217,6 +219,8 @@ class Journal:
                 self._migrate_to_2()
             if version < 3:
                 self._migrate_to_3()
+            if version < 4:
+                self._migrate_to_4()
             self.conn.execute("INSERT INTO meta (key, value) VALUES ('schema_version', ?) "
                               'ON CONFLICT(key) DO UPDATE SET value = excluded.value', (str(SCHEMA_VERSION),))
 
@@ -245,6 +249,10 @@ class Journal:
     def _migrate_to_3(self):
         """Version 3: the branch record per attachment (record_type, attach_syntax, is_detached); rows written before stay readable with NULLs."""
         self._add_columns(3)
+
+    def _migrate_to_4(self):
+        """Version 4: the sampling predicate and the rows in the sample on verification rows; older rows read NULL (a full fingerprint)."""
+        self._add_columns(4)
 
     def _add_columns(self, version):
         self.conn.execute('BEGIN')
@@ -668,16 +676,19 @@ class Journal:
 
     # -- verification -----------------------------------------------------------
     def record_verification(self, table, tier, result, source_value=None, target_value=None, sql_source=None,
-                            sql_target=None, detail=None):
+                            sql_target=None, detail=None, predicate=None, sample_rows=None):
         """Append one verification row at the table's current recopy_epoch; a result of 'match' also stamps verified_at_utc.
 
-        Returns the time of the row.
+        predicate is the WHERE text of a sampled fingerprint and sample_rows the source rows it
+        covered; both stay NULL for a full fingerprint. Returns the time of the row.
         """
         now = iso(utc_now())
         self._q('INSERT INTO verification (table_name, tier, result, source_value, target_value, sql_source, sql_target, '
-                'detail, checked_utc, epoch) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, (SELECT recopy_epoch FROM tables WHERE table_name = ?))',
+                'detail, checked_utc, epoch, predicate, sample_rows) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '
+                '(SELECT recopy_epoch FROM tables WHERE table_name = ?), ?, ?)',
                 (table, tier, result, None if source_value is None else str(source_value),
-                 None if target_value is None else str(target_value), sql_source, sql_target, detail, now, table))
+                 None if target_value is None else str(target_value), sql_source, sql_target, detail, now, table, predicate,
+                 None if sample_rows is None else int(sample_rows)))
         if result == 'match':
             self.set_table_attr(table, 'verified_at_utc', now)
         return now

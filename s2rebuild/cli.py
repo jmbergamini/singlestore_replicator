@@ -152,6 +152,10 @@ def build_parser():
     p['step'].add_argument('--retry-failed', action='store_true', help='O6: also rerun chunks parked after copy.max_attempts failures')
     p['step'].add_argument('--no-rehearsal', metavar='NOTE', help='O1 only: start without rehearsal evidence; the note is recorded as an event and in the O1 note')
     p['step'].add_argument('--idle-workload', metavar='NOTE', help='C1 only: pass without application writes seen; why the live database is idle')
+    p['step'].add_argument('--fingerprint', metavar='TABLE', action='append',
+                           help='O8 only: run tier 3 for this table only, sampled (repeatable; the other tables keep their recorded result)')
+    p['step'].add_argument('--percent', metavar='N', type=int, help='O8 with --fingerprint: the sample percent (default verify.sample_percent)')
+    p['step'].add_argument('--full', metavar='TABLE', action='append', help='O8 only: run a full tier 3 fingerprint for this table only (repeatable)')
     p['gate'].add_argument('step_id', metavar='ID', help='step id such as O3')
     decision = p['gate'].add_mutually_exclusive_group(required=True)
     decision.add_argument('--pass', dest='passed', action='store_true', help='the gate passed')
@@ -456,11 +460,27 @@ def cmd_step(args, env, out, state):
             options['fresh_table'] = args.fresh_table
         if args.idle_workload:
             options['idle_workload'] = args.idle_workload
+        options.update(_o8_options(args, step))
         sessions = inv.open_sessions()
         return steps.run_one(inv.config, inv.databases, inv.journals, log, step.id, run_id=inv.run_id, redo=args.redo,
                              dry_run=inv.dry_run, yes=args.yes, verbose=args.verbose, options=options, sessions=sessions)
     finally:
         inv.close()
+
+
+def _o8_options(args, step):
+    """The O8 rerun options of step: --fingerprint TABLE (repeatable) with --percent N, and --full TABLE; refused on another step."""
+    named = {'fingerprint': args.fingerprint, 'full': args.full, 'percent': args.percent}
+    given = sorted(k for k, v in named.items() if v is not None)
+    if not given:
+        return {}
+    if step.id != 'O8':
+        raise KitError('--%s applies to step O8 only' % given[0])
+    if args.percent is not None and not args.fingerprint:
+        raise KitError('--percent needs --fingerprint TABLE')
+    if args.percent is not None and not 1 <= args.percent <= 100:
+        raise KitError('--percent must be between 1 and 100')
+    return {k: v for k, v in named.items() if v is not None}
 
 
 def _gate_warnings(inv, step):

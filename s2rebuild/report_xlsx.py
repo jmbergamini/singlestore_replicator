@@ -431,6 +431,8 @@ def final_summary_rows(inventory, plans, journal, config, db, run_id, name_map=N
     rows.append(('Tables without a time column', ', '.join(p.name for p in plans if not p.time_column) or 'none'))
     sampled = sorted({r['table_name'] for r in verifications if r['result'] == 'sampled'})
     rows.append(('Sampled tables', ', '.join(sampled) or 'none'))
+    skipped = sorted({table for (tier, table), result in tier_results.items() if tier == 'fingerprint' and result == verify.NOT_FINGERPRINTED})
+    rows.append(('Not fingerprinted (budget)', ', '.join(skipped) or 'none'))
     verified = [t['verified_at_utc'] for t in journal.tables() if t.get('verified_at_utc')]
     rows.append(('Oldest verified_at', min(verified) if verified else 'none'))
     rows.append((None, None))
@@ -517,6 +519,8 @@ def final_table_rows(table, plan, journal, per_table):
     rows.extend([(None, None), ('Tier 3 fingerprint', None),
                  ('Result', t3['result'] if t3 else 'not run'), ('Groups compared', t3['detail'] if t3 else None),
                  ('Sampled or full', ('sampled' if t3['result'] == 'sampled' or 'sampled' in (t3['detail'] or '') else 'full') if t3 else None),
+                 ('Sample predicate', (t3.get('predicate') or 'none (full fingerprint)') if t3 else None),
+                 ('Rows in sample', t3.get('sample_rows') if t3 else None),
                  ('SQL source side', t3['sql_source'] if t3 else None), ('SQL target side', t3['sql_target'] if t3 else None),
                  ('Verified at', jt.get('verified_at_utc')),
                  (None, None), ('Attributes', None),

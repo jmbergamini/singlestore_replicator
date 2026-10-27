@@ -1,15 +1,18 @@
-"""s2rebuild tests test_verify: tier selection, grouped fingerprints and bucket mapping, budget and sampling, verified_at rule.
+"""s2rebuild tests test_verify: tier selection, grouped fingerprints and bucket mapping, parallel tier 3, range sampling, the budget
+deadline, the rerun flags, acceptance without a rerun, verified_at rule.
 
 Author: John Bergamini
 """
+import functools
 import unittest
+from unittest import mock
 
 from s2rebuild import copy as C
 from s2rebuild import estimate as E
 from s2rebuild import inventory as I
 from s2rebuild import steps
 from s2rebuild import verify as V
-from s2rebuild.common import EXIT_DONE
+from s2rebuild.common import EXIT_DONE, KitError
 from s2rebuild.connect import DryRunSession, Log
 from s2rebuild.sqlutil import read_guard, runner_guard
 from tests.fakedb import SimulatedCrash, crc32, key_text, multiset
@@ -86,6 +89,26 @@ def assert_counter_follows(test, h, table, after_kind):
     test.assertEqual(h.fake.databases[TGT]['tables'][table]['auto_increment'], counters[-1][1]['target_after'])
 
 
+SORTED_TABLES = dict(FIXTURE_TABLES)
+_SINGLE = FIXTURE_TABLES['t_single']
+# t_single as a columnstore table sorted on its integer column n, so a sampled fingerprint ranges over n
+SORTED_TABLES['t_single'] = (_SINGLE[0], _SINGLE[1], _SINGLE[2], _SINGLE[3].replace('PRIMARY KEY (`id`)\n', 'PRIMARY KEY (`id`),\n  SORT KEY (`n`)\n'))
+
+
+def sampled_harness(test, threshold, percent=5, time_column=None, **kw):
+    """A copied harness whose t_single carries SORT KEY (`n`), with verify.full_fingerprint_max_rows at threshold and the sample percent."""
+    def mutate(d):
+        d.update(verify=dict({'full_fingerprint_max_rows': threshold, 'sample_percent': percent}, **kw))
+        if time_column:
+            d['databases'][0].update(time_column_candidates=[time_column])
+    return copied(test, tables=SORTED_TABLES, mutate=mutate)
+
+
+def fingerprints_since(h, start):
+    """The fingerprint statements the fake saw from position start of its statement list."""
+    return [s for s, _ in h.fake.statements[start:] if s.startswith('SELECT CRC32(')]
+
+
 def run_from_o6(h, to_id='O8'):
     """The operator's rerun: s2rebuild run --from O6 --to to_id on the harness journal; returns the exit code."""
     return steps.run_steps(h.config, [h.db], {h.db.source: h.journal}, h.log, run_id=h.run_id, from_id='O6', to_id=to_id,
@@ -101,13 +124,23 @@ class SqlTests(unittest.TestCase):
         self.assertEqual(V.value_expr(plan), "CONCAT_WS('|', COALESCE(`v`, ''), COALESCE(`w`, ''), COALESCE(`x`, ''), COALESCE(`y`, ''))",
                          'up to four non-key columns')
         plan.time_column = 'u'
-        self.assertEqual(V.value_expr(plan), "CONCAT_WS('|', COALESCE(`u`, ''))", 'the time column alone when present')
-        sql = V.fingerprint_sql('d', plan, 3)
+        self.assertEqual(V.value_expr(plan), "CONCAT_WS('|', COALESCE(`u`, ''), COALESCE(`v`, ''), COALESCE(`w`, ''), COALESCE(`x`, ''), "
+                                             "COALESCE(`y`, ''))", 'the time column plus up to four value columns, always')
+        self.assertEqual(V.value_expr(plan, 1), "CONCAT_WS('|', COALESCE(`u`, ''), COALESCE(`v`, ''))", 'verify.value_columns bounds the rest')
+        plan.column_types = {'v': 'json', 'w': 'blob', 'x': 'double'}
+        self.assertEqual(V.value_columns_for(plan), ['u', 'x', 'y', 'z'], 'unsupported types are left out')
+        sql = V.fingerprint_sql('d', plan, 3, value_columns=1)
         self.assertEqual(sql, "SELECT CRC32(`id`) MOD 3 AS grp, COUNT(*) AS n, SUM(CRC32(`id`)) AS key_hash, "
-                              "SUM(CRC32(CONCAT_WS('|', COALESCE(`u`, '')))) AS value_hash FROM `d`.`t` GROUP BY grp")
-        self.assertTrue(V.fingerprint_sql('d', plan, 64, 5).endswith('WHERE CRC32(`id`) MOD 100 < 5 GROUP BY grp'))
-        for text in (sql, V.fingerprint_sql('d', plan, 64, 5), V.newest_sql('d', 't', 'u')):
+                              "SUM(CRC32(CONCAT_WS('|', COALESCE(`u`, ''), COALESCE(`x`, '')))) AS value_hash FROM `d`.`t` GROUP BY grp")
+        sampled = V.fingerprint_sql('d', plan, 64, V.range_predicate('id', 10, 19))
+        self.assertTrue(sampled.endswith('WHERE `id` >= 10 AND `id` <= 19 GROUP BY grp'))
+        for text in (sql, sampled, V.newest_sql('d', 't', 'u')):
             read_guard().check(text)
+        self.assertEqual(V.sample_cut(0, 699, 10), 69, 'an integer span: the floor')
+        self.assertEqual(str(V.sample_cut('1.5', '3.5', 50)), '2.5', 'a decimal span')
+        self.assertEqual(V.sql_literal(V.sample_cut('2026-01-01 00:00:00', '2026-01-02 00:00:00', 25)), "'2026-01-01 06:00:00.000000'")
+        self.assertIsNone(V.sample_cut('id-1', 'id-9', 5), 'text cannot be spanned')
+        self.assertEqual(V.sql_literal("it's"), "'it''s'")
         from tests.helpers import config_from
         cfg = config_from()
         self.assertEqual(V.fingerprint_groups(plan, cfg), 3)
@@ -174,19 +207,28 @@ class TierTests(unittest.TestCase):
         again = V.Verifier(session, SRC, TGT, plans, h.journal, h.config).run()
         self.assertFalse([r for r in again if r.result == V.MISMATCH])
 
-    def test_budget_smallest_first_then_sampled(self):
-        h = copied(self, mutate=lambda d: d.update(verify={'fingerprint_budget_minutes': 400001, 'sample_percent_over_budget': 50}))
-        session = h.sessions.runner(read_guard())
-        baseline = E.Baseline(scan_s_per_row=1.0, insert_s_per_row=1.0, chunk_overhead_s=0)
-        results = V.Verifier(session, SRC, TGT, h.plans(), h.journal, h.config, baseline).run(tiers=[V.TIER_FINGERPRINT])
-        by = {r.table: r for r in results}
-        self.assertEqual(by['t_empty'].result, V.MATCH, 'the empty table costs nothing')
-        self.assertEqual(by['t_comp'].result, V.MATCH, '200 s fits; smallest first spends it before the 24 million second table')
-        self.assertEqual(by['t_nokey'].result, V.SAMPLED, 'largest first would have fitted this one and sampled t_comp instead')
-        self.assertEqual(by['t_single'].result, V.SAMPLED)
-        self.assertIn('sampled 50 percent', by['t_single'].detail)
-        self.assertTrue(by['t_single'].sql_source.endswith('WHERE CRC32(`id`) MOD 100 < 50 GROUP BY grp'))
-        self.assertEqual(V.summarize(results)[V.TIER_FINGERPRINT]['sampled'], ['t_nokey', 't_single'])
+    def test_budget_deadline_marks_the_tables_after_it_not_fingerprinted(self):
+        """verify.fingerprint_budget_minutes is an elapsed deadline (a fake clock that steps 25 s per reading): the largest table is
+        fingerprinted inside the minute, the three behind it are recorded not fingerprinted, O8 ends pending, and --yes accepts the
+        recorded result without a rerun."""
+        h = copied(self, mutate=lambda d: d.update(verify={'fingerprint_budget_minutes': 1}))
+        self.assertEqual(h.step('O7').status, steps.PASSED, h.text())
+        ticks = iter(range(0, 100000, 25))
+        with mock.patch.object(V, 'Verifier', functools.partial(V.Verifier, clock=lambda: float(next(ticks)))):
+            out8 = h.step('O8')
+        self.assertEqual((out8.status, out8.exit_code), (steps.PENDING, 4), h.text())
+        self.assertIn('not fingerprinted within verify.fingerprint_budget_minutes: t_comp, t_empty, t_nokey', out8.note)
+        by = {r['table_name']: r for r in h.journal.verifications(tier=V.TIER_FINGERPRINT)}
+        self.assertEqual(by['t_single']['result'], V.MATCH)
+        self.assertEqual({t: by[t]['result'] for t in ('t_comp', 't_empty', 't_nokey')}, {t: V.NOT_FINGERPRINTED for t in ('t_comp', 't_empty', 't_nokey')})
+        self.assertEqual(by['t_comp']['detail'], 'budget: verify.fingerprint_budget_minutes 1 elapsed before this table')
+        self.assertIn('tier 3 t_single: match in 25.0 s', h.text(), 'one log line per table with the elapsed seconds')
+        self.assertIn('tier fingerprint: 1 match, 0 mismatch, 0 sampled, 3 not fingerprinted', h.text())
+        start = len(h.fake.statements)
+        out = h.step('O8', yes=True)
+        self.assertEqual(out.status, steps.PASSED, h.text())
+        self.assertEqual(h.fake.statements[start:], [], 'the acceptance issues no query')
+        self.assertEqual(h.journal.events(V.ACCEPTED_EVENT), ['accepted not fingerprinted %s at re-copy epoch 0 (budget)' % t for t in ('t_comp', 't_empty', 't_nokey')])
 
     def test_tier2_newest_mismatch_with_equal_counts(self):
         h = copied(self, mutate=lambda d: d['databases'][0].update(time_column_candidates=['b']))
@@ -364,11 +406,15 @@ class StaleCheckAndHandlersTests(unittest.TestCase):
         self.assertEqual(h.step('O8').status, steps.PASSED)
 
     def test_o8_sampled_needs_yes(self):
-        h = copied(self, mutate=lambda d: d.update(verify={'fingerprint_budget_minutes': 0}))
+        """A table over verify.full_fingerprint_max_rows is sampled and O8 ends pending until --yes; the threshold reads the journal's
+        source count, so t_nokey (500 rows) at a threshold of 500 is a full fingerprint."""
+        h = sampled_harness(self, threshold=500)
         self.assertEqual(h.step('O7').status, steps.PASSED, h.text())
         out8 = h.step('O8')
         self.assertEqual((out8.status, out8.exit_code), (steps.PENDING, 4), h.text())
         self.assertIn('rerun step O8 --yes', out8.note)
+        by = {r['table_name']: r for r in h.journal.verifications(tier=V.TIER_FINGERPRINT)}
+        self.assertEqual((by['t_single']['result'], by['t_nokey']['result'], by['t_nokey']['predicate']), (V.SAMPLED, V.MATCH, None))
         self.assertEqual(h.step('O8', yes=True).status, steps.PASSED)
 
     def test_handlers_refuse_before_the_copy_and_print_in_dry_run(self):
@@ -390,6 +436,161 @@ class StaleCheckAndHandlersTests(unittest.TestCase):
         self.assertEqual(h.step('O8', dry_run=True).status, steps.PASSED)
         self.assertIn('DRY RUN: SELECT COUNT(*) AS n FROM `%s`.`t_single`' % TGT, h.text())
         self.assertEqual(h.fake.connections, [], 'a dry run opens no connection')
+
+
+class ReworkTests(unittest.TestCase):
+    """W7: tier 3 in parallel on its own sessions, sampled by a contiguous range, the rerun flags and acceptance without a rerun."""
+
+    def test_tier3_runs_largest_first_both_sides_at_once_on_its_own_sessions(self):
+        h = copied(self, mutate=lambda d: d.update(verify={'sessions': 3}))
+        session = h.sessions.runner(read_guard())
+        before, start = len(h.fake.connections), len(h.fake.statements)
+        verifier = V.Verifier(session, SRC, TGT, h.plans(), h.journal, h.config, log=h.log, connector=h.sessions.runner_connector())
+        results = verifier.run(tiers=[V.TIER_FINGERPRINT])
+        self.assertEqual([r.table for r in results], ['t_single', 't_nokey', 't_comp', 't_empty'], 'largest first')
+        self.assertTrue(all(r.result == V.MATCH for r in results))
+        self.assertEqual(len(h.fake.connections) - before, 3, 'verify.sessions connections of their own, not copy.workers (2)')
+        self.assertTrue(all(c.closed for c in h.fake.connections[before:]), 'closed after the tier')
+        self.assertEqual([(t, side) for t, side, _ in verifier.schedule],
+                         [(t, side) for t in ('t_single', 't_nokey', 't_comp', 't_empty') for side in (V.SIDE_SOURCE, V.SIDE_TARGET)],
+                         'the two sides of a table are handed out together, so they run at the same time')
+        self.assertEqual(sorted(fingerprints_since(h, start)), sorted([r.sql_source for r in results] + [r.sql_target for r in results]))
+        self.assertEqual(session.statements, [], 'tier 3 never runs on the step session')
+        for r in results:
+            self.assertIsNotNone(r.seconds)
+            self.assertIn('tier 3 %s: match in ' % r.table, h.text(), 'one log line per table with the elapsed seconds')
+        self.assertIn('tier 3: 4 tables on 3 sessions, largest first', h.text())
+
+    def test_threshold_samples_the_time_range_and_notes_a_table_without_an_orderable_column(self):
+        """Over the threshold: t_comp (300 rows, time column b) gets a 5 percent range of b on both sides; t_single and t_nokey have no
+        sort key or time column, so they get a full fingerprint with a note; the workbook shows the predicate and the rows."""
+        from openpyxl import load_workbook
+        h = copied(self, mutate=lambda d: (d['databases'][0].update(time_column_candidates=['b']),
+                                           d.update(verify={'full_fingerprint_max_rows': 200})))
+        self.assertEqual(h.step('O7').status, steps.PASSED, h.text())
+        out8 = h.step('O8')
+        self.assertEqual((out8.status, out8.exit_code), (steps.PENDING, 4), h.text())
+        by = {r['table_name']: r for r in h.journal.verifications(tier=V.TIER_FINGERPRINT)}
+        comp = by['t_comp']
+        self.assertEqual((comp['result'], comp['sample_rows'], comp['epoch']), (V.SAMPLED, 15, 0))
+        self.assertTrue(comp['predicate'].startswith("`b` >= '2026-01-01 00:00:00.000000' AND `b` <= '2026-01-01 00:00:02.95"), comp['predicate'])
+        self.assertTrue(comp['sql_source'].endswith('WHERE %s GROUP BY grp' % comp['predicate']))
+        self.assertTrue(comp['sql_target'].endswith('WHERE %s GROUP BY grp' % comp['predicate']), 'the same predicate on both sides')
+        self.assertIn('sampled 5 percent of the b range, 15 rows in the sample', comp['detail'])
+        self.assertIn("SUM(CRC32(CONCAT_WS('|', COALESCE(`b`, ''), COALESCE(`note`, ''))))", comp['sql_source'], 'the time column plus the value column')
+        for name in ('t_single', 't_nokey'):
+            self.assertEqual((by[name]['result'], by[name]['predicate']), (V.MATCH, None))
+            self.assertIn('rows over verify.full_fingerprint_max_rows 200 and no orderable sort key or time column', by[name]['detail'])
+        self.assertEqual(by['t_empty']['detail'], '64 groups compared'.replace('64', '0'), 'under the threshold: no note')
+        self.assertIn('tier 3 was sampled on t_comp (15 rows, WHERE `b` >= ', out8.note)
+        wb = load_workbook(str(h.tmp / 'runs' / h.run_id / SRC / 'reports' / 'final.xlsx'))
+        tab = {r[0].value: r[1].value for r in wb['t_comp'].iter_rows(min_col=1, max_col=2) if r[0].value}
+        self.assertEqual((tab['Sampled or full'], tab['Sample predicate'], tab['Rows in sample']), ('sampled', comp['predicate'], 15))
+        summary = {str(r[0].value): r[1].value for r in wb['Summary'].iter_rows(min_col=1, max_col=2) if r[0].value}
+        self.assertEqual(summary['Sampled tables'], 't_comp')
+
+    def test_sort_key_gives_an_integer_range_and_a_change_inside_it_is_caught(self):
+        h = sampled_harness(self, threshold=500, percent=10)
+        plans = h.plans()
+        single = next(p for p in plans if p.name == 't_single')
+        self.assertEqual((single.sort_columns, V.range_column(single)), (['n'], 'n'))
+        session = h.sessions.runner(read_guard())
+        results = V.Verifier(session, SRC, TGT, plans, h.journal, h.config, log=h.log).run(tiers=[V.TIER_COUNT, V.TIER_FINGERPRINT])
+        r = next(r for r in results if r.table == 't_single' and r.tier == V.TIER_FINGERPRINT)
+        self.assertEqual((r.result, r.predicate, r.sample_rows), (V.SAMPLED, '`n` >= 0 AND `n` <= 69', 70), '10 percent of the span 0 to 699')
+        self.assertTrue(r.sql_source.endswith('WHERE `n` >= 0 AND `n` <= 69 GROUP BY grp'))
+        self.assertTrue(r.sql_target.endswith('WHERE `n` >= 0 AND `n` <= 69 GROUP BY grp'))
+        self.assertIn('SELECT MIN(`n`) AS lo, MAX(`n`) AS hi FROM `%s`.`t_single`' % SRC, session.statements, 'the range comes from the source')
+        nokey = next(r for r in results if r.table == 't_nokey' and r.tier == V.TIER_FINGERPRINT)
+        self.assertEqual((nokey.result, nokey.predicate), (V.MATCH, None), '500 rows is not over 500')
+        self.assertIsNotNone(next(t for t in h.journal.tables() if t['table_name'] == 't_single')['verified_at_utc'], 'a sampled match stamps verified_at')
+        inside = next(row for row in h.fake.rows(TGT, 't_single') if row['n'] == 5)
+        inside['payload'] = 'tampered'
+        again = V.Verifier(session, SRC, TGT, plans, h.journal, h.config, log=h.log).run(tiers=[V.TIER_FINGERPRINT])
+        bad = next(r for r in again if r.table == 't_single')
+        self.assertEqual(bad.result, V.MISMATCH)
+        self.assertEqual(bad.mismatched_groups, (crc32(key_text('`id`', inside)) % single.n_buckets,), 'the group maps to the bucket')
+        self.assertIsNone(next(t for t in h.journal.tables() if t['table_name'] == 't_single')['verified_at_utc'])
+
+    def test_yes_without_a_chunk_since_the_last_o8_accepts_the_recorded_result_without_a_query(self):
+        h = sampled_harness(self, threshold=500)
+        self.assertEqual(h.step('O7').status, steps.PASSED, h.text())
+        self.assertEqual(h.step('O8').status, steps.PENDING, h.text())
+        rows_before, start = len(h.journal.verifications()), len(h.fake.statements)
+        out = h.step('O8', yes=True)
+        self.assertEqual(out.status, steps.PASSED, h.text())
+        self.assertIn('recorded result accepted without a rerun: no chunk was copied since the last O8 run', out.note)
+        self.assertEqual(h.fake.statements[start:], [], 'no fingerprint query, no count: nothing was issued')
+        self.assertEqual(len(h.journal.verifications()), rows_before, 'no new verification row')
+        self.assertEqual(h.journal.events(V.ACCEPTED_EVENT),
+                         ['accepted sampled fingerprint for t_single at re-copy epoch 0 (35 rows, WHERE `n` >= 0 AND `n` <= 34)'])
+        from s2rebuild import switch
+        self.assertEqual(switch.unverified_tables(h.journal), [], 'S0 accepts the accepted sample')
+        self.assertEqual(h.step('O8', redo=True, yes=True).status, steps.PASSED, 'a second --yes records nothing twice')
+        self.assertEqual(len(h.journal.events(V.ACCEPTED_EVENT)), 1)
+
+    def test_yes_after_a_recopy_runs_the_tiers_again_before_accepting(self):
+        """The failure injection of the acceptance rule: a bucket copied since the last O8 run (a re-copy at a new epoch) makes --yes
+        run every tier again, and the acceptance is recorded at the new epoch."""
+        h = sampled_harness(self, threshold=500)
+        self.assertEqual(h.step('O7').status, steps.PASSED, h.text())
+        self.assertEqual(h.step('O8').status, steps.PENDING, h.text())
+        h.journal.mark_recopy('t_comp', None)
+        self.assertEqual(h.step('O6', options={'retry_failed': True}).status, steps.PASSED, h.text())
+        self.assertEqual(h.step('O7').status, steps.PASSED, h.text())
+        start = len(h.fake.statements)
+        out = h.step('O8', yes=True)
+        self.assertEqual(out.status, steps.PASSED, h.text())
+        self.assertTrue(out.note.startswith('every tier passed (4 tables; accepted sampled fingerprint for t_single at re-copy epoch 0'), out.note)
+        self.assertEqual(len(fingerprints_since(h, start)), 8, 'both sides of every table ran again')
+        self.assertIn('O8 runs the tiers again: t_comp has no fingerprint row at re-copy epoch 1', h.text())
+        self.assertEqual(h.journal.verifications('t_comp', V.TIER_FINGERPRINT)[-1]['epoch'], 1)
+
+    def test_full_table_reruns_tier_3_for_that_table_only(self):
+        h = sampled_harness(self, threshold=500)
+        self.assertEqual(h.step('O7').status, steps.PASSED, h.text())
+        self.assertEqual(h.step('O8').status, steps.PENDING, h.text())
+        start = len(h.fake.statements)
+        out = h.step('O8', options={'full': ['t_single']})
+        self.assertEqual(out.status, steps.PASSED, h.text())
+        self.assertTrue(out.note.startswith('every tier passed (4 tables)'), 'nothing left to accept')
+        issued = [s for s, _ in h.fake.statements[start:]]
+        self.assertEqual(len(issued), 2, 'the two sides of t_single and nothing else: %s' % issued)
+        self.assertTrue(all(s.startswith('SELECT CRC32(') and '`t_single`' in s and 'WHERE' not in s for s in issued))
+        row = h.journal.verifications('t_single', V.TIER_FINGERPRINT)[-1]
+        self.assertEqual((row['result'], row['predicate'], row['sample_rows'], row['epoch']), (V.MATCH, None, None, 0))
+        self.assertEqual(h.journal.events(V.ACCEPTED_EVENT), [])
+        out = h.step('O8', redo=True, options={'full': ['t_other']})
+        self.assertEqual(out.status, steps.REFUSED)
+        self.assertIn('Not a planned table: t_other', out.note)
+
+    def test_fingerprint_table_with_percent_samples_that_table_and_the_flags_are_checked(self):
+        import types
+        from s2rebuild import cli
+        h = sampled_harness(self, threshold=1_000_000_000, time_column='b')
+        self.assertEqual(h.step('O7').status, steps.PASSED, h.text())
+        self.assertEqual(h.step('O8').status, steps.PASSED, h.text())
+        start = len(h.fake.statements)
+        out = h.step('O8', redo=True, options={'fingerprint': ['t_comp'], 'percent': 50})
+        self.assertEqual(out.status, steps.PENDING, h.text())
+        self.assertIn('tier 3 was sampled on t_comp (150 rows, WHERE `b` >= ', out.note)
+        issued = [s for s, _ in h.fake.statements[start:]]
+        self.assertEqual([s[:13] for s in issued], ['SELECT MIN(`b', 'SELECT CRC32(', 'SELECT CRC32('], 'the range of b from the source, then both sides')
+        row = h.journal.verifications('t_comp', V.TIER_FINGERPRINT)[-1]
+        self.assertEqual((row['result'], row['sample_rows']), (V.SAMPLED, 150))
+        self.assertIn('sampled 50 percent of the b range', row['detail'])
+        self.assertEqual(h.step('O8', redo=True, yes=True).status, steps.PASSED, 'accepted without a rerun')
+        self.assertEqual(len(h.journal.events(V.ACCEPTED_EVENT)), 1)
+        o8, o6 = steps.REGISTRY['O8'], steps.REGISTRY['O6']
+        self.assertEqual(cli._o8_options(types.SimpleNamespace(fingerprint=None, full=None, percent=None), o6), {})
+        with self.assertRaisesRegex(KitError, '--percent needs --fingerprint TABLE'):
+            cli._o8_options(types.SimpleNamespace(fingerprint=None, full=None, percent=5), o8)
+        with self.assertRaisesRegex(KitError, '--percent must be between 1 and 100'):
+            cli._o8_options(types.SimpleNamespace(fingerprint=['t'], full=None, percent=0), o8)
+        with self.assertRaisesRegex(KitError, '--full applies to step O8 only'):
+            cli._o8_options(types.SimpleNamespace(fingerprint=None, full=['t'], percent=None), o6)
+        out = h.step('O8', redo=True, options={'fingerprint': ['t_comp'], 'full': ['t_comp']})
+        self.assertEqual((out.status, out.note), (steps.REFUSED, 't_comp named by both --fingerprint and --full; name a table once'))
 
 
 if __name__ == '__main__':

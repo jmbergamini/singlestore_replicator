@@ -55,9 +55,12 @@ copy:
   progress_seconds: 60
 verify:
   tiers: [count, newest, fingerprint]
-  fingerprint_budget_minutes: 30
+  sessions: null                        # tier 3 connections; null = copy.workers
+  full_fingerprint_max_rows: 1000000000 # a table with more rows is sampled: a contiguous range on its sort key or time column
+  sample_percent: 5                     # the percent of the value span the sample covers; 100 = full fingerprint
+  fingerprint_budget_minutes: null      # elapsed deadline for tier 3; tables after it are recorded not fingerprinted; null = none
   fingerprint_groups: 64
-  sample_percent_over_budget: 5
+  value_columns: 4                      # value hash: the time column plus up to this many supported columns
 pipelines:
   route: kit                            # kit = the kit replays at O9; customer = the customer runs the placeholder file
   credentials_env: { KAFKA: S2REBUILD_KAFKA_CREDENTIALS, S3: S2REBUILD_S3_CREDENTIALS }

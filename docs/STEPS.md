@@ -170,9 +170,13 @@ The same rules hold for every command that runs a step: `run`, `step`, `check` (
 
 - Purpose: prove the copy.
 - Identity: runner.
-- Tiers: 1 counts both sides; 2 newest time value and key range; 3 grouped fingerprints (key hash and value hash per group, mapped to buckets), smallest tables first within `verify.fingerprint_budget_minutes`, sampled beyond it.
-- Outputs: verification rows, each with the table's re-copy epoch, `verified_at_utc` per table, the final workbook and run report.
-- Gate: tiers 1 and 2 pass everywhere; tier 3 within budget, or a sampled result accepted with `s2rebuild step O8 --yes`.
+- Tiers: 1 counts both sides; 2 newest time value and key range; 3 grouped fingerprints (key hash and value hash per group, mapped to buckets; the value hash takes the time column plus up to `verify.value_columns` supported columns).
+- Tier 3 runs on `verify.sessions` connections (default `copy.workers`), largest table first, the source and replacement sides of a table at the same time; one log line per table with the elapsed seconds.
+- A table with more rows than `verify.full_fingerprint_max_rows` (default 1,000,000,000) is sampled: a `verify.sample_percent` (default 5) range on its first sort key column or its time column, MIN and MAX from the source, the same predicate on both sides. A table over the threshold with neither column gets a full fingerprint with a note. The verification row and the table tab show the predicate and the rows in the sample.
+- `verify.fingerprint_budget_minutes` (default none) is an elapsed deadline: a table whose turn comes after it is recorded not fingerprinted.
+- Outputs: verification rows, each with the table's re-copy epoch and the sample predicate, `verified_at_utc` per table, the final workbook and run report.
+- Gate: tiers 1 and 2 pass everywhere; tier 3 a full match on every table, or a sampled or not fingerprinted result accepted with `s2rebuild step O8 --yes`. With `--yes` and no chunk copied since the last O8 run, the recorded result is accepted without a rerun and an `accepted` event names each table; otherwise the tiers run again first.
+- Rerun one table: `s2rebuild step O8 --fingerprint TABLE --percent N` (sampled) or `s2rebuild step O8 --full TABLE` runs tier 3 for the named tables only and records the result at the current epoch; the other tables keep their recorded result. Add `--redo` when O8 already passed.
 - When it fails: exit 3; the mismatching buckets are marked for re-copy, which reopens O6 and O7. Run `s2rebuild run --from O6`: O6 copies them again, O7 resets the counters, O8 verifies again.
 
 ## O9 Pipelines

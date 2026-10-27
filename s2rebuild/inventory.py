@@ -45,6 +45,9 @@ _DEFINER = re.compile(r'DEFINER=(`[^`]*`@`[^`]*`)')
 _VARCHAR = re.compile(r'(?:var)?char\((\d+)\)', re.I)
 _REFERENCE = re.compile(r'\s*CREATE\s+(?:ROWSTORE\s+)?REFERENCE\s+TABLE\b', re.I)
 _ROWSTORE = re.compile(r'\s*CREATE\s+ROWSTORE\s+(?:REFERENCE\s+)?TABLE\b', re.I)
+# SORT KEY [`name`] (`a`, `b`) and KEY `name` (`a`) USING CLUSTERED COLUMNSTORE: the columnstore sort order
+_SORT_KEY = re.compile(r'\bSORT\s+KEY\s*(?:`[^`]*`\s*)?\(([^)]*)\)', re.I)
+_CLUSTERED_KEY = re.compile(r'\bKEY\s*(?:`[^`]*`\s*)?\(([^)]*)\)\s*USING\s+CLUSTERED\s+COLUMNSTORE\b', re.I)
 COPY_PATH_STAGING = 'staging'
 COPY_PATH_DIRECT = 'direct'
 _CREDENTIALS = re.compile(r"""(CREDENTIALS\s+)(?:'(?:[^'\\]|\\.|'')*'|"(?:[^"\\]|\\.|"")*")""", re.I)
@@ -162,6 +165,19 @@ def storage_type(definition):
 def is_reference(definition):
     """True for a CREATE [ROWSTORE] REFERENCE TABLE text (a full copy on every node)."""
     return bool(_REFERENCE.match(str(definition or '')))
+
+
+def sort_key_columns(definition):
+    """The columnstore sort key columns of a CREATE TABLE text, in order: SORT KEY (...) or KEY ... USING CLUSTERED COLUMNSTORE.
+
+    An empty list for a rowstore table, an unordered columnstore (SORT KEY ()) or no text. The
+    first column is the range column of a sampled fingerprint (verify.range_column).
+    """
+    text = str(definition or '')
+    m = _SORT_KEY.search(text) or _CLUSTERED_KEY.search(text)
+    if not m:
+        return []
+    return [c.strip().strip('`') for c in m.group(1).split(',') if c.strip().strip('`')]
 
 
 def view_definer(definition):
@@ -517,7 +533,8 @@ class TablePlan:
     """One table's copy plan: columns, key expression, bucket count and the attributes the report shows."""
 
     def __init__(self, name, columns, est_rows, key_kind, key_columns, definition, n_buckets, time_column=None,
-                 unique_key_lock_risk=False, concurrency=None, size_gib=None, chunk_rows=None, computed_columns=()):
+                 unique_key_lock_risk=False, concurrency=None, size_gib=None, chunk_rows=None, computed_columns=(),
+                 column_types=None, sort_columns=None):
         self.name = name
         self.columns = list(columns)
         self.est_rows = int(est_rows)
@@ -531,6 +548,10 @@ class TablePlan:
         self.size_gib = size_gib
         self.chunk_rows = chunk_rows
         self.computed_columns = list(computed_columns)
+        # column name to lower-case DATA_TYPE (the verification picks hashable and orderable columns by it; unknown when None)
+        self.column_types = dict(column_types or {})
+        # the columnstore sort key columns in order, from the definition when not given
+        self.sort_columns = list(sort_columns) if sort_columns is not None else sort_key_columns(definition)
         if not self.columns:
             raise KitError('Table %s has no copyable columns' % name)
         if len(self.columns) != len(set(self.columns)):
@@ -579,7 +600,8 @@ class TablePlan:
                 'key_columns': self.key_columns, 'key_expr': self.key_expr, 'column_count': len(self.columns),
                 'time_column': self.time_column, 'unique_key_lock_risk': self.unique_key_lock_risk,
                 'concurrency': self.concurrency, 'size_gib': self.size_gib, 'chunk_rows': self.chunk_rows,
-                'computed_columns': self.computed_columns, 'reference': self.reference, 'copy_path': self.copy_path}
+                'computed_columns': self.computed_columns, 'reference': self.reference, 'copy_path': self.copy_path,
+                'sort_columns': self.sort_columns}
 
 
 def buckets_for(est_rows, chunk_rows, min_rows_for_chunking, max_buckets_per_table):
@@ -654,7 +676,8 @@ def plan_tables(inventory, config, db):
             t['name'], columns, t['est_rows'], key_kind, key_columns, t['definition'], n_buckets,
             time_column=time_column_for(t, db.time_column_candidates), unique_key_lock_risk=lock_risk(t, key_columns),
             concurrency=concurrency, size_gib=t.get('size_gib'), chunk_rows=chunk_rows,
-            computed_columns=t.get('computed_columns') or []))
+            computed_columns=t.get('computed_columns') or [],
+            column_types={c['name']: str(c.get('data_type') or '').lower() for c in t['columns']}))
     names = [p.name for p in plans]
     if len(names) != len(set(names)):
         raise KitError('Duplicate table names in the inventory')

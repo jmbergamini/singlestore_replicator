@@ -250,14 +250,25 @@ def key_text(expr, row):
     return mysql_str(row[m.group(1)])
 
 
+def _literal_compare(value, literal):
+    """Compare a row value with a literal of a range predicate: numbers as numbers, quoted text by its text form; None sorts nowhere."""
+    if value is None:
+        return None
+    if literal.startswith("'"):
+        return (mysql_str(value) > literal[1:-1].replace("''", "'")) - (mysql_str(value) < literal[1:-1].replace("''", "'"))
+    return (float(value) > float(literal)) - (float(value) < float(literal))
+
+
 def evaluate_predicate(pred, row):
-    """CRC32(expr) MOD n = k, or CRC32(expr) MOD 100 < p for a sample."""
+    """CRC32(expr) MOD n = k, a column range `c` >= lo AND `c` <= hi (the sampled fingerprint), or one column equal to a literal."""
     m = re.fullmatch(r'CRC32\((.*)\) MOD (\d+) = (\d+)', pred)
     if m:
         return crc32(key_text(m.group(1), row)) % int(m.group(2)) == int(m.group(3))
-    m = re.fullmatch(r'CRC32\((.*)\) MOD 100 < (\d+)', pred)
+    m = re.fullmatch(r"`([^`]+)` >= ('(?:[^']|'')*'|-?[\d.]+) AND `([^`]+)` <= ('(?:[^']|'')*'|-?[\d.]+)", pred)
     if m:
-        return crc32(key_text(m.group(1), row)) % 100 < int(m.group(2))
+        assert m.group(1) == m.group(3), pred
+        low, high = _literal_compare(row.get(m.group(1)), m.group(2)), _literal_compare(row.get(m.group(1)), m.group(4))
+        return low is not None and low >= 0 and high <= 0
     m = re.fullmatch(r"`([^`]+)` = '((?:[^']|'')*)'", pred)
     if m:
         value = row.get(m.group(1))
