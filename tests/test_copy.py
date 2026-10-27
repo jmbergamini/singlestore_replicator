@@ -695,6 +695,23 @@ class SchedulerTests(unittest.TestCase):
             self.assertEqual(sum(1 for t in taken if t and t[0] == first), expected, workers)
             self.assertEqual(sum(1 for t in taken if t and t[0] == second), workers - expected, 'the other workers go to the next table')
 
+    def test_integer_table_concurrency_caps_every_table(self):
+        """W11: copy.table_concurrency 2 with 4 workers: two chunks of the first table in flight, the other two workers on the next table."""
+        h = Harness(self, mutate=lambda d: d['copy'].update(workers=4, table_concurrency=2))
+        self.assertEqual(h.step('O5').status, steps.PASSED)
+        plans = h.plans()
+        self.assertTrue(all(p.concurrency == 2 for p in plans), 'the plan carries the integer on every table')
+        runner = C.Runner(plans, C.statements_for(h.db), h.journal, h.fake.connect, h.log, h.config.copy, workers=4, sleep=lambda s: None)
+        self.assertEqual(set(runner.limits.values()), {2})
+        for name in runner.queues:
+            runner.queues[name].clear()
+        first, second = plans[0].name, plans[1].name
+        runner.queues[first].extend((b, 'pending') for b in range(20))
+        runner.queues[second].extend((b, 'pending') for b in range(20))
+        taken = [runner.take() for _ in range(4)]
+        self.assertEqual(sum(1 for t in taken if t and t[0] == first), 2)
+        self.assertEqual(sum(1 for t in taken if t and t[0] == second), 2, 'the other workers go to the next table')
+
     def test_parked_chunks_need_retry_failed(self):
         h = Harness(self, mutate=lambda d: d['copy'].update(max_attempts=1))
         h.fake.fail_insert[('t_single', 'CRC32(`id`) MOD 3 = 0')] = 'before'

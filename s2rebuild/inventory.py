@@ -26,7 +26,7 @@ import re
 import time
 from pathlib import Path
 
-from . import routines, steps
+from . import estimate, routines, steps
 from .common import KitError, iso, utc_now
 from .sqlutil import ident, qualified, strip_literals
 
@@ -668,7 +668,9 @@ def plan_tables(inventory, config, db):
         chunk_rows = override.chunk_rows or config.copy.chunk_rows
         key_kind, key_columns = choose_key(t)
         columns = [c['name'] for c in t['columns'] if not c.get('generation_expression')]
-        concurrency = override.concurrency if override.concurrency is not None else (1 if config.copy.table_concurrency == 1 else None)
+        # an integer copy.table_concurrency caps every table at that many chunks in flight; auto leaves the limit to the runner
+        concurrency = override.concurrency if override.concurrency is not None else (
+            None if config.copy.table_concurrency == 'auto' else int(config.copy.table_concurrency))
         # a reference table is one bucket through the staging path, whatever its count: one staging table, two inserts
         n_buckets = 1 if is_reference(t['definition']) else buckets_for(
             t['est_rows'], chunk_rows, config.copy.min_rows_for_chunking, config.copy.max_buckets_per_table)
@@ -845,6 +847,19 @@ def grantee_of(current_user):
     return "'%s'@'%s'" % (user, host or '%')
 
 
+def workers_line(config, leaf_cores):
+    """The P2 line that sets copy.workers beside the leaf cores read and the worker count and leaf cores the baseline was fitted with.
+
+    The baseline is the configured file when present, else the shipped constants (estimate.load_baseline); the line is
+    information for the operator (LESSONS fact 42: client concurrency is not the limit), never a gate.
+    """
+    baseline = estimate.load_baseline(config.resolve(config.estimate.baseline) if config.estimate.baseline else None)
+    cores = '%d leaf cores' % leaf_cores if leaf_cores is not None else 'leaf cores not readable'
+    fitted = '%d leaf cores' % baseline.leaf_cores if baseline.leaf_cores is not None else 'leaf cores not recorded'
+    return 'workers: %d configured (copy.workers), table concurrency %s, on %s; the baseline was fitted with %d workers on %s' % (
+        config.copy.workers, config.copy.table_concurrency, cores, baseline.workers, fitted)
+
+
 def preflight(runner, db, config, owner=None):
     """P2 checks; returns (ok, lines, facts).
 
@@ -907,6 +922,7 @@ def preflight(runner, db, config, owner=None):
         lines.append('compute size: FAILED, %d leaf cores x 8 = %d is below the %d target partitions' % (cores, cores * 8, db.layout.partitions))
     else:
         lines.append('compute size: %d leaf cores x 8 = %d covers the %d target partitions' % (cores, cores * 8, db.layout.partitions))
+    lines.append(workers_line(config, cores))
     if owner is not None:
         who2 = _one(owner.query(CURRENT_SQL), 'The owner connection')
         count = owner.query(PIPELINE_COUNT_SQL, (db.source,))

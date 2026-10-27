@@ -360,7 +360,8 @@ class Runner:
 
     A queue per table in plan order (largest first); a worker takes the next chunk of the first
     table whose in-flight count is below its limit. Under table_concurrency auto the limit of a
-    table is every worker, or half of them above 8 workers (common.auto_table_limit). A lock wait (error 1205) does not consume an
+    table is every worker, or half of them above 8 workers (common.auto_table_limit); an integer
+    caps every table at that many chunks in flight. A lock wait (error 1205) does not consume an
     attempt: the chunk goes to the back of its table's queue, the table's limit becomes 1 when
     table_concurrency is auto, and the table is parked for lock_retry_seconds while the other
     tables continue. Before a chunk on a table that has waited for a lock, the reconciliation
@@ -399,8 +400,8 @@ class Runner:
         for p in plans:
             if p.concurrency:
                 self.limits[p.name] = int(p.concurrency)
-            elif copy_config.table_concurrency == 1:
-                self.limits[p.name] = 1
+            elif copy_config.table_concurrency != 'auto':
+                self.limits[p.name] = int(copy_config.table_concurrency)
         self.in_flight = {p.name: 0 for p in plans}
         self.peak_in_flight = {p.name: 0 for p in plans}
         self.parked_until = {}

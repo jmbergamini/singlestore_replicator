@@ -137,7 +137,7 @@ SCHEMA = {
         },
     },
     'copy': {
-        'workers': Field('int', 4, minimum=1, maximum=16),
+        'workers': Field('int', 4, minimum=1, maximum=32),
         'chunk_rows': Field('int', 10_000_000, minimum=1),
         'min_rows_for_chunking': Field('int', 5_000_000, minimum=0),
         'max_buckets_per_table': Field('int', 32, minimum=1),
@@ -550,8 +550,8 @@ def build_config(data, path=None, run_date=None, root=None):
         window = Window(start, end, raw['window']['restart_allowance_minutes'], raw['window']['buffer_minutes'])
     copy = raw['copy']
     concurrency = copy['table_concurrency']
-    if isinstance(concurrency, bool) or not (concurrency == 'auto' or (isinstance(concurrency, int) and concurrency == 1)):
-        raise KitError('copy.table_concurrency must be auto or 1')
+    if isinstance(concurrency, bool) or not (concurrency == 'auto' or (isinstance(concurrency, int) and 1 <= concurrency <= copy['workers'])):
+        raise KitError('copy.table_concurrency must be auto or an integer from 1 to copy.workers (%d)' % copy['workers'])
     tiers = raw['verify']['tiers']
     if not tiers or len(set(tiers)) != len(tiers) or any(t not in TIERS for t in tiers) \
             or [t for t in TIERS if t in tiers] != tiers:

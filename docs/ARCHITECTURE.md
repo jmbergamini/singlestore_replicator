@@ -236,7 +236,7 @@ copy:
   chunk_rows: 10000000
   min_rows_for_chunking: 5000000
   max_buckets_per_table: 32
-  table_concurrency: auto               # auto | 1; auto caps a table at half the workers above 8 and serializes it after its first lock wait
+  table_concurrency: auto               # auto | 1 to workers; auto caps a table at half the workers above 8 and serializes it after its first lock wait
   lock_probe_timeout_seconds: 5
   lock_retry_seconds: 120
   max_attempts: 3
@@ -272,7 +272,7 @@ objects:
     ignore: []                          # routines left behind on purpose (the default migrates every captured routine): name or database.name
 ```
 
-Validation rules (config.py): identifiers match `^[A-Za-z0-9_]+$`; source, replacement and retained differ; window end is after start; `freeze.mode` is one of the two values; `copy.workers` is 1 to 16; `objects.routines.ignore` entries are routine or database.routine names; unknown keys are an error (typos must not pass silently).
+Validation rules (config.py): identifiers match `^[A-Za-z0-9_]+$`; source, replacement and retained differ; window end is after start; `freeze.mode` is one of the two values; `copy.workers` is 1 to 32; `copy.table_concurrency` is auto or an integer from 1 to `copy.workers`; `objects.routines.ignore` entries are routine or database.routine names; unknown keys are an error (typos must not pass silently).
 
 Environment variables: `S2REBUILD_CONFIG` (default config path), `S2REBUILD_RUN` (default run id), the password variables named in the config, the pipeline credential variables named in the config. Nothing else.
 
@@ -449,7 +449,7 @@ Changes:
 - Names, layout, workers, chunk sizes and the inventory path come from config and the run, not constants. The expected table count check becomes "matches the capture".
 - `CREATE DATABASE <replacement> PARTITIONS <p> SUB_PARTITIONS <s>` from `databases[].layout`; durability flags must equal the source.
 - Bucket cap `max_buckets_per_table` (10.6).
-- Scheduler: a queue per table; a worker takes the next chunk from the first table whose in-flight count is below its limit. `table_concurrency: auto` allows parallel chunks per table, at most half the workers when there are more than 8 (so the rest copy the next tables), and sets the limit to 1 for a table after its first lock wait (error 1205); per-table `concurrency` in config overrides.
+- Scheduler: a queue per table; a worker takes the next chunk from the first table whose in-flight count is below its limit. `table_concurrency: auto` allows parallel chunks per table, at most half the workers when there are more than 8 (so the rest copy the next tables), and sets the limit to 1 for a table after its first lock wait (error 1205); an integer `copy.table_concurrency` caps every table at that many chunks in flight and skips the serialization; per-table `concurrency` in config overrides either. P2 prints the configured workers beside the leaf cores it read and the worker count the baseline was fitted with.
 - Lock probe before a chunk on a table that had a lock wait: the reconciliation DELETE runs with `lock_wait_timeout = lock_probe_timeout_seconds`; 1205 means still locked, the chunk is parked for `lock_retry_seconds` and other tables continue.
 - Lock wait cap: the `max_lock_waits`-th lock wait of one chunk in a run fails the chunk as an attempt. Its error and the O6 note name `s2rebuild step O6 --fresh-table <t>`, so a lock that never clears ends O6 INCOMPLETE on its own.
 - Error 1997 ("transaction was already in its commit phase", a node replaced under the chunk by autoscale, fact 40) is a transient: the chunk is marked failed, so its rows are reconciled by the DELETE before the re-insert, and goes to the back of its table's queue without consuming an attempt (`Runner.requeue_transient`, journal event `transient`).
@@ -767,7 +767,7 @@ Listed for `docs/CODE-GUIDE.md`. Each names the module and the one place to edit
 | View definers | Created by the owner session; the original DEFINER kept while its account exists and is not the runner, else the owner account | Always the owner account, or a named service account: `postcopy.definer_choice` |
 | Counters | The larger of the source counter and MAX+1, then sync on every aggregator (ALL) | MAX+1 only, or the source counter only; `postcopy.counter_value` |
 | Admin steps | Execute with gates when the owner profile exists | Print only (no owner profile) or the generated notebook |
-| Workers | 4 | Up to 16; watch leaf CPU; `copy.workers` |
+| Workers | 4 | Up to 32; watch leaf CPU; `copy.workers` |
 | Driver | PyMySQL in the terminal, singlestoredb in the notebook | Either everywhere; `connect.py` and the notebook template |
 | Secrets | Keychain or env | A secrets manager; `connect.py` |
 | Pipelines | Route `kit`: captured with the owner profile, credentials from env at replay | Route `customer`: the customer runs the placeholder file; the kit still verifies count, state and offsets. `pipelines.route` |

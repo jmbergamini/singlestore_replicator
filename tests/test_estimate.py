@@ -139,6 +139,21 @@ class ModelTests(unittest.TestCase):
         two = [Plan('big', 12000, 12), Plan('next', 6000, 6)]
         self.assertAlmostEqual(E.simulate(two, 12, b).wall_seconds, 2.0, msg='the other 6 workers copy the next table')
 
+    def test_schedule_honors_an_integer_table_concurrency(self):
+        """W11: an integer copy.table_concurrency reaches every plan and the simulation runs at most that many chunks of a table at once."""
+        b = E.Baseline(scan_s_per_row=0.0, insert_s_per_row=1e-3, chunk_overhead_s=0.0)
+        inv = I.load(FIXTURE_INVENTORY)
+        cfg = config_from(lambda d: d.update(copy={'workers': 8, 'table_concurrency': 2}))
+        plans = I.plan_tables(inv, cfg, cfg.databases[0])
+        self.assertTrue(all(p.concurrency == 2 for p in plans))
+        big = [p for p in plans if p.name == 'order_items']
+        self.assertEqual(big[0].n_buckets, 32)
+        capped = E.simulate(big, 8, b)
+        self.assertAlmostEqual(capped.wall_seconds, 16 * capped.longest_chunk_seconds, msg='32 chunks two at a time: 16 rounds')
+        auto = I.plan_tables(inv, config_from(lambda d: d.update(copy={'workers': 8})), cfg.databases[0])
+        self.assertTrue(all(p.concurrency is None for p in auto), 'auto leaves the limit to the runner')
+        self.assertAlmostEqual(E.simulate([p for p in auto if p.name == 'order_items'], 8, b).wall_seconds, 4 * capped.longest_chunk_seconds)
+
     def test_estimate_allowances_bands_and_fit(self):
         cfg = config_from()
         inv = I.load(FIXTURE_INVENTORY)

@@ -79,7 +79,7 @@ The 10.8.0 file is seeded by hand from the kit's queries (its `seeded` field say
 | Routine definers and order | The view policy through the owner session; functions and TVFs, then aggregates at O5, procedures at O7, each kind in rounds | A dependency order read from the bodies, or every routine at O7: `routines.O5_KINDS` and `routines.O7_KINDS` |
 | Counters | The larger of the source counter and MAX + 1, then sync on every aggregator (ALL) | MAX + 1 only, or the source counter only: `postcopy.counter_value` |
 | Admin steps | Execute with gates when the owner profile exists | Print only (no owner profile) or the generated notebook |
-| Workers | 4 | Up to 16; watch leaf CPU: `copy.workers` |
+| Workers | 4 | Up to 32; watch leaf CPU: `copy.workers` |
 | Driver | PyMySQL in the terminal, singlestoredb in the notebook | Either everywhere: `connect.py` and the notebook template |
 | Secrets | Keychain (filled by the kit's prompts at P1 and P3) or environment | A secrets manager: `connect.py` and `prompts.py` |
 | Pipelines | Route kit: credentials asked at P3, from the Keychain at O9, the environment as the fallback | Route customer: the customer runs the placeholder file, the kit verifies: `pipelines.route` |

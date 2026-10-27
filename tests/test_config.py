@@ -144,10 +144,20 @@ class ValidationTests(unittest.TestCase):
         self.refuse(r'freeze\.mode must be one of', lambda d: d.update(freeze={'mode': 'frozen'}))
         self.assertEqual(config_from(lambda d: d.update(freeze={'mode': 'lockout'})).freeze.mode, 'lockout')
         self.refuse(r'copy\.workers must be at least 1', lambda d: d.update(copy={'workers': 0}))
-        self.refuse(r'copy\.workers must be at most 16', lambda d: d.update(copy={'workers': 17}))
+        self.refuse(r'copy\.workers must be at most 32', lambda d: d.update(copy={'workers': 33}))
         self.assertEqual(config_from(lambda d: d.update(copy={'workers': 16})).copy.workers, 16)
         self.refuse(r'copy\.workers must be of type int', lambda d: d.update(copy={'workers': True}))
         self.refuse(r'copy\.workers must be of type int', lambda d: d.update(copy={'workers': '4'}))
+
+    def test_workers_up_to_32_and_an_integer_table_concurrency(self):
+        """W11: copy.workers accepts 32; copy.table_concurrency accepts an integer up to copy.workers and refuses one above it."""
+        cfg = config_from(lambda d: d.update(copy={'workers': 32, 'table_concurrency': 32}))
+        self.assertEqual((cfg.copy.workers, cfg.copy.table_concurrency), (32, 32))
+        self.assertEqual(config_from(lambda d: d.update(copy={'workers': 4, 'table_concurrency': 2})).copy.table_concurrency, 2)
+        self.refuse(r'copy\.table_concurrency must be auto or an integer from 1 to copy\.workers \(4\)',
+                    lambda d: d.update(copy={'workers': 4, 'table_concurrency': 5}))
+        self.refuse(r'copy\.table_concurrency must be auto or an integer from 1 to copy\.workers \(8\)',
+                    lambda d: d.update(copy={'workers': 8, 'table_concurrency': 9}))
 
     def test_password_source_exactly_one(self):
         self.refuse('exactly one of', lambda d: d['connections']['runner'].update(password_keychain='x'))
@@ -168,10 +178,10 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(cfg.databases[0].table_override('empty_override').concurrency, None)
 
     def test_table_concurrency_and_tiers(self):
-        self.refuse('table_concurrency must be auto or 1', lambda d: d.update(copy={'table_concurrency': 2}))
         self.assertEqual(config_from(lambda d: d.update(copy={'table_concurrency': 1})).copy.table_concurrency, 1)
         for bad in (True, False, 1.0, 0, '1', 'AUTO'):
-            self.refuse('table_concurrency must be auto or 1', lambda d, b=bad: d.update(copy={'table_concurrency': b}))
+            self.refuse(r'table_concurrency must be auto or an integer from 1 to copy\.workers \(4\)',
+                        lambda d, b=bad: d.update(copy={'table_concurrency': b}))
         self.refuse(r'verify\.tiers', lambda d: d.update(verify={'tiers': ['newest', 'count']}))
         self.refuse(r'verify\.tiers', lambda d: d.update(verify={'tiers': ['count', 'checksum']}))
         self.refuse(r'verify\.tiers', lambda d: d.update(verify={'tiers': []}))

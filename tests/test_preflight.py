@@ -49,6 +49,8 @@ class PreflightTests(unittest.TestCase):
         self.assertIn('source STORAGE_ID: 1028600672070281646:7367158985892520834 (READWRITE), recorded', text)
         self.assertIn('replacement name: %s is free' % TGT, text)
         self.assertIn('compute size: 16 leaf cores x 8 = 128 covers the 32 target partitions', text)
+        self.assertIn('workers: 2 configured (copy.workers), table concurrency auto, on 16 leaf cores; '
+                      'the baseline was fitted with 4 workers on leaf cores not recorded', text, 'W11: the worker line')
         self.assertIn('owner: no owner profile configured', text)
         self.assertIn('workspace: no Management API key configured (workspace.management_api_key_keychain); answer before the window:', text)
         self.assertIn('1. is the workspace ACTIVE', text)

@@ -52,7 +52,7 @@ copy:
   chunk_rows: 10000000
   min_rows_for_chunking: 5000000
   max_buckets_per_table: 32
-  table_concurrency: auto               # auto | 1; auto serializes a table after its first lock wait
+  table_concurrency: auto               # auto | 1 to workers; auto serializes a table after its first lock wait
   lock_probe_timeout_seconds: 5
   lock_retry_seconds: 120
   max_attempts: 3

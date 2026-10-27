@@ -46,11 +46,11 @@ One YAML file, default `customer/config.yaml`, selected with `--config` or `S2RE
 | `freeze.lockout.interval_seconds` | integer | `5` | lockout (seconds between passes; 0 = tight loop) |
 | `freeze.lockout.protected_accounts` | list | `[]` | P3, lockout, quiet-proof (runner and owner are always protected) |
 | `freeze.lockout.quiet_passes_required` | integer | `3` | lockout |
-| `copy.workers` | integer 1 to 16 | `4` | P3 estimate, O6 |
+| `copy.workers` | integer 1 to 32 | `4` | P2 (printed beside the leaf cores and the baseline's worker count), P3 estimate, O6 |
 | `copy.chunk_rows` | integer | `10000000` | P3, O4, O6 |
 | `copy.min_rows_for_chunking` | integer | `5000000` | P3, O4, O6 |
 | `copy.max_buckets_per_table` | integer | `32` | P3, O4, O6 |
-| `copy.table_concurrency` | `auto` or `1` (auto: at most half the workers on one table above 8 workers) | `auto` | O6 |
+| `copy.table_concurrency` | `auto` or an integer 1 to `copy.workers` (auto: at most half the workers on one table above 8 workers, and 1 after a lock wait; an integer caps every table at that many chunks in flight) | `auto` | P3 estimate, O6 |
 | `copy.lock_probe_timeout_seconds` | integer | `5` | O3 write probe, O6 lock probe |
 | `copy.lock_retry_seconds` | integer | `120` | O6 |
 | `copy.max_attempts` | integer | `3` | O6 (per chunk; a lock wait and error 1997 consume none) |
