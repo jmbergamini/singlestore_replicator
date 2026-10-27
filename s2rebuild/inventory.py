@@ -888,6 +888,10 @@ def handle_p2(step, ctx):
                 runner.query(sql, args)
             return steps.Outcome(steps.PASSED, 'dry run: preflight queries printed')
         ok, lines, facts = preflight(runner, ctx.db, ctx.config, owner)
+        record = None
+        if facts.get('source_attachment'):
+            from . import switch
+            record = switch.identify(runner, ctx.db.source)  # the branch record of the source: the switch and the rollback go by it
     finally:
         runner.close()
         if owner is not None:
@@ -896,7 +900,9 @@ def handle_p2(step, ctx):
         ctx.log('    ' + line)
     att = facts.get('source_attachment')
     if att:
-        ctx.journal.record_attachment('source', ctx.db.source, att.get('STORAGE_ID'), att.get('COMPUTE_ID'), att.get('ATTACH_TYPE'))
+        ctx.journal.record_attachment_row('source', att)
+        if record is not None:
+            ctx.journal.record_attachment_row('source', record)
     ctx.journal.set_meta('engine_version', str(facts.get('engine_version')))
     ctx.journal.set_meta('preflight', json.dumps(facts, default=str, sort_keys=True))
     failed = [l for l in lines if 'FAILED' in l]

@@ -5,8 +5,9 @@ Author: John Bergamini
 A run that stops before O10 leaves the source READONLY (Path A) and a partly copied
 replacement. abandon puts the workspace back the way P2 found it, through one owner block with
 a check before and after every statement: the source is attached READWRITE again on the
-STORAGE_ID the run recorded, and the replacement is dropped only while its name holds the
-STORAGE_ID O5 recorded (the identity checks of C3). Then the run is marked abandoned, so run,
+branch record the run recorded (name, STORAGE_ID, ATTACH_TYPE, COMPUTE_ID), and the replacement
+is dropped only while its name holds the record O5 recorded and no branch was made from it (the
+identity checks of C3). Then the run is marked abandoned, so run,
 step and gate refuse it; a new run starts with P1. The runner account goes afterwards with
 account-sql --drop --execute, which a later run would otherwise refuse at P1.
 
@@ -34,20 +35,35 @@ def other_storage_sql():
     return 'SELECT COUNT(*) AS n FROM information_schema.MV_CLOUD_ATTACHED_DATABASES WHERE DATABASE_NAME = %s AND STORAGE_ID <> %s'
 
 
+def branches_of_sql():
+    """COUNT of not dropped branch records made from a database (parameters: the parent name, its STORAGE_ID). Issues nothing (reads only)."""
+    return 'SELECT COUNT(*) AS n FROM information_schema.MV_CLOUD_BRANCHES WHERE PREV_DATABASE_NAME = %s AND STORAGE_ID = %s AND IS_DROPPED = 0'
+
+
 def _source_back(b, names, position):
-    """The source part: DETACH and ATTACH READWRITE (frozen), the ATTACH only (detached), or checks only (already READWRITE)."""
+    """The source part: DETACH and ATTACH READWRITE (frozen), the ATTACH only (detached), or checks only (already READWRITE).
+
+    Every statement runs behind a record check: the source name holds the recorded record
+    (name, STORAGE_ID, ATTACH_TYPE, COMPUTE_ID), attached before the DETACH and detached before
+    the ATTACH.
+    """
     source, sid = names['source'], names['source_sid']
     if position == 'frozen':
         b.check('source attached READONLY', switch.ATTACHED_SQL, (source,), ownersql.Expect('column_equals', 'ATTACH_TYPE', 'READONLY'))
         b.check('source STORAGE_ID equals the recorded one', switch.ATTACHED_SQL, (source,), ownersql.Expect('column_equals', 'STORAGE_ID', sid))
+        b.check('source is the recorded record', switch.ATTACHED_RECORD_SQL, (source, sid), ownersql.Expect('columns_equal', value=ownersql.record_expect(names, 'source')))
         b.statement('DETACH DATABASE %s' % ident(source), 'detach the read-only source',
                     detach={'wait': names['detach_wait_seconds'], 'kill': bool(names['detach_kill'])})
     if position in ('frozen', 'detached'):
         b.check('source storage detached', switch.BRANCH_SQL, (sid,), ownersql.Expect('column_equals', 'IS_DETACHED', 1))
+        b.check('source record detached', switch.DETACHED_RECORD_SQL, (source, sid), ownersql.Expect('columns_equal', value=ownersql.record_expect(names, 'source')))
         b.check('no attached database named source', switch.ATTACHED_SQL, (source,), ownersql.Expect('no_rows'))
         b.statement('ATTACH DATABASE %s STORAGEID %s' % (ident(source), sid), 'attach the same storage read write')
     b.check('source attached READWRITE', switch.ATTACHED_SQL, (source,), ownersql.Expect('column_equals', 'ATTACH_TYPE', 'READWRITE'), record='source')
-    b.check('source STORAGE_ID unchanged', switch.ATTACHED_SQL, (source,), ownersql.Expect('column_equals', 'STORAGE_ID', sid))
+    b.check('source STORAGE_ID and COMPUTE_ID unchanged', switch.ATTACHED_SQL, (source,),
+            ownersql.Expect('columns_equal', value={'STORAGE_ID': sid, 'COMPUTE_ID': names['source_cid']}))
+    b.check('source record attached', switch.ATTACHED_RECORD_SQL, (source, sid), ownersql.Expect('columns_equal', value=ownersql.record_expect(names, 'source')),
+            record='source')
 
 
 def _replacement_identity(b, names):
@@ -60,6 +76,9 @@ def _replacement_identity(b, names):
     recorded = (replacement, rsid, ownersql.CLEANUP_ATTACH_TYPES['replacement'])
     b.check('replacement name holds the recorded replacement %s, or nothing' % recorded[2], ownersql.attached_otherwise_sql(), recorded,
             ownersql.Expect('column_equals', 'n', 0))
+    b.check('replacement name holds no other record', ownersql.other_record_sql(), (replacement, names['replacement_cid']), ownersql.Expect('column_equals', 'n', 0))
+    # a branch of the replacement means the switch attached the live name from it (fact 27): abandon never drops its parent
+    b.check('the replacement has no branch', branches_of_sql(), (replacement, rsid), ownersql.Expect('column_equals', 'n', 0))
     b.check('recorded replacement attached under no other name', ownersql.attached_elsewhere_sql(), (rsid, replacement),
             ownersql.Expect('column_equals', 'n', 0))
 
@@ -74,6 +93,8 @@ def _replacement_dropped(b, names):
     b.statement('DROP DATABASE %s' % ident(replacement), 'drop the partly copied replacement', skip_if=(ownersql.recorded_absent_sql(), recorded))
     b.check('replacement is gone', switch.ATTACHED_SQL, (replacement,), ownersql.Expect('no_rows'))
     b.check('recorded replacement attached nowhere', ownersql.storage_attached_sql(), (rsid,), ownersql.Expect('column_equals', 'n', 0))
+    b.check('recorded replacement record dropped', ownersql.record_state_sql(), (replacement, rsid, names['replacement_cid']),
+            ownersql.Expect('column_equals', 'IS_DROPPED', 1))
 
 
 def block(names, position='frozen'):
@@ -89,6 +110,8 @@ def block(names, position='frozen'):
     b.check('source still READWRITE', switch.ATTACHED_SQL, (names['source'],), ownersql.Expect('column_equals', 'ATTACH_TYPE', 'READWRITE'))
     b.check('source still on the recorded STORAGE_ID', switch.ATTACHED_SQL, (names['source'],),
             ownersql.Expect('column_equals', 'STORAGE_ID', names['source_sid']))
+    b.check('source still the recorded record', switch.ATTACHED_RECORD_SQL, (names['source'], names['source_sid']),
+            ownersql.Expect('columns_equal', value=ownersql.record_expect(names, 'source')))
     b.note(RUNNER_NOTE)
     return b
 

@@ -9,8 +9,11 @@ version of the kit is upgraded in place. A re-copy (mark_recopy) reopens the evi
 the copy: it increments the table's recopy_epoch, and every verification row carries the epoch
 it verified. A mark, the start of O6 to O8 and the go decision of O10 (record_go) each read the
 switch state in their own BEGIN IMMEDIATE transaction, so of a re-copy and a go only the first
-to commit goes ahead. Statements issued by this module: SQLite statements against the journal
-file only.
+to commit goes ahead. The attachments table holds the branch record per role (source,
+replacement, retained, live): name, STORAGE_ID, COMPUTE_ID, the attachment type, the record type
+(create, resume, pitr), the ATTACH_SYNTAX and whether it is detached; a row of either attachment
+view completes the latest row of the same record (schema version 3). Statements issued by this
+module: SQLite statements against the journal file only.
 """
 import json
 import sqlite3
@@ -19,13 +22,14 @@ from pathlib import Path
 
 from .common import KitError, iso, utc_now
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 MEMORY = ':memory:'
 STEP_STATUSES = ('pending', 'running', 'passed', 'failed', 'skipped')
 CHUNK_STATES = ('pending', 'started', 'done', 'failed')
 TABLE_FLAGS = ('created_in_target', 'definition_ok')
 TABLE_ATTRS = ('size_gib', 'time_column', 'unique_key_lock_risk', 'concurrency', 'verified_at_utc')
 ATTACHMENT_ROLES = ('source', 'replacement', 'retained', 'live')
+RECORD_TYPES = ('create', 'resume', 'pitr')
 OFFSET_PHASES = ('capture', 'before_start', 'after_release')
 PIPELINE_FIELDS = ('state_at_capture', 'source_type', 'source_location', 'target', 'batch_interval',
                    'duplicate_handling', 'definition_file', 'app_managed', 'created_in_replacement_utc',
@@ -51,7 +55,8 @@ COLUMNS = {
                      ('sql_source', 'TEXT'), ('sql_target', 'TEXT'), ('detail', 'TEXT'), ('checked_utc', 'TEXT NOT NULL'),
                      ('epoch', 'INTEGER')],
     'attachments': [('id', 'INTEGER PRIMARY KEY AUTOINCREMENT'), ('role', 'TEXT NOT NULL'), ('database_name', 'TEXT NOT NULL'),
-                    ('storage_id', 'TEXT'), ('compute_id', 'TEXT'), ('attach_type', 'TEXT'), ('observed_utc', 'TEXT NOT NULL')],
+                    ('storage_id', 'TEXT'), ('compute_id', 'TEXT'), ('attach_type', 'TEXT'), ('observed_utc', 'TEXT NOT NULL'),
+                    ('record_type', 'TEXT'), ('attach_syntax', 'TEXT'), ('is_detached', 'INTEGER')],
     'grants_snapshot': [('grantee', 'TEXT PRIMARY KEY'), ('privileges_json', 'TEXT NOT NULL'),
                         ('captured_utc', 'TEXT NOT NULL'), ('restored_utc', 'TEXT')],
     'pipelines': [('name', 'TEXT PRIMARY KEY'), ('state_at_capture', 'TEXT'), ('source_type', 'TEXT'),
@@ -65,11 +70,38 @@ COLUMNS = {
 }
 TABLE_CONSTRAINTS = {'chunks': 'PRIMARY KEY (table_name, bucket)'}
 # Columns a later schema version added to a version 1 journal, by the version that added them.
-ADDED_COLUMNS = {2: {'tables': [('recopy_epoch', 'INTEGER NOT NULL DEFAULT 0')], 'verification': [('epoch', 'INTEGER')]}}
+ADDED_COLUMNS = {2: {'tables': [('recopy_epoch', 'INTEGER NOT NULL DEFAULT 0')], 'verification': [('epoch', 'INTEGER')]},
+                 3: {'attachments': [('record_type', 'TEXT'), ('attach_syntax', 'TEXT'), ('is_detached', 'INTEGER')]}}
 # Steps whose evidence a re-copy invalidates, with the note mark_recopy records when it reopens them.
 RECOPY_REOPENS = (('O6', 'buckets of %s marked for re-copy; rerun O6'),
                   ('O7', 'counters and stale check predate the re-copy of %s; rerun O7 after O6'),
                   ('O8', 'verification predates the re-copy of %s; rerun O8 after O7'))
+
+
+def _text(value):
+    return None if value is None else str(value)
+
+
+def _same(a, b):
+    return a is None or b is None or str(a) == str(b)
+
+
+def attachment_fields(row):
+    """The record_attachment keyword arguments for a view row: either attachment view, or a joined record.
+
+    ATTACH_TYPE is READONLY or READWRITE in MV_CLOUD_ATTACHED_DATABASES and create, resume or pitr in
+    MV_CLOUD_BRANCHES; the row's value goes to the field it belongs to. COMPUTE_ID comes from
+    COMPUTE_ID or LATEST_COMPUTE_ID; a joined record carries ACCESS for the attachment type.
+    """
+    kind = row.get('ATTACH_TYPE')
+    kind = None if kind is None else str(kind)
+    record_type = kind.lower() if kind and kind.lower() in RECORD_TYPES else row.get('RECORD_TYPE')
+    attach_type = kind.upper() if kind and kind.lower() not in RECORD_TYPES else row.get('ACCESS')
+    detached = row.get('IS_DETACHED')
+    return {'database_name': str(row.get('DATABASE_NAME')), 'storage_id': row.get('STORAGE_ID'),
+            'compute_id': row.get('COMPUTE_ID') if row.get('COMPUTE_ID') is not None else row.get('LATEST_COMPUTE_ID'),
+            'attach_type': attach_type, 'record_type': record_type, 'attach_syntax': row.get('ATTACH_SYNTAX'),
+            'is_detached': None if detached is None else int(str(detached))}
 
 
 def create_table_sql(name):
@@ -183,6 +215,8 @@ class Journal:
                 self._migrate_to_1()
             if version < 2:
                 self._migrate_to_2()
+            if version < 3:
+                self._migrate_to_3()
             self.conn.execute("INSERT INTO meta (key, value) VALUES ('schema_version', ?) "
                               'ON CONFLICT(key) DO UPDATE SET value = excluded.value', (str(SCHEMA_VERSION),))
 
@@ -206,9 +240,16 @@ class Journal:
 
     def _migrate_to_2(self):
         """Version 2: tables.recopy_epoch and verification.epoch, added to a version 1 journal when missing."""
+        self._add_columns(2)
+
+    def _migrate_to_3(self):
+        """Version 3: the branch record per attachment (record_type, attach_syntax, is_detached); rows written before stay readable with NULLs."""
+        self._add_columns(3)
+
+    def _add_columns(self, version):
         self.conn.execute('BEGIN')
         try:
-            for name, columns in ADDED_COLUMNS[2].items():
+            for name, columns in ADDED_COLUMNS[version].items():
                 have = set(self._existing_columns(name))
                 for col, decl in columns:
                     if col not in have:
@@ -673,12 +714,35 @@ class Journal:
         return self._rows(sql + ' ORDER BY id', tuple(args))
 
     # -- attachments, grants, pipelines -------------------------------------------
-    def record_attachment(self, role, database_name, storage_id=None, compute_id=None, attach_type=None):
-        """Append an observed attachment row for the role source, replacement, retained or live."""
+    def record_attachment(self, role, database_name, storage_id=None, compute_id=None, attach_type=None, record_type=None, attach_syntax=None,
+                          is_detached=None):
+        """Append an observed attachment row for the role source, replacement, retained or live.
+
+        attach_type is READONLY or READWRITE (MV_CLOUD_ATTACHED_DATABASES); record_type is the
+        branch record's create, resume or pitr, attach_syntax its ATTACH_SYNTAX and is_detached
+        its IS_DETACHED (MV_CLOUD_BRANCHES). A field left None is filled from the latest row of
+        the same role when that row names the same database, STORAGE_ID and COMPUTE_ID, so the
+        two views' rows of one record complete each other.
+        """
         if role not in ATTACHMENT_ROLES:
             raise KitError('Unknown attachment role ' + str(role))
-        self._q('INSERT INTO attachments (role, database_name, storage_id, compute_id, attach_type, observed_utc) '
-                'VALUES (?, ?, ?, ?, ?, ?)', (role, database_name, storage_id, compute_id, attach_type, iso(utc_now())))
+        if record_type is not None and str(record_type) not in RECORD_TYPES:
+            raise KitError('Unknown branch record type %s (create, resume or pitr)' % record_type)
+        values = {'attach_type': attach_type, 'record_type': record_type, 'attach_syntax': attach_syntax, 'is_detached': is_detached}
+        previous = self.attachment(role)
+        if previous and previous.get('database_name') == database_name and _same(previous.get('storage_id'), storage_id) \
+                and _same(previous.get('compute_id'), compute_id):
+            for key, value in values.items():
+                if value is None:
+                    values[key] = previous.get(key)
+        self._q('INSERT INTO attachments (role, database_name, storage_id, compute_id, attach_type, observed_utc, record_type, attach_syntax, is_detached) '
+                'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', (role, database_name, _text(storage_id), _text(compute_id), values['attach_type'], iso(utc_now()),
+                                                      values['record_type'], values['attach_syntax'],
+                                                      None if values['is_detached'] is None else int(values['is_detached'])))
+
+    def record_attachment_row(self, role, row):
+        """Record a row of MV_CLOUD_ATTACHED_DATABASES, of MV_CLOUD_BRANCHES, or a joined record (switch.identify) for a role."""
+        self.record_attachment(role, **attachment_fields(row))
 
     def attachment(self, role):
         """The most recent attachment row for a role, or None."""

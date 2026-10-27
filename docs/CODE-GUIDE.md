@@ -10,7 +10,7 @@ The package is `s2rebuild/`. Every module starts with `s2rebuild <module>: <purp
 - `common.py`: KitError and its exit codes, UTC time helpers, run ids.
 - `config.py`: loads and validates the YAML against a declarative schema, applies defaults and the run-date names, refuses unknown keys, and exposes `Config`, `DatabaseSpec` and `Window` (with the abort deadline rule).
 - `connect.py`: Secrets (Keychain or environment), the Redactor that masks secrets in every line (SQL user names are masked in logs but kept in the admin blocks an operator copies), guarded `Session`, `DryRunSession` and `SessionFactory`, and the 0600 `Log`.
-- `journal.py`: the SQLite journal per run and database (WAL, synchronous FULL, one lock): meta, steps, tables, chunks, verification, attachments, grants snapshot, pipelines, offsets, events; schema migrations; read-only and in-memory copies.
+- `journal.py`: the SQLite journal per run and database (WAL, synchronous FULL, one lock): meta, steps, tables, chunks, verification, attachments (the whole branch record per role: name, STORAGE_ID, COMPUTE_ID, attach type, record type, ATTACH_SYNTAX, detached; `record_attachment_row` takes a row of either attachment view or an `identify` record, and a row completes the latest row of the same record), grants snapshot, pipelines, offsets, events; schema migrations (version 3); read-only and in-memory copies.
 - `sqlutil.py`: identifier quoting, the statement classifier, the Guard (statement kinds and the databases they may name), SQL literals for injected secrets and the forms a secret can take in an error message.
 - `steps.py`: the registry of P1 to C4 with kinds, identities, gates and preconditions; the owner allowances per step; `run_step`, `run_steps` and gate recording. Modules register their handlers here.
 - `inventory.py`: P2 preflight and the P3 and O4 capture (tables, keys, sizes, accounts, sessions, views, routines, pipelines with the credentials placeholder), the copy plan (`TablePlan`, hash buckets), drift.
@@ -25,7 +25,7 @@ The package is `s2rebuild/`. Every module starts with `s2rebuild <module>: <purp
 - `abandon.py`: the abandon command, a run backed out before O10 (source READWRITE again, replacement dropped, run closed).
 - `lockout.py` and `grants.py`: O3 Path B: per-scope snapshots, revoke, the kill loop, restore and compare.
 - `pipelines.py`: O2 stop and capture, O9 replay or verification, O11 release, C1 checks, and the import of a notebook capture.
-- `switch.py`: the O10 state machine and rollback.
+- `switch.py`: the O10 state machine and rollback, and the identity of a database: `identify(session, name)` joins MV_CLOUD_BRANCHES with MV_CLOUD_ATTACHED_DATABASES into one record, `records_match` compares the key (name, STORAGE_ID, ATTACH_TYPE, COMPUTE_ID), `refusal_text` prints both records; every DETACH, ATTACH and DROP of the machine, the rollback, C3 (`ownersql.cleanup_block`) and abandon runs behind that comparison, and R2 re-attaches the original by the ATTACH_SYNTAX S1 recorded.
 - `notebook.py`: fills `notebooks/owner-steps.template.ipynb` with the run, the blocks and ownerlib.
 - `rehearse.py`: P5 on throwaway databases with the SIGKILL test.
 - `bundle.py`: MANIFEST.json, the static-tree scan, the zip and `--verify`.
@@ -49,7 +49,7 @@ The 10.8.0 file is seeded by hand from the kit's queries (its `seeded` field say
 
 1. `config.yaml` becomes a `Config`; each configured database a `DatabaseSpec` with its replacement and retained names.
 2. P3 writes the inventory under `customer/runs/<run>/<db>/inventory/P3/`; O4 writes it again after the freeze. The copy plan comes from the newest capture.
-3. Every step writes its start, end, outcome and evidence to `journal.sqlite`; the copy writes each chunk transition before the statement it guards; admin blocks write each check and statement as events; the switch records storage ids as attachments.
+3. Every step writes its start, end, outcome and evidence to `journal.sqlite`; the copy writes each chunk transition before the statement it guards; admin blocks write each check and statement as events; P2, O3, O5 and the switch record branch records as attachments (a check with a record role stores its first row; the attachment row and the branch row of one record complete each other).
 4. Reports read the capture and the journal: the profile workbook at P3, the final workbook and run report at O8 and C2. `calibrate` reads the chunk timings back into `customer/baseline.json`.
 
 ## Adding a step or a statement

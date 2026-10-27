@@ -28,10 +28,20 @@ from the switched position first runs the zero-change proof (every planned table
 name holds its journal target_count; no pipeline runs on it, no write privilege the lockout
 took is back and no foreign non-idle session is on it) and refuses with what differs. Rollback
 is refused once O11 started releasing writers or C1 saw application writes, and resumes from
-any position behind S1. Statements issued through the O10 owner guard: DETACH DATABASE (with
-the KILL escalation), ATTACH DATABASE and, in the optional rollback step R3, DROP DATABASE on
-the retained copy only.
+any position behind S1.
+Identity is the branch record, never a STORAGE_ID alone (Helios 10.8.0, October 27, 2026: a
+STORAGE_ID names a storage, and a branch keeps its parent's). identify(session, name) joins
+MV_CLOUD_ATTACHED_DATABASES with MV_CLOUD_BRANCHES into one record (name, STORAGE_ID,
+ATTACH_TYPE create, resume or pitr, COMPUTE_ID, ACCESS, IS_DETACHED, IS_DROPPED, END_VERSION,
+ATTACH_SYNTAX); the key is name, STORAGE_ID, ATTACH_TYPE and COMPUTE_ID (records_match), and
+ROW_NUMBER is never read. The journal stores the whole record per role; every DETACH, ATTACH and
+DROP of the machine and of the rollback runs behind a comparison with the recorded record and
+refuses with both records printed when they differ. S1 records the original's detached record,
+whose own ATTACH_SYNTAX (the AT MILESTONE form) R2 runs to re-attach it. Statements issued
+through the O10 owner guard: DETACH DATABASE (with the KILL escalation), ATTACH DATABASE and, in
+the optional rollback step R3, DROP DATABASE on the retained copy only.
 """
+import re
 import sys
 
 from . import ownersql, steps
@@ -67,6 +77,119 @@ def _known(value):
 
 BRANCH_OF_SQL = ('SELECT COUNT(*) AS n FROM information_schema.MV_CLOUD_BRANCHES WHERE DATABASE_NAME = %s AND STORAGE_ID = %s '
                  'AND PREV_DATABASE_NAME = %s AND IS_DROPPED = 0 AND IS_DETACHED = 0')
+RECORD_COLUMNS = 'DATABASE_NAME, STORAGE_ID, ATTACH_TYPE, LATEST_COMPUTE_ID, PREV_DATABASE_NAME, IS_DETACHED, IS_DROPPED, END_VERSION, ATTACH_SYNTAX'
+# every record of a name that is not dropped (parameter: the name); identify joins them with the attachment row
+RECORDS_SQL = 'SELECT %s FROM information_schema.MV_CLOUD_BRANCHES WHERE DATABASE_NAME = %%s AND IS_DROPPED = 0' % RECORD_COLUMNS
+# the attached record of a name on a storage (parameters: name, STORAGE_ID): the printed blocks' record checks
+ATTACHED_RECORD_SQL = ('SELECT %s FROM information_schema.MV_CLOUD_BRANCHES WHERE DATABASE_NAME = %%s AND STORAGE_ID = %%s AND IS_DROPPED = 0 '
+                       'AND IS_DETACHED = 0' % RECORD_COLUMNS)
+# the attached record of a name (parameter: name): S2 and S3 after, R1 before
+NAME_RECORD_SQL = 'SELECT %s FROM information_schema.MV_CLOUD_BRANCHES WHERE DATABASE_NAME = %%s AND IS_DROPPED = 0 AND IS_DETACHED = 0' % RECORD_COLUMNS
+# the detached record of a name on a storage (parameters: name, STORAGE_ID): S1 after, R2 before
+DETACHED_RECORD_SQL = ('SELECT %s FROM information_schema.MV_CLOUD_BRANCHES WHERE DATABASE_NAME = %%s AND STORAGE_ID = %%s AND IS_DROPPED = 0 '
+                       'AND IS_DETACHED = 1' % RECORD_COLUMNS)
+KEY_FIELDS = ('DATABASE_NAME', 'STORAGE_ID', 'ATTACH_TYPE', 'COMPUTE_ID')
+JOURNAL_KEY_FIELDS = ('database_name', 'storage_id', 'record_type', 'compute_id')
+SYNTAX_COMPUTE = re.compile(r' COMPUTEID ([A-Za-z0-9_:-]+)\s*;?\s*$')
+
+
+def compute_id_of(branch_row):
+    """The COMPUTE_ID of a branch record: the COMPUTEID inside its ATTACH_SYNTAX, else LATEST_COMPUTE_ID."""
+    m = SYNTAX_COMPUTE.search(str(branch_row.get('ATTACH_SYNTAX') or ''))
+    if m:
+        return m.group(1)
+    value = branch_row.get('LATEST_COMPUTE_ID')
+    return None if value is None else str(value)
+
+
+def _record(branch_row, attachment=None):
+    record = {'DATABASE_NAME': str(branch_row.get('DATABASE_NAME')), 'STORAGE_ID': str(branch_row.get('STORAGE_ID')),
+              'ATTACH_TYPE': str(branch_row.get('ATTACH_TYPE') or '').lower() or None, 'COMPUTE_ID': compute_id_of(branch_row),
+              'ACCESS': None if attachment is None else str(attachment.get('ATTACH_TYPE')).upper(),
+              'PREV_DATABASE_NAME': branch_row.get('PREV_DATABASE_NAME'), 'IS_DETACHED': int(str(branch_row.get('IS_DETACHED') or 0)),
+              'IS_DROPPED': int(str(branch_row.get('IS_DROPPED') or 0)), 'END_VERSION': branch_row.get('END_VERSION'),
+              'ATTACH_SYNTAX': branch_row.get('ATTACH_SYNTAX')}
+    return record
+
+
+def record_key(record):
+    """(name, STORAGE_ID, ATTACH_TYPE, COMPUTE_ID) as strings for a live record (identify) or a journal attachment row; None when a part is unknown."""
+    if record is None:
+        return None
+    fields = JOURNAL_KEY_FIELDS if 'record_type' in record or 'database_name' in record else KEY_FIELDS
+    values = [record.get(f) for f in fields]
+    if any(v is None or (isinstance(v, str) and ownersql.placeholders(v)) for v in values):
+        return None
+    return tuple(str(v).lower() if i == 2 else str(v) for i, v in enumerate(values))
+
+
+def records_match(a, b):
+    """True when two records (live or journal rows) carry the same name, STORAGE_ID, ATTACH_TYPE and COMPUTE_ID; an unknown part never matches."""
+    ka, kb = record_key(a), record_key(b)
+    return ka is not None and ka == kb
+
+
+def record_text(record):
+    """One line naming a record for a refusal or a log line: name, STORAGE_ID, ATTACH_TYPE, COMPUTE_ID and its state."""
+    if record is None:
+        return 'no record'
+    if 'record_type' in record or 'database_name' in record:
+        state = 'detached' if record.get('is_detached') else ('attached %s' % record['attach_type'] if record.get('attach_type') else 'recorded')
+        return 'name %s, STORAGE_ID %s, ATTACH_TYPE %s, COMPUTE_ID %s (%s)' % (
+            record.get('database_name'), record.get('storage_id'), record.get('record_type'), record.get('compute_id'), state)
+    if record.get('IS_DROPPED'):
+        state = 'dropped'
+    elif record.get('IS_DETACHED'):
+        state = 'detached'
+    else:
+        state = 'attached %s' % (record.get('ACCESS') or '')
+    return 'name %s, STORAGE_ID %s, ATTACH_TYPE %s, COMPUTE_ID %s (%s)' % (
+        record['DATABASE_NAME'], record['STORAGE_ID'], record['ATTACH_TYPE'], record['COMPUTE_ID'], state.strip())
+
+
+def refusal_text(label, expected, observed):
+    """The refusal for a record that differs, with both records printed."""
+    return ('Refused at "%s": the record differs, so nothing was issued. Expected: %s. Observed: %s. Identify the database by its branch '
+            'record (name, STORAGE_ID, ATTACH_TYPE, COMPUTE_ID), never by STORAGE_ID alone, before any further statement'
+            % (label, record_text(expected), record_text(observed)))
+
+
+def records(session, name):
+    """Every record of a name that is not dropped, as identify builds them, the attached one (when any) first. Issues two reads."""
+    attached = _rows(session, ATTACHED_SQL, (name,))
+    att = attached[0] if attached else None
+    out = []
+    for row in _rows(session, RECORDS_SQL, (name,)):
+        joined = att is not None and str(row.get('STORAGE_ID')) == str(att.get('STORAGE_ID')) \
+            and str(compute_id_of(row)) == str(att.get('COMPUTE_ID')) and not int(str(row.get('IS_DETACHED') or 0))
+        out.append(_record(row, att if joined else None))
+    out.sort(key=lambda r: r['ACCESS'] is None)
+    return out
+
+
+def identify(session, name, expected=None):
+    """The record of the attached database named name, else its detached record, else None; never by ROW_NUMBER.
+
+    MV_CLOUD_BRANCHES rows of the name, not dropped, joined in the kit with the
+    MV_CLOUD_ATTACHED_DATABASES row (same STORAGE_ID and COMPUTE_ID): the attached record carries
+    ACCESS (READONLY or READWRITE). With no attached record, the detached one is returned; among
+    several, the one matching expected (records_match), else the first. Issues reads only.
+    """
+    found = records(session, name)
+    attached = [r for r in found if r['ACCESS'] is not None]
+    if attached:
+        return attached[0]
+    detached = [r for r in found if r['IS_DETACHED']]
+    if expected is not None:
+        for r in detached:
+            if records_match(expected, r):
+                return r
+    return detached[0] if detached else None
+
+
+def journal_record(journal, role, record):
+    """Store a live record (identify) in the journal for a role."""
+    journal.record_attachment_row(role, record)
 
 
 def live_is_branch_of_replacement(session, names, live_att, replacement_att):
@@ -177,6 +300,8 @@ def forward_block(names, counts=None, s0_problems=None, withheld=None):
                'O9 passed; time remaining covers the switch allowance; operator typed the live name.')
     block.check('S1 before: source attached with the recorded STORAGE_ID', ATTACHED_SQL, (names['source'],),
                 ownersql.Expect('column_equals', 'STORAGE_ID', names['source_sid']))
+    block.check('S1 before: the source is the recorded record', ATTACHED_RECORD_SQL, (names['source'], names['source_sid']),
+                ownersql.Expect('columns_equal', value=ownersql.record_expect(names, 'source')))
     block.check('S1 before: source attached %s' % ('READONLY (Path A)' if path_a else 'READWRITE with a passed quiet proof (Path B)'),
                 ATTACHED_SQL, (names['source'],), ownersql.Expect('column_equals', 'ATTACH_TYPE', 'READONLY' if path_a else 'READWRITE'))
     block.check('S1 before: no non-idle session on the source other than ours', SESSIONS_SQL, _sessions_params(names),
@@ -196,6 +321,8 @@ def forward_block(names, counts=None, s0_problems=None, withheld=None):
             block.check(withheld_label(account, scope), sql, params, ownersql.Expect('column_equals', 'n', 0))
     block.check('S1 before (for S3): replacement attached READWRITE with the recorded STORAGE_ID', ATTACHED_SQL, (names['replacement'],),
                 ownersql.Expect('columns_equal', value={'STORAGE_ID': names['replacement_sid'], 'ATTACH_TYPE': 'READWRITE'}))
+    block.check('S1 before (for S3): the replacement is the recorded record', ATTACHED_RECORD_SQL, (names['replacement'], names['replacement_sid']),
+                ownersql.Expect('columns_equal', value=ownersql.record_expect(names, 'replacement')))
     block.check('S1 before (for S2): no attached database named retained', ATTACHED_SQL, (names['retained'],), ownersql.Expect('no_rows'))
     block.statement('DETACH DATABASE %s' % ident(names['source']),
                     'S1: detach the source (after %s s of waiting the kit cancels it and issues DETACH ... KILL%s)' % (
@@ -203,11 +330,15 @@ def forward_block(names, counts=None, s0_problems=None, withheld=None):
                     detach={'wait': names.get('detach_wait_seconds', 120), 'kill': bool(names.get('detach_kill', True))})
     block.check('S1 after: source storage detached', BRANCH_SQL, (names['source_sid'],), ownersql.Expect('column_equals', 'IS_DETACHED', 1))
     block.check('S1 after: no attached database named source', ATTACHED_SQL, (names['source'],), ownersql.Expect('no_rows'))
+    block.check('S1 after: the original record is detached with its ATTACH_SYNTAX recorded', DETACHED_RECORD_SQL, (names['source'], names['source_sid']),
+                ownersql.Expect('columns_equal', value=ownersql.record_expect(names, 'source')), record='source')
     block.check('S2 before: no attached database named retained', ATTACHED_SQL, (names['retained'],), ownersql.Expect('no_rows'))
     block.statement("ATTACH DATABASE %s AS %s READ ONLY STORAGEID %s" % (ident(names['source']), ident(names['retained']), names['source_sid']),
                     'S2: attach the original storage read only under the retained name')
     block.check('S2 after: retained attached READONLY', ATTACHED_SQL, (names['retained'],), ownersql.Expect('column_equals', 'ATTACH_TYPE', 'READONLY'),
                 record='retained')
+    block.check('S2 after: the retained name holds a resume record of the original', NAME_RECORD_SQL, (names['retained'],),
+                ownersql.Expect('columns_equal', value={'ATTACH_TYPE': 'resume', 'PREV_DATABASE_NAME': names['source']}), record='retained')
     block.note('S2 after: one small table count in the retained copy equals the journal source count (the kit checks this).')
     block.check('S3 before: replacement attached READWRITE with the recorded STORAGE_ID', ATTACHED_SQL, (names['replacement'],),
                 ownersql.Expect('columns_equal', value={'STORAGE_ID': names['replacement_sid'], 'ATTACH_TYPE': 'READWRITE'}))
@@ -221,6 +352,8 @@ def forward_block(names, counts=None, s0_problems=None, withheld=None):
                 ownersql.Expect('column_not_in', 'STORAGE_ID', [names['source_sid']]))
     block.check('S3 after: the live name is its own branch record of the replacement', BRANCH_OF_SQL,
                 (names['source'], names['replacement_sid'], names['replacement']), ownersql.Expect('column_at_least', 'n', 1))
+    block.check('S3 after: the live name holds a pitr record of the replacement', NAME_RECORD_SQL, (names['source'],),
+                ownersql.Expect('columns_equal', value={'ATTACH_TYPE': 'pitr', 'PREV_DATABASE_NAME': names['replacement']}), record='live')
     block.check('S3 after: the live database reports the target layout', LAYOUT_SQL, (names['source'],),
                 ownersql.Expect('columns_equal', value={'NUM_PARTITIONS': names['partitions'], 'NUM_SUB_PARTITIONS': names['sub_partitions']}))
     for label, sql, key in (('tables', TABLE_COUNT_SQL, 'tables'), ('views', VIEW_COUNT_SQL, 'views'), ('pipelines', PIPELINE_COUNT_SQL, 'pipelines')):
@@ -228,7 +361,7 @@ def forward_block(names, counts=None, s0_problems=None, withheld=None):
             block.check('S3 after: %s count equals the capture' % label, sql, (names['source'],), ownersql.Expect('column_equals', 'n', counts[key]))
     if not counts:
         block.note('S3 after: no capture is available, so the table, view and pipeline counts are not checked here; the kit refuses O10 without one.')
-    block.note('S3 after: the three smallest non-empty tables match the journal counts (the kit checks these and records the live STORAGE_ID).')
+    block.note('S3 after: the three smallest non-empty tables match the journal counts (the kit checks these and records the live record).')
     block.note('The replacement stays attached under its own name until C3.')
     return block
 
@@ -245,6 +378,10 @@ def unproven_tables(table_counts):
 
 def rollback_block(names, released=False, app_writes_seen=None, withheld=None):
     """The rollback block R1 to R3, valid only before O11 released writers; a STOP item when it is no longer valid.
+
+    R1 detaches the live name only while it holds the recorded live record; R2 runs the detached
+    original record's own ATTACH_SYNTAX (original_syntax); R3 drops the retained name only while
+    it holds the recorded retained record.
 
     Before R1 the zero-change proof: one COUNT(*) check per planned table of the live name
     against its journal target_count (names['table_counts'] from names_for), no pipeline Running
@@ -282,19 +419,37 @@ def rollback_block(names, released=False, app_writes_seen=None, withheld=None):
                     ownersql.Expect('column_equals', 'n', 0))
     block.check('R1 before (zero-change proof): no non-idle session on the live name other than ours', SESSIONS_SQL, _sessions_params(names),
                 ownersql.Expect('column_equals', 'n', 0))
-    block.check('R1 before: the attached database named source is the live branch', ATTACHED_SQL, (names['source'],),
-                ownersql.Expect('column_equals', 'STORAGE_ID', names['live_sid']))
+    block.check('R1 before: the attached database named source is the recorded live record', ATTACHED_SQL, (names['source'],),
+                ownersql.Expect('columns_equal', value={'STORAGE_ID': names['live_sid'], 'COMPUTE_ID': names['live_cid'], 'ATTACH_TYPE': 'READWRITE'}))
+    block.check('R1 before: the live record under the live name', NAME_RECORD_SQL, (names['source'],),
+                ownersql.Expect('columns_equal', value=ownersql.record_expect(names, 'live')))
     block.statement('DETACH DATABASE %s' % ident(names['source']), 'R1: detach the live branch')
     block.check('R1 after: no attached database named source', ATTACHED_SQL, (names['source'],), ownersql.Expect('no_rows'))
     block.check('R2 before: the original storage is detached', BRANCH_SQL, (names['source_sid'],), ownersql.Expect('column_equals', 'IS_DETACHED', 1))
-    block.statement("ATTACH DATABASE %s STORAGEID %s" % (ident(names['source']), names['source_sid']), 'R2: re-attach the original read write')
+    block.check('R2 before: the original record is detached with its ATTACH_SYNTAX', DETACHED_RECORD_SQL, (names['source'], names['source_sid']),
+                ownersql.Expect('columns_equal', value=ownersql.record_expect(names, 'source')))
+    block.statement(original_syntax(names), 'R2: re-attach the original record read write by its own ATTACH_SYNTAX')
+    if ownersql.placeholders(original_syntax(names)):
+        block.note('R2: the AT MILESTONE value is the ATTACH_SYNTAX of the detached original record, recorded at S1. Generate this block again '
+                   'after S1 (s2rebuild owner-sql O10 --rollback) to fill it in, or copy the ATTACH_SYNTAX from the row of the R2 check.')
     block.check('R2 after: source attached READWRITE with the original STORAGE_ID', ATTACHED_SQL, (names['source'],),
-                ownersql.Expect('columns_equal', value={'STORAGE_ID': names['source_sid'], 'ATTACH_TYPE': 'READWRITE'}))
-    block.check('R3 before: retained attached', ATTACHED_SQL, (names['retained'],), ownersql.Expect('some_rows'))
+                ownersql.Expect('columns_equal', value={'STORAGE_ID': names['source_sid'], 'ATTACH_TYPE': 'READWRITE', 'COMPUTE_ID': names['source_cid']}))
+    block.check('R3 before: the retained name holds the recorded record', ATTACHED_SQL, (names['retained'],),
+                ownersql.Expect('columns_equal', value={'STORAGE_ID': names['retained_sid'], 'COMPUTE_ID': names['retained_cid'], 'ATTACH_TYPE': 'READONLY'}))
     block.statement('DROP DATABASE %s' % ident(names['retained']), 'R3 (optional): drop the retained branch')
     block.check('R3 after: retained gone', ATTACHED_SQL, (names['retained'],), ownersql.Expect('no_rows'))
-    block.note('The detached live branch left by R1 is deleted in the Portal by STORAGE_ID %s.' % names['live_sid'])
+    block.note('The detached live record left by R1 (name %s, STORAGE_ID %s, COMPUTE_ID %s) stays recoverable by its own ATTACH_SYNTAX; it shares '
+               'its STORAGE_ID with the replacement, so it is never deleted in the Portal by STORAGE_ID. The cleanup flow of the release 1.0 work '
+               'order removes it.' % (names['source'], names['live_sid'], names['live_cid']))
     return block
+
+
+def original_syntax(names):
+    """The R2 statement: the detached original's own ATTACH_SYNTAX as S1 recorded it, else the AT MILESTONE form with a milestone placeholder."""
+    syntax = str(names.get('source_syntax') or '')
+    if names.get('source_detached') and ' AT MILESTONE ' in syntax and not ownersql.placeholders(syntax):
+        return syntax.strip().rstrip(';')
+    return "ATTACH DATABASE %s AT MILESTONE '<source_milestone>' STORAGEID %s COMPUTEID %s" % (ident(names['source']), names['source_sid'], names['source_cid'])
 
 
 def s1_ran(session, journal, source):
@@ -370,10 +525,38 @@ class SwitchMachine:
             raise KitError('Switch refused at "%s": expected %s, observed %s' % (label, expect.text(), observed))
         self.log('    check %s: ok (%s)' % (label, observed))
         if record and rows:
-            row = rows[0]
-            self.journal.record_attachment(record, str(row.get('DATABASE_NAME')), row.get('STORAGE_ID'), row.get('COMPUTE_ID'), row.get('ATTACH_TYPE'))
-            self.names[record + '_sid'] = row.get('STORAGE_ID')
+            self.journal.record_attachment_row(record, rows[0])
+            self.names[record + '_sid'] = rows[0].get('STORAGE_ID')
         return rows
+
+    def _recorded(self, role):
+        """The journal's record for a role (the latest attachments row), or None."""
+        return self.journal.attachment(role)
+
+    def _identify(self, label, name, expected=None, record=None, **fields):
+        """identify(name) behind a check: the record must match expected (when given) and every field named (ACCESS, ATTACH_TYPE, ...).
+
+        A record that differs refuses with both records printed and issues nothing. With record,
+        the live record is stored in the journal for that role and the names are refreshed.
+        """
+        live = identify(self.session, name, expected)
+        if expected is not None and not records_match(expected, live):
+            self.journal.event('switch_check', '%s: FAILED (expected %s; observed %s)' % (label, record_text(expected), record_text(live)))
+            raise KitError(refusal_text(label, expected, live))
+        wrong = [] if live is not None else ['no record under the name %s' % name]
+        for key, want in fields.items():
+            got = None if live is None else live.get(key)
+            if str(got).lower() != str(want).lower():
+                wrong.append('%s = %s, expected %s' % (key, got, want))
+        if wrong:
+            self.journal.event('switch_check', '%s: FAILED (%s; observed %s)' % (label, '; '.join(wrong), record_text(live)))
+            raise KitError('Switch refused at "%s": %s; observed %s' % (label, '; '.join(wrong), record_text(live)))
+        self.journal.event('switch_check', '%s: ok (%s)' % (label, record_text(live)))
+        self.log('    check %s: ok (%s)' % (label, record_text(live)))
+        if record:
+            journal_record(self.journal, record, live)
+            self.names.update(ownersql.record_names(record, self.journal.attachment(record)))
+        return live
 
     def _run(self, sql, label):
         try:
@@ -404,6 +587,7 @@ class SwitchMachine:
             raise KitError('Switch refused before S1: %s not recorded (the replacement STORAGE_ID is recorded at O5)' % ', '.join(missing))
         self._expect('S1 before (for S3): replacement attached READWRITE with the recorded STORAGE_ID', ATTACHED_SQL, (n['replacement'],),
                      ownersql.Expect('columns_equal', value={'STORAGE_ID': n['replacement_sid'], 'ATTACH_TYPE': 'READWRITE'}))
+        self._identify('S1 before (for S3): the replacement is the recorded record', n['replacement'], self._recorded('replacement'), ACCESS='READWRITE')
         self._expect('S1 before (for S2): no attached database named retained', ATTACHED_SQL, (n['retained'],), ownersql.Expect('no_rows'))
 
     def s1_before(self):
@@ -418,6 +602,7 @@ class SwitchMachine:
         readonly = n.get('freeze_mode', 'readonly') == 'readonly'
         self._expect('S1 before: source attached with the recorded STORAGE_ID', ATTACHED_SQL, (n['source'],), ownersql.Expect('column_equals', 'STORAGE_ID', n['source_sid']))
         self._expect('S1 before: source attach type', ATTACHED_SQL, (n['source'],), ownersql.Expect('column_equals', 'ATTACH_TYPE', 'READONLY' if readonly else 'READWRITE'))
+        self._identify('S1 before: the source is the recorded record', n['source'], self._recorded('source'))
         self._expect('S1 before: no foreign non-idle session', SESSIONS_SQL, _sessions_params(n), ownersql.Expect('column_equals', 'n', 0))
         self.preflight()
         if not readonly and self.check_lockout_pass:
@@ -439,6 +624,8 @@ class SwitchMachine:
             self._run('DETACH DATABASE %s' % ident(n['source']), 'S1 DETACH source')
         self._expect('S1 after: source storage detached', BRANCH_SQL, (n['source_sid'],), ownersql.Expect('column_equals', 'IS_DETACHED', 1))
         self._expect('S1 after: no attached database named source', ATTACHED_SQL, (n['source'],), ownersql.Expect('no_rows'))
+        self._identify('S1 after: the original record is detached with its ATTACH_SYNTAX recorded', n['source'], self._recorded('source'),
+                       record='source', IS_DETACHED=1)
 
     def _last_pass_check(self):
         """S1 before on Path B: the last lockout pass in the journal was quiet within freeze.quiet_max_age_seconds (lockout.last_pass_problem)."""
@@ -462,7 +649,9 @@ class SwitchMachine:
     def s2_after(self):
         """The S2 after-checks: retained attached READONLY (recorded) and one small table count equal to the journal."""
         n = self.names
-        self._expect('S2 after: retained attached READONLY', ATTACHED_SQL, (n['retained'],), ownersql.Expect('column_equals', 'ATTACH_TYPE', 'READONLY'), record='retained')
+        self._expect('S2 after: retained attached READONLY', ATTACHED_SQL, (n['retained'],), ownersql.Expect('column_equals', 'ATTACH_TYPE', 'READONLY'))
+        self._identify('S2 after: the retained name holds a resume record of the original', n['retained'], record='retained', ACCESS='READONLY',
+                       ATTACH_TYPE='resume', PREV_DATABASE_NAME=n['source'])
         self._small_table_check(n['retained'], 1)
 
     def s3(self):
@@ -480,7 +669,7 @@ class SwitchMachine:
         """The S3 after-checks: live READWRITE on a new branch (recorded), target layout, capture counts, three smallest tables."""
         n = self.names
         rows = self._expect('S3 after: an attached READWRITE database named source', ATTACHED_SQL, (n['source'],),
-                            ownersql.Expect('column_equals', 'ATTACH_TYPE', 'READWRITE'), record='live')
+                            ownersql.Expect('column_equals', 'ATTACH_TYPE', 'READWRITE'))
         taken = [str(n['source_sid']), str(n['replacement_sid'])] + ([str(n['retained_sid'])] if _known(n.get('retained_sid')) else [])
         sid = str(rows[0].get('STORAGE_ID'))
         if sid in taken:
@@ -490,6 +679,8 @@ class SwitchMachine:
             label = 'S3 after: the live name is its own branch of the replacement (same STORAGE_ID, own COMPUTE_ID, PREV_DATABASE_NAME %s)' % n['replacement']
             self.journal.event('switch_check', '%s: ok' % label)
             self.log('    check %s: ok' % label)
+        self._identify('S3 after: the live name holds a pitr record of the replacement', n['source'], record='live', ACCESS='READWRITE',
+                       ATTACH_TYPE='pitr', PREV_DATABASE_NAME=n['replacement'])
         if self.layout is not None:
             self._expect('S3 after: the live database reports the target layout', LAYOUT_SQL, (n['source'],),
                          ownersql.Expect('columns_equal', value={'NUM_PARTITIONS': self.layout.partitions, 'NUM_SUB_PARTITIONS': self.layout.sub_partitions}))
@@ -587,6 +778,27 @@ class SwitchMachine:
         self.journal.event('rollback_proof', done)
         self.log('    ' + done)
 
+    def _original_syntax(self):
+        """R2 before: the original record is detached and matches the journal; returns its own ATTACH_SYNTAX (the AT MILESTONE form).
+
+        The syntax comes from the live record. When S1 recorded the detached record, its syntax
+        must be the same text: a different one means the record was attached and detached again
+        since, which refuses with both printed.
+        """
+        expected = self._recorded('source')
+        live = self._identify('R2 before: the original record is detached', self.names['source'], expected, IS_DETACHED=1)
+        syntax = str(live.get('ATTACH_SYNTAX') or '').strip().rstrip(';')
+        if not syntax:
+            raise KitError('Rollback refused at R2: the detached original record %s shows no ATTACH_SYNTAX; attach it by hand from the Portal'
+                           % record_text(live))
+        recorded = (expected or {}).get('attach_syntax')
+        if expected and int(expected.get('is_detached') or 0) and recorded and str(recorded).strip().rstrip(';') != syntax:
+            self.journal.event('switch_check', 'R2 before: ATTACH_SYNTAX differs from the one S1 recorded (recorded %s; live %s)' % (recorded, syntax))
+            raise KitError('Rollback refused at R2: the ATTACH_SYNTAX of the original record differs from the one S1 recorded, so the record '
+                           'was attached and detached again since. Recorded: %s. Live: %s. Inspect the record before any further statement'
+                           % (recorded, syntax))
+        return syntax
+
     def rollback(self, drop_retained=False):
         """R1 to R3 from the live position; refused once O11 started releasing writers or application writes were seen.
 
@@ -607,20 +819,22 @@ class SwitchMachine:
             self.zero_change_proof()
         self.journal.set_meta('rollback_started_utc', self.journal.get_meta('rollback_started_utc') or iso(utc_now()))
         if state == SWITCHED:
-            self._expect('R1 before: the attached database named source is the live branch', ATTACHED_SQL, (n['source'],),
-                         ownersql.Expect('column_equals', 'STORAGE_ID', n['live_sid']))
+            self._identify('R1 before: the attached database named source is the recorded live record', n['source'], self._recorded('live'),
+                           ACCESS='READWRITE')
             self._run('DETACH DATABASE %s' % ident(n['source']), 'R1 DETACH live branch')
             self._expect('R1 after: no attached database named source', ATTACHED_SQL, (n['source'],), ownersql.Expect('no_rows'))
         self._expect('R2 before: the original storage is detached', BRANCH_SQL, (n['source_sid'],), ownersql.Expect('column_equals', 'IS_DETACHED', 1))
         self._expect('R2 before: no attached database named source', ATTACHED_SQL, (n['source'],), ownersql.Expect('no_rows'))
-        self._run("ATTACH DATABASE %s STORAGEID %s" % (ident(n['source']), n['source_sid']), 'R2 ATTACH original read write')
+        self._run(self._original_syntax(), 'R2 ATTACH original by its ATTACH_SYNTAX')
         self._expect('R2 after: source attached READWRITE with the original STORAGE_ID', ATTACHED_SQL, (n['source'],),
                      ownersql.Expect('columns_equal', value={'STORAGE_ID': n['source_sid'], 'ATTACH_TYPE': 'READWRITE'}))
+        self._identify('R2 after: the original record is attached READWRITE', n['source'], self._recorded('source'), record='source', ACCESS='READWRITE')
         if drop_retained and _rows(self.session, ATTACHED_SQL, (n['retained'],)):
+            self._identify('R3 before: the retained name holds the recorded record', n['retained'], self._recorded('retained'), ACCESS='READONLY')
             self._run('DROP DATABASE %s' % ident(n['retained']), 'R3 DROP retained')
             self._expect('R3 after: retained gone', ATTACHED_SQL, (n['retained'],), ownersql.Expect('no_rows'))
         self.journal.set_meta('rolled_back_utc', iso(utc_now()))
-        self.journal.event('rollback', 'original %s re-attached READWRITE on STORAGE_ID %s' % (n['source'], n['source_sid']))
+        self.journal.event('rollback', 'original %s re-attached READWRITE by its own ATTACH_SYNTAX (%s)' % (n['source'], record_text(self._recorded('source'))))
         return NOT_STARTED
 
 
@@ -753,16 +967,15 @@ def _typed_live_name(ctx, live):
 
 
 def record_replacement(ctx, session):
-    """Record the replacement attachment (STORAGE_ID) when the journal has none; returns the storage id or None."""
+    """Record the replacement's attached record (identify) when the journal has none; returns the storage id or None."""
     current = ctx.journal.attachment('replacement')
     if current and current.get('storage_id'):
         return current['storage_id']
-    rows = _rows(session, ATTACHED_SQL, (ctx.db.replacement,))
-    if not rows:
+    live = identify(session, ctx.db.replacement)
+    if live is None or live.get('ACCESS') is None:
         return None
-    r = rows[0]
-    ctx.journal.record_attachment('replacement', ctx.db.replacement, r.get('STORAGE_ID'), r.get('COMPUTE_ID'), r.get('ATTACH_TYPE'))
-    return r.get('STORAGE_ID')
+    journal_record(ctx.journal, 'replacement', live)
+    return live['STORAGE_ID']
 
 
 def path_b_pass_age(names, position):

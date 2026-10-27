@@ -432,7 +432,9 @@ def final_summary_rows(inventory, plans, journal, config, db, run_id, name_map=N
     rows.append(('Switch', None))
     for role in ('source', 'replacement', 'retained', 'live'):
         att = journal.attachment(role)
-        rows.append((role, ('%s STORAGE_ID %s %s' % (att['database_name'], att.get('storage_id'), att.get('attach_type') or '')) if att else 'not recorded'))
+        rows.append((role, ('%s STORAGE_ID %s %s; record %s COMPUTE_ID %s%s' % (
+            att['database_name'], att.get('storage_id'), att.get('attach_type') or '', att.get('record_type') or 'unknown', att.get('compute_id'),
+            ' (not attached)' if att.get('is_detached') else '')) if att else 'not recorded'))
     rows.append((None, None))
     rows.append(('Open items', None))
     pending = [s for s, r in board.items() if r.get('status') in ('pending', 'failed', 'running')]

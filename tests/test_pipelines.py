@@ -1084,7 +1084,8 @@ O3_EVENTS = {'DETACH': 'O3 detach the source', 'ATTACH': 'O3 attach the same sto
 def o3_harness(test, owner=True):
     """A Path A harness with the source STORAGE_ID (1028600672070281646:7367158985892520834) recorded, with or without the owner profile."""
     h = owner_harness(test) if owner else Harness(test)
-    h.journal.record_attachment('source', SRC, '1028600672070281646:7367158985892520834', 'cid-1', 'READWRITE')
+    h.journal.record_attachment('source', SRC, '1028600672070281646:7367158985892520834', 'cid-1', 'READWRITE', record_type='create',
+                                attach_syntax='ATTACH DATABASE `%s` STORAGEID 1028600672070281646:7367158985892520834 COMPUTEID cid-1' % SRC, is_detached=0)
     return h
 
 
@@ -1211,7 +1212,7 @@ class FreezeTests(unittest.TestCase):
         h = owner_harness(self)
         out = h.step('O3', redo=True)
         self.assertEqual(out.status, steps.REFUSED)
-        self.assertIn('source_sid not recorded', out.note)
+        self.assertIn('source not recorded', out.note)
         self.assertFalse(any(w.startswith('DETACH') for w in h.fake.writes))
         no_owner = Harness(self)
         out = no_owner.step('O3', redo=True)

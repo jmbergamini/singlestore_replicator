@@ -29,7 +29,7 @@ from .sqlutil import ident, owner_guard, qualified
 RUNNER_PRIVILEGES = ('SELECT', 'INSERT', 'DELETE', 'CREATE', 'DROP', 'ALTER', 'CREATE DATABASE', 'DROP DATABASE', 'PROCESS',
                      'CREATE VIEW', 'SHOW VIEW')
 PASSWORD_PLACEHOLDER = '<password>'
-PLACEHOLDER_SID = re.compile(r'<[a-z_]+_sid>')
+PLACEHOLDER_SID = re.compile(r'<[a-z_]+_(?:sid|cid|type|syntax|milestone)>')
 CANCEL_JOIN_SECONDS = 30
 CLEANUP_ATTACH_TYPES = {'retained': 'READONLY', 'replacement': 'READWRITE'}
 
@@ -365,8 +365,7 @@ def execute_block(block, session, log, journal=None, substitute=None, open_sessi
                 raise KitError('%s stopped at check "%s": expected %s, observed %s' % (block.step_id, item.label, item.expect.text(), observed))
             log('    check %s: ok (%s)' % (item.label, observed))
             if item.record and rows and journal is not None:
-                row = rows[0]
-                journal.record_attachment(item.record, str(row.get('DATABASE_NAME')), row.get('STORAGE_ID'), row.get('COMPUTE_ID'), row.get('ATTACH_TYPE'))
+                journal.record_attachment_row(item.record, rows[0])
             continue
         if item.skip_if:
             count = _first_value(session.query(item.skip_if[0], item.skip_if[1] or None))
@@ -400,13 +399,8 @@ def execute_block(block, session, log, journal=None, substitute=None, open_sessi
 def names_for(ctx):
     """Everything a block needs about the run: names, storage ids, users, layout, settings and the planned table counts (rollback proof)."""
     journal = ctx.journal
-    att = {role: journal.attachment(role) for role in ('source', 'replacement', 'retained', 'live')}
-    return {
+    names = {
         'source': ctx.db.source, 'replacement': ctx.db.replacement, 'retained': ctx.db.retained,
-        'source_sid': (att['source'] or {}).get('storage_id') or '<source_sid>',
-        'replacement_sid': (att['replacement'] or {}).get('storage_id') or '<replacement_sid>',
-        'retained_sid': (att['retained'] or {}).get('storage_id') or '<retained_sid>',
-        'live_sid': (att['live'] or {}).get('storage_id') or '<live_sid>',
         'partitions': ctx.db.layout.partitions, 'sub_partitions': ctx.db.layout.sub_partitions,
         'runner_user': ctx.config.runner.user, 'owner_user': ctx.config.owner.user if ctx.config.owner else None,
         'freeze_mode': ctx.config.freeze.mode, 'detach_wait_seconds': ctx.config.freeze.detach_wait_seconds,
@@ -415,6 +409,26 @@ def names_for(ctx):
         'retain_days': ctx.config.closeout.retain_days, 'run_id': ctx.run_id, 'freeze_time': journal.get_meta('freeze_time'),
         'workspace_id': ctx.config.workspace.get('id'), 'table_counts': table_counts(journal),
     }
+    for role in ('source', 'replacement', 'retained', 'live'):
+        names.update(record_names(role, journal.attachment(role)))
+    return names
+
+
+def record_names(role, att):
+    """The block names of one recorded role: <role>_sid, _cid, _type, _syntax and _detached, with placeholders where nothing is recorded."""
+    att = att or {}
+    return {role + '_sid': att.get('storage_id') or '<%s_sid>' % role, role + '_cid': att.get('compute_id') or '<%s_cid>' % role,
+            role + '_type': att.get('record_type') or '<%s_type>' % role, role + '_syntax': att.get('attach_syntax') or '<%s_syntax>' % role,
+            role + '_detached': att.get('is_detached')}
+
+
+def record_expect(names, role, **more):
+    """The columns_equal values of a MV_CLOUD_BRANCHES record check for a role: LATEST_COMPUTE_ID, ATTACH_TYPE when recorded, and more."""
+    value = {'LATEST_COMPUTE_ID': names[role + '_cid']}
+    if not placeholders(str(names.get(role + '_type') or '')):
+        value['ATTACH_TYPE'] = names[role + '_type']
+    value.update(more)
+    return value
 
 
 def table_counts(journal):
@@ -444,7 +458,7 @@ def withheld_checks(snapshot, db_name):
 
 
 def placeholders(text):
-    """The <..._sid> placeholders still present in a block's text."""
+    """The <role_sid>, <role_cid>, <role_type>, <role_syntax> and <role_milestone> placeholders still present in a text."""
     return sorted(set(PLACEHOLDER_SID.findall(text)))
 
 
@@ -560,43 +574,105 @@ def recorded_absent_sql():
             'WHERE DATABASE_NAME = %s AND STORAGE_ID = %s AND ATTACH_TYPE = %s')
 
 
+def other_record_sql():
+    """COUNT of attached, not dropped branch records under a name with another COMPUTE_ID (parameters: name, COMPUTE_ID).
+
+    0 when the name holds the recorded record or nothing. A COMPUTE_ID belongs to one record,
+    so another one means another database under the name. Issues nothing (reads only).
+    """
+    return ('SELECT COUNT(*) AS n FROM information_schema.MV_CLOUD_BRANCHES WHERE DATABASE_NAME = %s AND IS_DROPPED = 0 AND IS_DETACHED = 0 '
+            'AND LATEST_COMPUTE_ID <> %s')
+
+
+def record_elsewhere_sql():
+    """COUNT of attached records with a STORAGE_ID and COMPUTE_ID under any other name (parameters: STORAGE_ID, COMPUTE_ID, name).
+
+    0 when the recorded record is attached under its own name, detached or dropped. A positive
+    count means the name in the block is not the recorded one. Issues nothing (reads only).
+    """
+    return ('SELECT COUNT(*) AS n FROM information_schema.MV_CLOUD_BRANCHES WHERE STORAGE_ID = %s AND LATEST_COMPUTE_ID = %s AND IS_DROPPED = 0 '
+            'AND IS_DETACHED = 0 AND DATABASE_NAME <> %s')
+
+
+def record_detached_sql():
+    """COUNT of detached, not dropped records with a STORAGE_ID and COMPUTE_ID (parameters: STORAGE_ID, COMPUTE_ID).
+
+    0 unless the recorded record was detached, which means someone moved it: the DROP would be
+    skipped and the record left behind, so the block stops first. Issues nothing (reads only).
+    """
+    return ('SELECT COUNT(*) AS n FROM information_schema.MV_CLOUD_BRANCHES WHERE STORAGE_ID = %s AND LATEST_COMPUTE_ID = %s AND IS_DROPPED = 0 '
+            'AND IS_DETACHED = 1')
+
+
+def record_absent_sql():
+    """1 unless a name holds the recorded record attached, else 0 (parameters: name, STORAGE_ID, COMPUTE_ID): the skip_if of a C3 DROP DATABASE.
+
+    The DROP is skipped when its name holds nothing or another record, so a database that
+    appears under the name after the identity check is never dropped; the checks after the
+    DROP then refuse. Issues nothing (reads only).
+    """
+    return ('SELECT COUNT(*) = 0 AS n FROM information_schema.MV_CLOUD_BRANCHES WHERE DATABASE_NAME = %s AND STORAGE_ID = %s '
+            'AND LATEST_COMPUTE_ID = %s AND IS_DROPPED = 0 AND IS_DETACHED = 0')
+
+
+def record_state_sql():
+    """The branch record of a name, STORAGE_ID and COMPUTE_ID with its IS_DETACHED, IS_DROPPED and ATTACH_SYNTAX (parameters: name, STORAGE_ID, COMPUTE_ID)."""
+    return ('SELECT DATABASE_NAME, STORAGE_ID, ATTACH_TYPE, LATEST_COMPUTE_ID, IS_DETACHED, IS_DROPPED, ATTACH_SYNTAX '
+            'FROM information_schema.MV_CLOUD_BRANCHES WHERE DATABASE_NAME = %s AND STORAGE_ID = %s AND LATEST_COMPUTE_ID = %s')
+
+
+def record_identity_checks(block, names, role, label, again=False):
+    """The identity checks of one recorded role before its DROP: the name holds the recorded record or nothing, no other record under the
+    name, the recorded record attached under no other name and not detached (the last two once; again=True leaves them out)."""
+    name, sid, cid, kind = names[role], names[role + '_sid'], names[role + '_cid'], CLEANUP_ATTACH_TYPES[role]
+    still = 'still ' if again else ''
+    block.check('%s name %sholds the recorded %s %s, or nothing' % (role, still, label, kind), attached_otherwise_sql(), (name, sid, kind),
+                Expect('column_equals', 'n', 0))
+    block.check('%s name %sholds no other record' % (role, still), other_record_sql(), (name, cid), Expect('column_equals', 'n', 0))
+    if not again:
+        block.check('recorded %s record attached under no other name' % role, record_elsewhere_sql(), (sid, cid, name), Expect('column_equals', 'n', 0))
+        block.check('recorded %s record not detached' % role, record_detached_sql(), (sid, cid), Expect('column_equals', 'n', 0))
+
+
 def cleanup_block(names):
-    """C3: drop the retained branch and the replacement after retain_days; the detached original is deleted in the Portal.
+    """C3: drop the retained branch and the replacement after retain_days; the detached original stays for the cleanup flow.
 
     Issues DROP DATABASE on the retained and replacement names only, each only while its name
-    holds the database the run recorded: the retained branch (STORAGE_ID from O10 S2, READONLY)
-    and the replacement (STORAGE_ID from O5, READWRITE). Both identities are checked before the
-    first DROP: the name holds the recorded database or nothing, and the recorded STORAGE_ID is
-    attached under no other name. The retained check sits directly before its DROP and the
-    replacement is checked again just before its own DROP. Another database under either name,
-    a recorded database under another name, or a name in the block that is not the recorded one
-    stops the block with nothing dropped. A DROP is skipped unless its name holds the recorded
-    database, so a rerun after a partial cleanup finishes it. After each DROP the name must be
-    free and the recorded STORAGE_ID attached nowhere. The live name is checked first and last.
+    holds the record the run recorded: the retained copy (the resume record of O10 S2, READONLY)
+    and the replacement (the create record of O5, READWRITE). A record is name, STORAGE_ID,
+    ATTACH_TYPE and COMPUTE_ID (Helios 10.8.0: the live branch shares the replacement's
+    STORAGE_ID, so a STORAGE_ID alone names nothing). Both identities are checked before the
+    first DROP (record_identity_checks). The retained checks sit directly before its DROP and the
+    replacement is checked again just before its own DROP. Another record under either name, a
+    recorded record under another name or detached, or a name in the block that is not the
+    recorded one stops the block with nothing dropped. A DROP is skipped unless its name holds
+    the recorded record, so a rerun after a partial cleanup finishes it. After each DROP the name
+    must be free and the recorded record dropped. The live name is checked first and last.
     """
-    retained = (names['retained'], names['retained_sid'], CLEANUP_ATTACH_TYPES['retained'])
-    replacement = (names['replacement'], names['replacement_sid'], CLEANUP_ATTACH_TYPES['replacement'])
-    replacement_label = 'the recorded replacement %s, or nothing' % replacement[2]
+    from . import switch
+    live = {'STORAGE_ID': names['live_sid'], 'COMPUTE_ID': names['live_cid']}
     block = Block('C3', 'Retention cleanup')
     block.note('Run only after %s retention days have passed since O11 and the customer has accepted the live database.' % names['retain_days'])
-    block.check('live name resolves to the live branch', inventory_attachment_sql(), (names['source'],), Expect('column_equals', 'STORAGE_ID', names['live_sid']))
-    block.check('replacement name holds ' + replacement_label, attached_otherwise_sql(), replacement, Expect('column_equals', 'n', 0))
-    block.check('recorded replacement attached under no other name', attached_elsewhere_sql(), (replacement[1], replacement[0]),
-                Expect('column_equals', 'n', 0))
-    block.check('recorded retained branch attached under no other name', attached_elsewhere_sql(), (retained[1], retained[0]),
-                Expect('column_equals', 'n', 0))
-    block.check('retained name holds the recorded retained branch %s, or nothing' % retained[2], attached_otherwise_sql(), retained,
-                Expect('column_equals', 'n', 0))
-    block.statement('DROP DATABASE %s' % ident(names['retained']), 'drop the retained read-only branch', skip_if=(recorded_absent_sql(), retained))
+    block.check('live name resolves to the live record', inventory_attachment_sql(), (names['source'],), Expect('columns_equal', value=live))
+    block.check('live record attached under the live name', switch.ATTACHED_RECORD_SQL, (names['source'], names['live_sid']),
+                Expect('columns_equal', value=record_expect(names, 'live')))
+    record_identity_checks(block, names, 'replacement', 'replacement')
+    record_identity_checks(block, names, 'retained', 'retained branch')
+    block.statement('DROP DATABASE %s' % ident(names['retained']), 'drop the retained read-only branch',
+                    skip_if=(record_absent_sql(), (names['retained'], names['retained_sid'], names['retained_cid'])))
     block.check('retained is gone', inventory_attachment_sql(), (names['retained'],), Expect('no_rows'))
-    block.check('recorded retained branch attached nowhere', storage_attached_sql(), (retained[1],), Expect('column_equals', 'n', 0))
-    block.check('replacement name still holds ' + replacement_label, attached_otherwise_sql(), replacement, Expect('column_equals', 'n', 0))
+    block.check('recorded retained record dropped', record_state_sql(), (names['retained'], names['retained_sid'], names['retained_cid']),
+                Expect('column_equals', 'IS_DROPPED', 1))
+    record_identity_checks(block, names, 'replacement', 'replacement', again=True)
     block.statement('DROP DATABASE %s' % ident(names['replacement']), 'drop the replacement (the live branch is independent of it)',
-                    skip_if=(recorded_absent_sql(), replacement))
+                    skip_if=(record_absent_sql(), (names['replacement'], names['replacement_sid'], names['replacement_cid'])))
     block.check('replacement is gone', inventory_attachment_sql(), (names['replacement'],), Expect('no_rows'))
-    block.check('recorded replacement attached nowhere', storage_attached_sql(), (replacement[1],), Expect('column_equals', 'n', 0))
-    block.check('live name still resolves to the live branch', inventory_attachment_sql(), (names['source'],), Expect('column_equals', 'STORAGE_ID', names['live_sid']))
-    block.note('Delete the detached original storage %s in the Portal by STORAGE_ID. Keep the evidence folder.' % names['source_sid'])
+    block.check('recorded replacement record dropped', record_state_sql(), (names['replacement'], names['replacement_sid'], names['replacement_cid']),
+                Expect('column_equals', 'IS_DROPPED', 1))
+    block.check('live name still resolves to the live record', inventory_attachment_sql(), (names['source'],), Expect('columns_equal', value=live))
+    block.note('The detached original record (name %s, STORAGE_ID %s, ATTACH_TYPE %s, COMPUTE_ID %s) stays; the retained copy shares its '
+               'STORAGE_ID, so it is never deleted in the Portal by STORAGE_ID. The cleanup flow of the release 1.0 work order removes it. '
+               'Keep the evidence folder.' % (names['source'], names['source_sid'], names['source_type'], names['source_cid']))
     return block
 
 
@@ -730,15 +806,18 @@ def guard_check_block(block, ctx, identity=steps.OWNER):
     key = block.guard_step if block.guard_step in steps.OWNER_ALLOWANCES else 'P1'
     guard = steps.guard_for(key, ctx.db, identity)
     for item in block.statements:
-        guard.check(re.sub(r'<[a-z_]+>', 'placeholder', item.sql))
+        # a milestone placeholder stands where the AT MILESTONE value of the detached original goes (the rollback block before S1 ran)
+        sql = re.sub(r"AT MILESTONE '<[a-z_]+_milestone>'", "AT MILESTONE '2000-01-01 00_00_00.000000'", item.sql)
+        guard.check(re.sub(r'<[a-z_]+>', 'placeholder', sql))
 
 
 def refuse_placeholders(block):
-    """Refuse to execute a block that still holds a <..._sid> placeholder: the storage id was never recorded."""
+    """Refuse to execute a block that still holds a placeholder: the record of that role was never recorded."""
     missing = placeholders(block.render())
     if missing:
-        raise KitError('%s cannot run: %s not recorded yet (the source STORAGE_ID is recorded at P3 or O3, the replacement at O5, '
-                       'retained and live at O10)' % (block.step_id, ', '.join(m.strip('<>') for m in missing)))
+        roles = sorted({m.strip('<>').rsplit('_', 1)[0] for m in missing})
+        raise KitError('%s cannot run: %s not recorded yet (the source record is recorded at P2, P3 or O3, the replacement at O5, '
+                       'retained and live at O10, the detached original at O10 S1)' % (block.step_id, ', '.join(roles)))
 
 
 def handle_admin(step, ctx, block, after=None, substitute=None, before_first_statement=None, path=None):

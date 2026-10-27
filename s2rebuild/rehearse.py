@@ -357,10 +357,9 @@ def _rehearse_switch(ctx, sub, spec, names, plans, data, journal, timed, timings
     reader = ctx.runner_session(read_guard('runner P5'))
     try:
         for role, name in (('source', names['source']), ('replacement', names['replacement'])):
-            rows_att = reader.query(switch.ATTACHED_SQL, (name,))
-            if rows_att:
-                r = rows_att[0]
-                journal.record_attachment(role, name, r.get('STORAGE_ID'), r.get('COMPUTE_ID'), r.get('ATTACH_TYPE'))
+            live = switch.identify(reader, name)
+            if live is not None and live.get('ACCESS') is not None:
+                switch.journal_record(journal, role, live)
     finally:
         reader.close()
     sw_names = ownersql.names_for(sub)

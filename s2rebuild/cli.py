@@ -564,8 +564,7 @@ def _record_observed_switch(inv, result, log):
             continue
         journal = inv.journals[db.source]
         for att in rows:
-            row = att['row']
-            journal.record_attachment(att['role'], str(row.get('DATABASE_NAME')), row.get('STORAGE_ID'), row.get('COMPUTE_ID'), row.get('ATTACH_TYPE'))
+            journal.record_attachment_row(att['role'], att['row'])
         journal.event('switch_observed', 'gate O10 --pass evidence (refused): %s' % ', '.join(
             '%s %s on STORAGE_ID %s' % (att['role'], att['row'].get('DATABASE_NAME'), att['row'].get('STORAGE_ID')) for att in rows))
         if log is not None:
@@ -605,7 +604,7 @@ def _import_evidence(ctx, step_id, result, log):
     for att in result.get('attachments') or []:
         row = att.get('row') or {}
         if att.get('role') in ('source', 'replacement', 'retained', 'live') and row.get('STORAGE_ID'):
-            ctx.journal.record_attachment(att['role'], str(row.get('DATABASE_NAME')), row.get('STORAGE_ID'), row.get('COMPUTE_ID'), row.get('ATTACH_TYPE'))
+            ctx.journal.record_attachment_row(att['role'], row)
             log('attachment %s recorded from the notebook result: %s on STORAGE_ID %s' % (att['role'], row.get('DATABASE_NAME'), row.get('STORAGE_ID')))
 
 
@@ -772,8 +771,7 @@ def cmd_profile(args, env, out, state):
                     if not inv.dry_run:
                         journal.set_meta('inventory_dir_' + step_id, str(target_dir))
                         if data.get('attachment'):
-                            journal.record_attachment('source', db.source, data['attachment'].get('STORAGE_ID'),
-                                                      data['attachment'].get('COMPUTE_ID'), data['attachment'].get('ATTACH_TYPE'))
+                            journal.record_attachment_row('source', dict(data['attachment'], DATABASE_NAME=db.source))
                 except KitError as exc:
                     if not inv.dry_run:
                         journal.step_end(step_id, 'pending', str(exc))

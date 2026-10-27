@@ -981,6 +981,8 @@ class FakeCursor:
         base = db.listing_counter * 100
         if re.fullmatch(r'COUNT\(\*\) AS n', select):
             return [{'n': len(rows)}]
+        if re.fullmatch(r'COUNT\(\*\) = 0 AS n', select):
+            return [{'n': int(not rows)}]
         out = []
         for i, b in enumerate(rows, 1):
             row = dict(public_row(b), ROW_NUMBER=base + i)

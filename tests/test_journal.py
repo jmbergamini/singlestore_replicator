@@ -147,12 +147,13 @@ class SchemaTests(unittest.TestCase):
             ro.close()
 
     def test_f4_version_1_journal_upgrades_in_place_to_version_2(self):
-        """A version 1 journal gains tables.recopy_epoch (0) and verification.epoch (unknown for the rows it holds) and keeps its data."""
+        """A version 1 journal gains tables.recopy_epoch (0) and verification.epoch (unknown for the rows it holds), then the version 3
+        attachment record columns, and keeps its data."""
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'v1.sqlite'
             version_1_journal(path)
             j = Journal(path)
-            self.assertEqual((j.schema_version(), SCHEMA_VERSION), (2, 2))
+            self.assertEqual((j.schema_version(), SCHEMA_VERSION), (3, 3))
             for table, cols in COLUMNS.items():
                 self.assertEqual(set(j._existing_columns(table)), {c for c, _ in cols}, table)
             self.assertEqual(j.recopy_epoch('t1'), 0)
@@ -165,7 +166,7 @@ class SchemaTests(unittest.TestCase):
             self.assertEqual(j.verification_state()[0]['epoch_verified'], 1)
             j.close()
             again = Journal(path)
-            self.assertEqual(again.schema_version(), 2)
+            self.assertEqual(again.schema_version(), 3)
             again.close()
 
     def test_f4_read_only_open_reads_a_version_1_journal_without_changing_it(self):

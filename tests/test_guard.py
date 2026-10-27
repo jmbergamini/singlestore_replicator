@@ -358,7 +358,7 @@ ALLOWANCES = {
     'cli.py': {'pipeline', 'drop', 'grant', 'revoke', 'kill', 'attach'},   # command help text, the --drop flag, record_attachment
     'inventory.py': {'pipeline', 'grant', 'attach', 'drop'},  # pipeline capture, grantees, attachment row, DROP in the write privilege list
     'estimate.py': {'pipeline', 'attach', 'revoke', 'kill'},   # pipeline allowance and the plan sheet's freeze path wording
-    'report_xlsx.py': {'pipeline', 'grant', 'attach', 'revoke'},  # Pipelines tabs, grants scope row, source attachment row, Path B action row
+    'report_xlsx.py': {'pipeline', 'grant', 'attach', 'revoke', 'detach'},  # Pipelines tabs, grants scope row, the attachment rows and their is_detached column, Path B action row
     'copy.py': {'drop', 'kill'},                                # DROP TABLE in the fresh-table fallback (section 10.9); the hard-stop hint names the operating system kill, no KILL statement
     'transform.py': set(),
     'verify.py': set(),
@@ -373,9 +373,9 @@ ALLOWANCES = {
     'pipelines.py': {'pipeline', 'grant', 'revoke'},                   # pipeline statements, grant restore at O11 (grants revoked by the lockout)
     'notebook.py': {'grant', 'revoke', 'kill', 'pipeline', 'detach'},  # the lockout cell text and the run payload
     'abandon.py': {'detach', 'attach', 'drop', 'kill', 'revoke'},  # the abandon block, detach_kill of the escalation, the Path B refusal text
-    'rehearse.py': {'drop', 'attach', 'detach', 'kill', 'pipeline'},  # cleanup DROP DATABASE, attachment records, the SIGKILL test, detached storage note
+    'rehearse.py': {'drop', 'detach', 'kill', 'pipeline'},  # cleanup DROP DATABASE, the SIGKILL test, detached storage note
     'config.py': {'pipeline', 'detach', 'kill'},  # pipelines section, detach_wait_seconds, detach_kill
-    'journal.py': {'pipeline', 'grant', 'attach', 'revoke'},  # pipelines, grants_snapshot (never overwritten by a revoked state) and attachments tables
+    'journal.py': {'pipeline', 'grant', 'attach', 'revoke', 'detach'},  # pipelines, grants_snapshot (never overwritten by a revoked state), the attachments table and its is_detached column
     'connect.py': set(),
     'bundle.py': set(),
     'enginecapture.py': {'pipeline', 'attach', 'detach', 'drop'},  # the PIPELINES views, the ATTACH forms and the 2720 row of the error table

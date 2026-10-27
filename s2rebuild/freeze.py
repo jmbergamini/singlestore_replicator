@@ -91,6 +91,9 @@ def _attach(b, names):
 def _after_checks(b, names):
     b.check('source attached READONLY', switch.ATTACHED_SQL, (names['source'],), ownersql.Expect('column_equals', 'ATTACH_TYPE', 'READONLY'), record='source')
     b.check('source STORAGE_ID unchanged', switch.ATTACHED_SQL, (names['source'],), ownersql.Expect('column_equals', 'STORAGE_ID', names['source_sid']))
+    # the branch record of the source (name, STORAGE_ID, ATTACH_TYPE, COMPUTE_ID) is recorded whole: the switch and the rollback go by it
+    b.check('source record attached on the recorded storage', switch.ATTACHED_RECORD_SQL, (names['source'], names['source_sid']),
+            ownersql.Expect('columns_equal', value=ownersql.record_expect(names, 'source')), record='source')
     b.check('source reported by the workspace', switch.LAYOUT_SQL, (names['source'],), ownersql.Expect('some_rows'))
 
 

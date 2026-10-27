@@ -22,6 +22,9 @@ from tests.test_verify import (LATE_ROW, arm_recopy, assert_counter_follows, ass
                                run_from_o6)
 
 RET = 'example_orders_db_retained_20261101'
+SID = '1028600672070281646:7367158985892520834'
+# the branch record of the fixture source as the fake seeds it (O3 records it with the attachment row)
+SOURCE_RECORD = {'record_type': 'create', 'attach_syntax': 'ATTACH DATABASE `%s` STORAGEID %s COMPUTEID cid-1' % (SRC, SID), 'is_detached': 0}
 S3_PATTERN = r'^ATTACH DATABASE `%s` AS `%s`' % (TGT, SRC)
 
 
@@ -44,7 +47,7 @@ def switched_harness(test, mutate=None, mutate_inventory=None, owner=True):
     h.env['S2REBUILD_OWNER_PASSWORD'] = 'owner-fixture'
     assert h.o5_o6().status == steps.PASSED, h.text()
     h.fake.attachment(SRC)['ATTACH_TYPE'] = 'READONLY'
-    h.journal.record_attachment('source', SRC, '1028600672070281646:7367158985892520834', 'cid-1', 'READONLY')
+    h.journal.record_attachment('source', SRC, SID, 'cid-1', 'READONLY', **SOURCE_RECORD)
     assert h.journal.attachment('replacement')['storage_id'] == h.fake.attachment(TGT)['STORAGE_ID'], 'O5 records the replacement'
     return h
 
@@ -250,12 +253,10 @@ DROP_LABELS = {RET: 'drop the retained read-only branch', TGT: 'drop the replace
 def cleanup_harness(test):
     """A harness after the switch, O11 to C2 passed and released_utc far enough in the past that C3 is due."""
     h = switched_harness(test)
-    # C3 drops the retained copy while it is attached READ ONLY, which Helios 10.8.0 refuses with 2720 (W3 replaces this flow
-    # with the detach, re-attach read write by syntax, drop sequence), and its identity checks go by STORAGE_ID alone, which
-    # the shared STORAGE_ID of the live branch defeats (W2 moves them to the branch record); these tests cover the identity
-    # checks of the DROPs on a storage model without both facts
+    # C3 drops the retained copy while it is attached READ ONLY, which Helios 10.8.0 refuses with 2720 (fact 28; W3 replaces this
+    # flow with the detach, re-attach read write by syntax, drop sequence); these tests cover the identity checks of the DROPs,
+    # which go by the branch record (name, STORAGE_ID, ATTACH_TYPE, COMPUTE_ID) on the shared STORAGE_ID of fact 27
     h.fake.refuse_read_only_drop = False
-    h.fake.branch_keeps_storage_id = False
     machine, _ = machine_for(h)
     assert machine.forward() == switch.SWITCHED, h.text()
     for step_id in ('O7', 'O8', 'O9', 'O10', 'O11', 'C1', 'C2'):
@@ -297,7 +298,7 @@ def reuse_name(h, name):
 
 
 # The skip_if query of a C3 DROP; change_before on it puts another actor between the identity checks and the DROP.
-SKIP_QUERY = r'^SELECT COUNT\(\*\) = 0 AS n FROM information_schema\.MV_CLOUD_ATTACHED_DATABASES WHERE DATABASE_NAME = %s'
+SKIP_QUERY = r'^SELECT COUNT\(\*\) = 0 AS n FROM information_schema\.MV_CLOUD_BRANCHES WHERE DATABASE_NAME = %s'
 
 
 def move_attachment(fake, name, new_name):
@@ -1035,50 +1036,69 @@ class CleanupIdentityTests(unittest.TestCase):
         self.assertEqual((live['STORAGE_ID'], live['ATTACH_TYPE']), (h.journal.attachment('live')['storage_id'], 'READWRITE'))
 
     def test_f3_cleanup_block_checks_identity_before_each_drop(self):
-        """The C3 block in order: the live name, then both identities before the first DROP.
+        """The C3 block in order: the live record, then both identities before the first DROP.
 
-        Each identity is two checks: the name holds the recorded STORAGE_ID and attach type or
-        nothing, and the recorded STORAGE_ID is attached under no other name. The retained check
-        sits directly before its DROP and the replacement is checked again just before its own
-        DROP. Each DROP is skipped unless its name holds the recorded database. After each DROP
-        the name is free and the recorded STORAGE_ID is attached nowhere; the live name comes
-        last. With no retained attachment recorded, C3 refuses before any statement.
+        Each identity is four checks on the branch record (name, STORAGE_ID, ATTACH_TYPE,
+        COMPUTE_ID): the name holds the recorded STORAGE_ID and attach type or nothing, no other
+        record is attached under the name, the recorded record is attached under no other name,
+        and it is not detached. The retained checks sit directly before its DROP and the
+        replacement is checked again just before its own DROP. Each DROP is skipped unless its
+        name holds the recorded record. After each DROP the name is free and the record is
+        dropped; the live record comes last. With no retained record recorded, C3 refuses before
+        any statement.
         """
         h = cleanup_harness(self)
         names = ownersql.names_for(h.ctx())
         rsid, tsid, lsid = names['retained_sid'], names['replacement_sid'], names['live_sid']
-        self.assertEqual(rsid, h.fake.attachment(RET)['STORAGE_ID'], 'S2 recorded the retained branch')
-        self.assertEqual(tsid, h.fake.attachment(TGT)['STORAGE_ID'], 'O5 recorded the replacement')
+        rcid, tcid, lcid = names['retained_cid'], names['replacement_cid'], names['live_cid']
+        self.assertEqual((rsid, rcid), (h.fake.attachment(RET)['STORAGE_ID'], h.fake.attachment(RET)['COMPUTE_ID']), 'S2 recorded the retained record')
+        self.assertEqual((tsid, tcid), (h.fake.attachment(TGT)['STORAGE_ID'], h.fake.attachment(TGT)['COMPUTE_ID']), 'O5 recorded the replacement record')
+        self.assertEqual((rsid, tsid, lsid), (SID, tsid, tsid), 'Helios 10.8.0: the retained copy shares the original storage, the live name the replacement storage')
+        self.assertEqual((names['retained_type'], names['replacement_type'], names['live_type']), ('resume', 'create', 'pitr'))
         views = 'FROM information_schema.MV_CLOUD_ATTACHED_DATABASES WHERE '
+        branches = 'FROM information_schema.MV_CLOUD_BRANCHES WHERE '
         row = 'SELECT DATABASE_NAME, ATTACH_TYPE, STORAGE_ID, COMPUTE_ID, ATTACH_SYNTAX ' + views + "DATABASE_NAME = '%s';"
+        record = ('SELECT DATABASE_NAME, STORAGE_ID, ATTACH_TYPE, LATEST_COMPUTE_ID, PREV_DATABASE_NAME, IS_DETACHED, IS_DROPPED, END_VERSION, ATTACH_SYNTAX '
+                  + branches + "DATABASE_NAME = '%s' AND STORAGE_ID = '%s' AND IS_DROPPED = 0 AND IS_DETACHED = 0;")
         otherwise = 'SELECT COUNT(*) AS n ' + views + "DATABASE_NAME = '%s' AND (STORAGE_ID <> '%s' OR ATTACH_TYPE <> '%s');"
-        elsewhere = 'SELECT COUNT(*) AS n ' + views + "STORAGE_ID = '%s' AND DATABASE_NAME <> '%s';"
-        anywhere = 'SELECT COUNT(*) AS n ' + views + "STORAGE_ID = '%s';"
-        skip = ('-- SKIP the next statement when this returns n > 0: SELECT COUNT(*) = 0 AS n ' + views
-                + "DATABASE_NAME = '%s' AND STORAGE_ID = '%s' AND ATTACH_TYPE = '%s';")
+        other_record = 'SELECT COUNT(*) AS n ' + branches + "DATABASE_NAME = '%s' AND IS_DROPPED = 0 AND IS_DETACHED = 0 AND LATEST_COMPUTE_ID <> '%s';"
+        elsewhere = 'SELECT COUNT(*) AS n ' + branches + "STORAGE_ID = '%s' AND LATEST_COMPUTE_ID = '%s' AND IS_DROPPED = 0 AND IS_DETACHED = 0 AND DATABASE_NAME <> '%s';"
+        detached = 'SELECT COUNT(*) AS n ' + branches + "STORAGE_ID = '%s' AND LATEST_COMPUTE_ID = '%s' AND IS_DROPPED = 0 AND IS_DETACHED = 1;"
+        state = ('SELECT DATABASE_NAME, STORAGE_ID, ATTACH_TYPE, LATEST_COMPUTE_ID, IS_DETACHED, IS_DROPPED, ATTACH_SYNTAX ' + branches
+                 + "DATABASE_NAME = '%s' AND STORAGE_ID = '%s' AND LATEST_COMPUTE_ID = '%s';")
+        skip = ('-- SKIP the next statement when this returns n > 0: SELECT COUNT(*) = 0 AS n ' + branches
+                + "DATABASE_NAME = '%s' AND STORAGE_ID = '%s' AND LATEST_COMPUTE_ID = '%s' AND IS_DROPPED = 0 AND IS_DETACHED = 0;")
+        live = '; expect STORAGE_ID = %s, COMPUTE_ID = %s' % (lsid, lcid)
         expected = [
-            '-- CHECK live name resolves to the live branch; expect STORAGE_ID = ' + lsid, row % SRC,
+            '-- CHECK live name resolves to the live record' + live, row % SRC,
+            '-- CHECK live record attached under the live name; expect LATEST_COMPUTE_ID = %s, ATTACH_TYPE = pitr' % lcid, record % (SRC, lsid),
             '-- CHECK replacement name holds the recorded replacement READWRITE, or nothing; expect n = 0', otherwise % (TGT, tsid, 'READWRITE'),
-            '-- CHECK recorded replacement attached under no other name; expect n = 0', elsewhere % (tsid, TGT),
-            '-- CHECK recorded retained branch attached under no other name; expect n = 0', elsewhere % (rsid, RET),
+            '-- CHECK replacement name holds no other record; expect n = 0', other_record % (TGT, tcid),
+            '-- CHECK recorded replacement record attached under no other name; expect n = 0', elsewhere % (tsid, tcid, TGT),
+            '-- CHECK recorded replacement record not detached; expect n = 0', detached % (tsid, tcid),
             '-- CHECK retained name holds the recorded retained branch READONLY, or nothing; expect n = 0', otherwise % (RET, rsid, 'READONLY'),
-            '-- ' + DROP_LABELS[RET], skip % (RET, rsid, 'READONLY'), 'DROP DATABASE `%s`;' % RET,
+            '-- CHECK retained name holds no other record; expect n = 0', other_record % (RET, rcid),
+            '-- CHECK recorded retained record attached under no other name; expect n = 0', elsewhere % (rsid, rcid, RET),
+            '-- CHECK recorded retained record not detached; expect n = 0', detached % (rsid, rcid),
+            '-- ' + DROP_LABELS[RET], skip % (RET, rsid, rcid), 'DROP DATABASE `%s`;' % RET,
             '-- CHECK retained is gone; expect no rows', row % RET,
-            '-- CHECK recorded retained branch attached nowhere; expect n = 0', anywhere % rsid,
+            '-- CHECK recorded retained record dropped; expect IS_DROPPED = 1', state % (RET, rsid, rcid),
             '-- CHECK replacement name still holds the recorded replacement READWRITE, or nothing; expect n = 0', otherwise % (TGT, tsid, 'READWRITE'),
-            '-- ' + DROP_LABELS[TGT], skip % (TGT, tsid, 'READWRITE'), 'DROP DATABASE `%s`;' % TGT,
+            '-- CHECK replacement name still holds no other record; expect n = 0', other_record % (TGT, tcid),
+            '-- ' + DROP_LABELS[TGT], skip % (TGT, tsid, tcid), 'DROP DATABASE `%s`;' % TGT,
             '-- CHECK replacement is gone; expect no rows', row % TGT,
-            '-- CHECK recorded replacement attached nowhere; expect n = 0', anywhere % tsid,
-            '-- CHECK live name still resolves to the live branch; expect STORAGE_ID = ' + lsid, row % SRC,
+            '-- CHECK recorded replacement record dropped; expect IS_DROPPED = 1', state % (TGT, tsid, tcid),
+            '-- CHECK live name still resolves to the live record' + live, row % SRC,
         ]
         lines = ownersql.cleanup_block(names).render().splitlines()
         self.assertEqual([line for line in lines[2:] if not line.startswith('-- NOTE: ')], expected)
         self.assertNotIn('retained attached;', '\n'.join(lines))
+        self.assertIn('never deleted in the Portal by STORAGE_ID', lines[-1])
         h.journal.conn.execute("DELETE FROM attachments WHERE role = 'retained'")
         before = list(h.fake.writes)
         out = h.step('C3')
         self.assertEqual(out.status, steps.REFUSED)
-        self.assertIn('C3 cannot run: retained_sid not recorded', out.note)
+        self.assertIn('C3 cannot run: retained not recorded', out.note)
         self.assertEqual(h.fake.writes, before, 'nothing is dropped without the recorded identity')
 
     def test_f3_another_database_under_the_retained_name_refuses_with_nothing_dropped(self):
@@ -1218,23 +1238,22 @@ class CleanupIdentityTests(unittest.TestCase):
                     self.assertEqual((len(drops(h, RET)), len(drops(h, TGT))), (1, 1))
 
     def test_f3_recorded_database_under_another_name_refuses_with_nothing_dropped(self):
-        """The recorded STORAGE_ID attached under another name, or a block built from names the run did not record, refuses.
+        """The recorded record detached or attached under another name, or a block built from names the run did not record, refuses.
 
-        Moved: another actor detached the retained branch or the replacement and attached the
-        same STORAGE_ID under another name. Drifted: the configuration names another retained or
-        replacement database after O10, and no O1 names are in the journal for check_run_names to
-        refuse (owner-sql and the notebook are built from the configuration). A name-only check
-        passes the absent name, skips its DROP and passes C3 with the recorded database still
-        attached. Both routes (kit step C3 and the notebook ownerlib run_block) now stop at the
-        "attached under no other name" check with nothing dropped.
+        Moved: another actor detached the retained branch or the replacement, whose record is
+        then detached, and attached its storage under another name. Drifted: the configuration
+        names another retained or replacement database after O10, and no O1 names are in the
+        journal for check_run_names to refuse (owner-sql and the notebook are built from the
+        configuration). A name-only check passes the absent name, skips its DROP and passes C3
+        with the recorded record still attached. Both routes (kit step C3 and the notebook
+        ownerlib run_block) stop at the "not detached" or "attached under no other name" check of
+        that record with nothing dropped.
         """
-        retained = 'recorded retained branch attached under no other name'
-        replacement = 'recorded replacement attached under no other name'
         cases = {
-            'retained branch moved': (lambda h: move_attachment(h.fake, RET, RET + '_moved'), retained),
-            'replacement moved': (lambda h: move_attachment(h.fake, TGT, TGT + '_moved'), replacement),
-            'retained name drifted': (lambda h: drift_name(h, retained=RET + '_drifted'), retained),
-            'replacement name drifted': (lambda h: drift_name(h, replacement=TGT + '_drifted'), replacement),
+            'retained branch moved': (lambda h: move_attachment(h.fake, RET, RET + '_moved'), 'recorded retained record not detached'),
+            'replacement moved': (lambda h: move_attachment(h.fake, TGT, TGT + '_moved'), 'recorded replacement record not detached'),
+            'retained name drifted': (lambda h: drift_name(h, retained=RET + '_drifted'), 'recorded retained record attached under no other name'),
+            'replacement name drifted': (lambda h: drift_name(h, replacement=TGT + '_drifted'), 'recorded replacement record attached under no other name'),
         }
         for case, (change, label) in cases.items():
             for route in ('kit', 'notebook'):
@@ -1262,9 +1281,9 @@ class CleanupIdentityTests(unittest.TestCase):
         query (FakeDB.change_before on the skip query). Rerun: after a first run dropped the
         retained branch and failed before the replacement DROP, a new database appears under the
         free retained name; the DROP is skipped (a skip on the name alone would drop it) and
-        "retained is gone" stops the block. Moved: on a first run the retained branch is attached
-        under another name; the DROP is skipped and "recorded retained branch attached nowhere"
-        stops the block. On both routes nothing more is dropped and the replacement stays.
+        "retained is gone" stops the block. Moved: on a first run the retained branch is detached
+        and its storage attached under another name; the DROP is skipped and "recorded retained
+        record dropped" stops the block. On both routes nothing more is dropped and the replacement stays.
         """
         def create_retained(db):
             db.connect('admin').cursor().execute('CREATE DATABASE `%s` PARTITIONS 4 SUB_PARTITIONS 0' % RET)
@@ -1272,7 +1291,7 @@ class CleanupIdentityTests(unittest.TestCase):
         cases = {
             'new database under the free name on a rerun': (True, create_retained, 'retained is gone', 'expected no rows, observed 1 row(s)'),
             'retained branch moved before its DROP': (False, lambda db: move_attachment(db, RET, RET + '_moved'),
-                                                      'recorded retained branch attached nowhere', 'expected n = 0, observed n = 1'),
+                                                      'recorded retained record dropped', 'expected IS_DROPPED = 1, observed IS_DROPPED = 0'),
         }
         for case, (rerun, action, label, observed) in cases.items():
             for route in ('kit', 'notebook'):
@@ -2209,7 +2228,7 @@ class ExecuteBlockTests(unittest.TestCase):
         names = ownersql.names_for(h.ctx())
         names['live_sid'] = '<live_sid>'
         block = ownersql.cleanup_block(names)
-        with self.assertRaisesRegex(KitError, 'C3 cannot run: live_sid, retained_sid not recorded'):
+        with self.assertRaisesRegex(KitError, 'C3 cannot run: live, retained not recorded'):
             ownersql.refuse_placeholders(block)
 
 
@@ -2247,7 +2266,7 @@ class OwnerlibTests(unittest.TestCase):
         self.assertEqual(result['status'], 'passed', out.getvalue())
         self.assertEqual(result['statements'], 3)
         roles = {a['role']: a['row']['STORAGE_ID'] for a in result['attachments']}
-        self.assertEqual(set(roles), {'retained', 'live'})
+        self.assertEqual(set(roles), {'source', 'retained', 'live'}, 'S1 records the detached original, S2 and S3 the new records')
         self.assertEqual(roles['live'], h.fake.attachment(SRC)['STORAGE_ID'])
         with contextlib.redirect_stdout(out):
             again = ns['run_block'](cursor, switch.forward_block(names).to_dict(), {'run_id': h.run_id})
