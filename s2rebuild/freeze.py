@@ -85,7 +85,7 @@ def _detached_check(b, names):
 
 
 def _attach(b, names):
-    b.statement("ATTACH DATABASE %s STORAGEID '%s' READ ONLY" % (ident(names['source']), names['source_sid']), 'attach the same storage read only')
+    b.statement("ATTACH DATABASE %s READ ONLY STORAGEID %s" % (ident(names['source']), names['source_sid']), 'attach the same storage read only')
 
 
 def _after_checks(b, names):

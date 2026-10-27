@@ -153,6 +153,7 @@ SCHEMA = {
         'credentials_env': Field('dict', {'KAFKA': 'S2REBUILD_KAFKA_CREDENTIALS', 'S3': 'S2REBUILD_S3_CREDENTIALS'}),
         'per_pipeline_env': Field('dict', {}),
         'retention_hours': Field('dict', {}),
+        'start_at_release': Field('str', 'all', choices=('all', 'none')),
     },
     'estimate': {
         'baseline': Field('str', 'customer/baseline.json', nullable=True),

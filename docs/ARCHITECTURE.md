@@ -230,7 +230,7 @@ copy:
   chunk_rows: 10000000
   min_rows_for_chunking: 5000000
   max_buckets_per_table: 32
-  table_concurrency: auto               # auto | 1; auto serializes a table after its first lock wait
+  table_concurrency: auto               # auto | 1; auto caps a table at half the workers above 8 and serializes it after its first lock wait
   lock_probe_timeout_seconds: 5
   lock_retry_seconds: 120
   max_attempts: 3
@@ -288,6 +288,7 @@ Database selection: with one database configured, nothing to choose. With severa
 | `owner-sql ID` | O2, O3, O9, O10, O11, C3, C4 | Print the ordered SQL block for a step with its precondition queries and expected results as comments; also written under `owner-sql/` (O3 Path A also writes the re-entry block, `O3-reentry.sql`) |
 | `owner-notebook` | any admin step | Generate `owner-steps.ipynb` for the run with one cell per admin step; `--dry-run` prints what it would write |
 | `mark-recopy TABLE [--bucket N]` | O6 to O8 | Mark buckets for re-copy; the next copy run deletes and re-inserts them; O6, O7 and O8 go back to pending |
+| `abandon` | before O10 | Back out a run stopped before the switch: the source READWRITE again on its recorded STORAGE_ID, the replacement dropped by its recorded STORAGE_ID, the run closed; prints the block, `--execute --note TEXT` runs it with the owner profile under the copy lock |
 | `pause` / `resume` | O6 | Create or remove the stop file; running chunks finish, no new chunk starts |
 | `report` | C2 | Final Excel and Markdown for a run (also produced automatically at the end of O8 and C1) |
 | `calibrate` | C2 | Fit the throughput model from a journal and write `customer/baseline.json` |
@@ -319,7 +320,7 @@ Restart rules:
 - `run --from ID` re-enters at a step. Steps before it must be `passed` or `skipped`, otherwise the kit refuses with the list of what is missing and how each passes, earliest first: `gate ID --pass` for a step a person records, `run --from` for a python step (one `run --from` covers consecutive outage steps), `step ID` for a P or C python step. `run --from` stops at a gate a person has not recorded, so the order is the order to follow. The preconditions are checked before the "already passed" skip, so a passed step behind a reopened step is refused like any other; a dry run only reports them.
 - A re-copy invalidates the evidence built on the copy. `mark_recopy` (the `mark-recopy` command, the O7 stale check and an O8 mismatch) writes in one transaction: the buckets to `failed` with attempts 0, the table's `verified_at_utc` and `target_count` cleared, its `recopy_epoch` plus one, and O6, O7 and O8 set to `pending` when they passed, with a note naming the table. A crash part way leaves the journal as it was. The O7 re-copy marks O6 passed again once a round ends with every chunk done and the count proof all matching. A fresh-table load (`step O6 --fresh-table TABLE`) replaces the whole table, so before its first statement it makes the same journal write without the chunk rows: `verified_at_utc` and `target_count` cleared, `recopy_epoch` plus one, O7 and O8 back to `pending`. `mark-recopy` checks every selected journal (the bucket exists, the switch has not begun) before it marks any. Just before each of these journal writes, the O10 block files already written for the database are rewritten so each starts with a STOP (10.17).
 - Once the switch may have begun, the copy is what the live name resolves to and `target_count` is what the rollback proof compares. From then on `mark_recopy` and O6, O7 and O8 refuse before any write: O10 passed, the go decision, an O10 gate (pass or fail), a switch observed (`switch_observed`: in the evidence of a refused `gate O10 --pass`, or in the position O10 reads before its go decision when it is not "not started"), `switched_utc`, a rollback or release time, or a retained or live attachment in the journal. The kit route records the go decision before its first statement, so an O10 that stopped before it (a Ctrl-C at the typed-name prompt, a lost owner connection, a stop during S0) issued nothing and does not count, even when it is `failed` or still `running`. Every O10 refusal that issues nothing comes before the go: S0 (on Path B with the last lockout pass), the S1 before-checks (read once just before the go and again before the DETACH), and the go transaction itself, so such a refusal leaves the re-copy open. A gate is how a person reports a hand or notebook O10, so every O10 gate counts. While O10 waits for its go it holds the copy lock (10.9). The go decision, a re-copy mark and the start of O6, O7 or O8 each read the switch state in their own `BEGIN IMMEDIATE` journal transaction: the go (`record_go`) reads the journal part of S0 again and refuses while O6, O7 or O8 is running, and a mark or a start refuses once the go is recorded. Of a re-copy and a go, whichever commits second is refused. A passed O6 to O8 is still skipped, so a `run` over them reaches O11. A new copy is a new run.
-- `pause` creates `<journal>.stop`; `resume` removes it. The abort deadline from the window has the same effect as `pause`.
+- `pause` creates `<journal>.stop`; `resume` removes it. The abort deadline from the window has the same effect as `pause`. The window is optional; without it there is no deadline.
 - A step whose handler raises anything other than a refusal (a driver error, Ctrl-C) is recorded `failed` with the exception type and error number, never the message, and the exception propagates. Only a killed process leaves a step `running`.
 - Never hard-stop the copy. A killed client leaves a prepared transaction holding a leaf table lock for 15 to 20 minutes. The README says this in the O6 section, once.
 
@@ -392,7 +393,7 @@ Admin statements, each behind a query:
 1. Precondition: source attached READWRITE (`MV_CLOUD_ATTACHED_DATABASES`), STORAGE_ID equals the one recorded in P2, pipelines none Running (O2 passed).
 2. `DETACH DATABASE <source>;` If the statement waits more than `detach_wait_seconds` (default 120) and `freeze.detach_kill` is true, the kit issues `DETACH DATABASE <source> KILL;` which terminates the blocking workload and detaches after upload. Without `KILL`, writers block the detach for as long as they keep writing.
 3. Postcondition: `MV_CLOUD_BRANCHES` shows the storage `IS_DETACHED = 1`.
-4. `ATTACH DATABASE <source> STORAGEID '<id>' READ ONLY;`
+4. `ATTACH DATABASE <source> READ ONLY STORAGEID <id>;`
 5. Postcondition: `MV_CLOUD_ATTACHED_DATABASES` row with `ATTACH_TYPE = READONLY` and the same STORAGE_ID; `DISTRIBUTED_DATABASES` reports the source.
 6. Write probe (runner): `DELETE FROM <source>.<smallest non-empty table> WHERE <first key column, or first column on a keyless table> = '<random value that cannot exist>'` with `lock_wait_timeout = 5`. Pass means the server refused the write with a read-only error. A DELETE that succeeds, even with 0 rows, fails the gate. (`WHERE 1=0` is not used because the planner may skip the lock and the write check.) This probe is the one runner statement that names the source in a write; the guard allows it only in O3 and only with the probe predicate.
 7. Record `freeze_time` in the journal.
@@ -426,11 +427,12 @@ Changes:
 - Names, layout, workers, chunk sizes and the inventory path come from config and the run, not constants. The expected table count check becomes "matches the capture".
 - `CREATE DATABASE <replacement> PARTITIONS <p> SUB_PARTITIONS <s>` from `databases[].layout`; durability flags must equal the source.
 - Bucket cap `max_buckets_per_table` (10.6).
-- Scheduler: a queue per table; a worker takes the next chunk from the first table whose in-flight count is below its limit. `table_concurrency: auto` allows parallel chunks per table and sets the limit to 1 for a table after its first lock wait (error 1205); per-table `concurrency` in config overrides.
+- Scheduler: a queue per table; a worker takes the next chunk from the first table whose in-flight count is below its limit. `table_concurrency: auto` allows parallel chunks per table, at most half the workers when there are more than 8 (so the rest copy the next tables), and sets the limit to 1 for a table after its first lock wait (error 1205); per-table `concurrency` in config overrides.
 - Lock probe before a chunk on a table that had a lock wait: the reconciliation DELETE runs with `lock_wait_timeout = lock_probe_timeout_seconds`; 1205 means still locked, the chunk is parked for `lock_retry_seconds` and other tables continue.
 - Lock wait cap: the `max_lock_waits`-th lock wait of one chunk in a run fails the chunk as an attempt. Its error and the O6 note name `s2rebuild step O6 --fresh-table <t>`, so a lock that never clears ends O6 INCOMPLETE on its own.
 - Interrupt: the first Ctrl-C stops new chunks while the running ones finish. A later Ctrl-C prints that a hard stop needs kill and that the leaf lock then holds 15 to 20 minutes; the wait goes on, so no worker dies mid INSERT and O6 ends recorded.
 - Copy lock: `<journal>.lock`, an exclusive file lock that carries the holder's pid and purpose. O6 takes it, an O7 re-copy round takes it from its mark through its copy, `mark-recopy` takes it before it checks any journal, and O10 takes it from S0 through S3. A held lock refuses with the holder named. The lock goes with its process, so a holder that died blocks nothing.
+- Reference tables (`CREATE REFERENCE TABLE` in the captured definition): Helios runs an INSERT into a reference table on the master aggregator, where a READ ONLY source has no master instance (error 1777). Each chunk of a reference table runs `CREATE TABLE <replacement>.<t>__stage (<the copy columns from the definition, no keys>)`, `INSERT INTO <t>__stage SELECT ... FROM <source>.<t> WHERE <predicate>`, `INSERT INTO <replacement>.<t> SELECT ... FROM <t>__stage`, `DROP TABLE <t>__stage` (also after a failure), and refuses when the two row counts differ. A staging table left by an interrupted attempt is dropped first. The stage name must be at most 64 characters and not a planned table.
 - Fresh-table fallback, `s2rebuild step O6 --fresh-table TABLE`: `CREATE TABLE <replacement>.<t>__fresh LIKE <replacement>.<t>` (the definition O5 checked), one `INSERT ... SELECT` without predicate, count check, `DROP TABLE <replacement>.<t>`, `ALTER TABLE <replacement>.<t>__fresh RENAME TO <t>`, journal event `manual_load`. Used when a target table is locked by a prepared transaction the kit cannot see. Refused past the abort deadline, while the stop file exists, and when the fresh name is over 64 characters or a planned table. The journal meta `fresh_table:<t>` records the fresh name before the CREATE (`creating`), after the count check (`loaded`, with the table's `recopy_epoch`) and, in one transaction with the chunk rows, `done`. A rerun reuses only the fresh table it recorded; an unrecorded table under that name refuses. A rerun after the rename only writes the journal rows, while `<t>` holds the source count, its `recopy_epoch` is the recorded one and a bucket of it is not done. After a re-copy mark, or a copy run that finished its buckets, the `loaded` record is stale and the rerun loads the table again. A missing `<t>` is never recreated from the source: the load resumes from a complete recorded fresh table or refuses. The chunk rows carry `error = 'fresh-table load'`, so `calibrate` skips them.
 - Progress line every `progress_seconds`: tables done, buckets done, failed, rows done, rows per hour, projected finish against the deadline.
 - Timings per chunk and per table are kept for the report and for `calibrate`.
@@ -512,8 +514,8 @@ Forward sequence, each statement preceded by its check and followed by a recorde
 |---|---|---|---|
 | S0 | O8 passed, with every step before it passed; every planned table verified after `freeze_time` and after its newest chunk, at its current `recopy_epoch` (10.10); O9 passed; time remaining ≥ switch allowance; on Path B before S1, the last lockout pass quiet within `freeze.quiet_max_age_seconds`; operator typed the live name (or `--yes`); the S1 before-checks pass once | none | go recorded (`record_go`: the journal part of S0 and the Path B last pass read again, and O6 to O8 not running, in the same journal transaction); the copy lock is held from S0 through S3 |
 | S1 | source attached with the recorded STORAGE_ID (READONLY on Path A; READWRITE with a passed quiet proof on Path B, every write privilege the lockout took still revoked (one check per account and scope, expect n = 0), and the last lockout pass in the journal quiet within `freeze.quiet_max_age_seconds`; the printed block carries the journal part as a note and checks the privileges live); no non-idle session on it other than ours | `DETACH DATABASE <source>;` (with `KILL` after `detach_wait_seconds` when `detach_kill` is true) | storage IS_DETACHED = 1; no attached database named source |
-| S2 | no attached database named retained | `ATTACH DATABASE <source> AS <retained> STORAGEID '<source_sid>' READ ONLY;` | retained attached READONLY; one small table count equals the journal's source count; record the retained STORAGE_ID |
-| S3 | replacement attached READWRITE with recorded STORAGE_ID; no attached database named source | `ATTACH DATABASE <replacement> AS <source> STORAGEID '<replacement_sid>';` | an attached READWRITE database named source whose STORAGE_ID is new; `NUM_PARTITIONS` and `NUM_SUB_PARTITIONS` equal the target layout; table, view and pipeline counts equal the capture; three smallest non-empty tables match the journal counts; record the live STORAGE_ID |
+| S2 | no attached database named retained | `ATTACH DATABASE <source> AS <retained> READ ONLY STORAGEID <source_sid>;` | retained attached READONLY; one small table count equals the journal's source count; record the retained STORAGE_ID |
+| S3 | replacement attached READWRITE with recorded STORAGE_ID; no attached database named source | `ATTACH DATABASE <replacement> AS <source> STORAGEID <replacement_sid>;` | an attached READWRITE database named source whose STORAGE_ID is new; `NUM_PARTITIONS` and `NUM_SUB_PARTITIONS` equal the target layout; table, view and pipeline counts equal the capture; three smallest non-empty tables match the journal counts; record the live STORAGE_ID |
 
 The replacement stays attached under its own name until C3. Dropping it later does not affect the live branch (branches are independent of their parent).
 
@@ -524,7 +526,7 @@ Rollback, only before O11 starts releasing writers:
 | # | Check before | Statement | Check after |
 |---|---|---|---|
 | R1 | the zero-change proof: `COUNT(*)` of every planned table on the live name equals the journal `target_count`; no pipeline in state Running on the live name; for every grantee and scope of the lockout snapshot not given back yet, none of those write privileges held; the S1 session query shows no foreign non-idle session on it; then an attached database named source whose STORAGE_ID is the live branch | `DETACH DATABASE <source>;` | no attached database named source |
-| R2 | source storage IS_DETACHED = 1 | `ATTACH DATABASE <source> STORAGEID '<source_sid>';` | source attached READWRITE with the original STORAGE_ID |
+| R2 | source storage IS_DETACHED = 1 | `ATTACH DATABASE <source> STORAGEID <source_sid>;` | source attached READWRITE with the original STORAGE_ID |
 | R3 | retained attached | `DROP DATABASE <retained>;` (optional) | gone |
 
 The detached live branch left by R1 is deleted in the Portal by STORAGE_ID. After the first new write on the live branch, rollback is a new freeze and a reconciliation, not R1 to R3. The kit refuses the rollback, before any statement, when:
@@ -593,7 +595,7 @@ Static tree = everything except `customer/`, `dist/`, `.venv/`, `__pycache__/`, 
 Verified on the reference run or in the documentation. `docs/LESSONS.md` carries the same list in plain words.
 
 1. `CREATE DATABASE x PARTITIONS p SUB_PARTITIONS s` creates the layout; sub-partitions cannot be added later.
-2. `ATTACH DATABASE <parent> [AS <new>] [STORAGEID 'id'] [COMPUTEID 'id'] [READ ONLY]`. `AS` creates a branch with a new STORAGE_ID. STORAGEID is required when the name is not unique. IDs come from `MV_CLOUD_ATTACHED_DATABASES` (DATABASE_NAME, SITE_NAME, ATTACH_TYPE, STORAGE_ID, COMPUTE_ID, ATTACH_SYNTAX, ATTACH_MEMO).
+2. `ATTACH DATABASE <parent> [AS <new>] [READ ONLY] [STORAGEID id] [COMPUTEID id]`, with the ids unquoted. `AS` creates a branch with a new STORAGE_ID. STORAGEID is required when the name is not unique. IDs come from `MV_CLOUD_ATTACHED_DATABASES` (DATABASE_NAME, SITE_NAME, ATTACH_TYPE, STORAGE_ID, COMPUTE_ID, ATTACH_SYNTAX, ATTACH_MEMO).
 3. `DETACH DATABASE x [AT MILESTONE "m" | FORCE | KILL]`. `KILL` terminates the blocking workload and detaches after upload. `FORCE` loses unsynced data and is never used by the kit.
 4. A database has one read-write attachment and may have several read-only ones. DETACH then ATTACH READ ONLY stops every writer in minutes. The Portal "Clusters attached" dialog does the same.
 5. `MV_CLOUD_BRANCHES` lists storages with STORAGE_ID, IS_DETACHED, IS_ATTACHED_TO_THIS_COMPUTE, IS_ATTACHABLE, IS_DROPPED, END_VERSION and the PREV_* source fields. DATABASE_NAME is not unique there.
@@ -610,6 +612,15 @@ Verified on the reference run or in the documentation. `docs/LESSONS.md` carries
 16. Attaching requires compute cores × 8 ≥ the number of partitions.
 17. `query_parallelism_per_leaf_core` is global, affects databases with sub-partitions only, and applies to new connections.
 18. Reference throughput, 4 workers on S-16 at 2x: 13.1 million rows scanned per second per worker, 339 thousand rows inserted per second per worker, 1.43 billion rows per hour and about 490 GiB per hour in aggregate.
+19. Engine 10.8.0: `PIPELINES_BATCHES_SUMMARY` has START_TIME (the batch timestamp), BATCH_TIME (the batch duration in seconds), ROWS_INSERTED and ROWS_UPDATED, and no BATCH_ROWS_WRITTEN; `PIPELINES_ERRORS` has ERROR_UNIX_TIMESTAMP and no ERROR_TIME.
+20. A workspace can enforce a password policy (`PASSWORD_MIN_LENGTH`, `PASSWORD_MIN_UPPERCASE_CHARS` and the other PASSWORD_ global variables); CREATE USER with a password that misses it fails with error 1144.
+21. An account without routine privileges sees no rows in `information_schema.ROUTINES`; the owner sees them all.
+22. Engine 10.8.0: ATTACH takes the STORAGEID unquoted and READ ONLY before it: `ATTACH DATABASE x [AS y] [READ ONLY] [STORAGEID id]`. A quoted id, or READ ONLY after STORAGEID, is error 1064. `MV_CLOUD_BRANCHES.ATTACH_SYNTAX` shows the form for each storage.
+23. On a READ ONLY attachment `information_schema.PIPELINES` shows no rows, while `PIPELINES_OFFSETS` keeps them. Pipelines must be captured before the freeze.
+24. Engine 10.8.0: an INSERT into a REFERENCE table runs on the master aggregator, where a READ ONLY source has no master instance (error 1777, "Partitions of <db> has no master instance"); reference tables copy through a sharded staging table (section 10.9). TABLE_STATISTICS shows no rows for reference tables.
+25. Engine 10.8.0: even the workspace admin cannot name another account as DEFINER of a view (CREATE VIEW fails with error 1227, SUPER needed); O7 falls back to the owner as definer and records why.
+26. Engine 10.8.0: `ALTER TABLE ... AUTO_INCREMENT = X` on a sharded table is error 1749 (not supported); O7 then runs only `AGGREGATOR SYNC AUTO_INCREMENT ON <table> ALL`, which moves every aggregator past MAX, and records why.
+27. Engine 10.8.0: `ATTACH x AS y` keeps x's STORAGE_ID for the branch y, which is still independent (own COMPUTE_ID, ATTACH_TYPE pitr, PREV_DATABASE_NAME x; writes not shared; a DROP of x leaves y). O10 accepts the live name on the replacement's STORAGE_ID only with that branch row and a COMPUTE_ID other than the replacement's (`switch.live_is_branch_of_replacement`). C3's identity checks by STORAGE_ID alone refuse in this state; they must use the branch row too.
 
 ## 12. Documentation and branding
 
@@ -723,10 +734,10 @@ SELECT PIPELINE_NAME, STATE FROM information_schema.PIPELINES WHERE DATABASE_NAM
 SELECT PIPELINE_NAME, SOURCE_TYPE, SOURCE_PARTITION_ID, EARLIEST_OFFSET, LATEST_OFFSET,
        LATEST_LOADED_OFFSET, LATEST_SUCCESSFUL_OFFSET
 FROM information_schema.PIPELINES_OFFSETS WHERE DATABASE_NAME = %s;
-SELECT PIPELINE_NAME, BATCH_STATE, BATCH_TIME, BATCH_ROWS_WRITTEN
-FROM information_schema.PIPELINES_BATCHES_SUMMARY WHERE DATABASE_NAME = %s AND BATCH_TIME >= %s;
-SELECT PIPELINE_NAME, ERROR_TIME, ERROR_MESSAGE FROM information_schema.PIPELINES_ERRORS
-WHERE DATABASE_NAME = %s AND ERROR_TIME >= %s;
+SELECT PIPELINE_NAME, BATCH_STATE, START_TIME, ROWS_INSERTED, ROWS_UPDATED
+FROM information_schema.PIPELINES_BATCHES_SUMMARY WHERE DATABASE_NAME = %s AND START_TIME >= %s;
+SELECT PIPELINE_NAME, ERROR_UNIX_TIMESTAMP, ERROR_MESSAGE FROM information_schema.PIPELINES_ERRORS
+WHERE DATABASE_NAME = %s AND ERROR_UNIX_TIMESTAMP >= UNIX_TIMESTAMP(%s);
 SHOW CREATE PIPELINE `db`.`pipeline` EXTENDED;   -- CREATE row, then ALTER ... SET OFFSETS rows
 ```
 
@@ -751,7 +762,7 @@ GRANT SELECT, INSERT, DELETE, CREATE, DROP, ALTER, CREATE DATABASE, DROP DATABAS
   ON *.* TO 's2rebuild_runner'@'%';
 STOP PIPELINE `source`.`p`;
 DETACH DATABASE `source`;                        -- or ... KILL
-ATTACH DATABASE `source` STORAGEID '<sid>' READ ONLY;
+ATTACH DATABASE `source` READ ONLY STORAGEID <sid>;
 REVOKE <write privileges> ON *.* FROM '<grantee>';
 KILL CONNECTION <id>;
 USE `replacement`;                                                       -- O7, then per view:
@@ -759,8 +770,8 @@ SELECT COUNT(*) AS n FROM information_schema.USER_PRIVILEGES WHERE GRANTEE = %s;
 CREATE DEFINER=`user`@`host` VIEW `replacement`.`v` AS ...;              -- O7: original kept, or the clause removed
 SELECT DEFINER FROM information_schema.VIEWS WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s;    -- O7: a view found already created
 CREATE PIPELINE ... ; ALTER PIPELINE ... SET OFFSETS ...;
-ATTACH DATABASE `source` AS `retained` STORAGEID '<source_sid>' READ ONLY;
-ATTACH DATABASE `replacement` AS `source` STORAGEID '<replacement_sid>';
+ATTACH DATABASE `source` AS `retained` READ ONLY STORAGEID <source_sid>;
+ATTACH DATABASE `replacement` AS `source` STORAGEID <replacement_sid>;
 START PIPELINE `source`.`p`;
 GRANT <revoked privileges> ON *.* TO '<grantee>';
 SET GLOBAL query_parallelism_per_leaf_core = 0.5;

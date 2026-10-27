@@ -116,6 +116,18 @@ class CounterTests(unittest.TestCase):
         runner_guard(TGT).check(P.alter_counter_sql(TGT, 't', 5))
         runner_guard(TGT).check(P.sync_counter_sql(TGT, 't'))
 
+    def test_a_sharded_table_whose_counter_the_server_refuses_is_synced_only(self):
+        """Helios refuses ALTER TABLE ... AUTO_INCREMENT on a sharded table (1749, October 27, 2026): the sync alone runs and the action says why."""
+        h, tables = self.counter_harness(6755399441055745, None)
+        h.fake.refuse_sharded_counter = True
+        session = h.sessions.runner(runner_guard(TGT))
+        actions = P.set_counters(session, TGT, tables, h.journal, h.log)
+        by = {a['table']: a for a in actions}
+        self.assertEqual(by['t_comp']['action'], P.COUNTER_REFUSED_ACTION)
+        self.assertNotIn('ALTER TABLE `%s`.`t_comp` AUTO_INCREMENT = 6755399441055745' % TGT, h.fake.writes)
+        self.assertEqual(h.fake.synced, ['t_comp'], 'the sync still runs on every aggregator')
+        self.assertIn(P.COUNTER_REFUSED_ACTION, [json.loads(d)['action'] for d in h.journal.events('counter')])
+
     def test_f11_source_counter_above_max_plus_one_wins_and_the_sync_runs_on_every_aggregator(self):
         """t_comp: source counter 500 above MAX+1 300; t_empty: no rows, source counter 9. Each counter is set to the source counter and
         synced with ALL; the counter event and the table tab carry both values and the decision."""
@@ -200,6 +212,17 @@ class ViewDefinerTests(unittest.TestCase):
         tab = {r[0].value: r[2].value for r in wb['Views'].iter_rows(min_row=2)}
         self.assertEqual(tab['v_base'], 'yes (original definer kept)')
         self.assertEqual(tab['a_top'], 'yes (the original definer no longer exists; the owner account is the definer)')
+
+    def test_a_refused_original_definer_falls_back_to_the_owner(self):
+        """Helios refuses another account as DEFINER (1227, October 27, 2026): the view is created again with the owner as definer."""
+        h = view_harness(self, [V_BASE, V_TOP])
+        h.fake.refuse_other_definer = True
+        out = h.step('O7')
+        self.assertEqual(out.status, steps.PASSED, h.text())
+        self.assertEqual(created_views(h), {'v_base': 'ops_owner@%', 'a_top': 'ops_owner@%'})
+        self.assertEqual(view_choices(h)['v_base'], ('owner', P.DEFINER_REFUSED_REASON))
+        self.assertNotIn(1227, [json.loads(d).get('error') for d in h.journal.events('view_failed')])
+        self.assertEqual(h.step('O8').status, steps.PASSED, h.text())
 
     def test_f7_create_view_is_followed_by_its_existence_check(self):
         """The admin CREATE VIEW sits between its checks: a CREATE the server accepts without listing the view stops O7, no choice recorded."""

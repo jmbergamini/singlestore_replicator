@@ -104,3 +104,17 @@ def format_duration(seconds):
     if hours:
         return '%d h %02d m' % (hours, minutes)
     return '%d m' % minutes
+
+
+AUTO_TABLE_SHARE_ABOVE = 8
+
+
+def auto_table_limit(workers):
+    """The most chunks of one table in flight under copy.table_concurrency auto: half the workers above 8 workers, else all.
+
+    On S-8 at 4X (October 27, 2026) 12 workers on the last store_sales chunks copied no faster
+    than 4, so above 8 workers no table takes more than half of them and the rest copy the next
+    tables. A table serialized after a lock wait, or with its own concurrency, keeps that limit.
+    """
+    workers = max(1, int(workers))
+    return workers // 2 if workers > AUTO_TABLE_SHARE_ABOVE else workers

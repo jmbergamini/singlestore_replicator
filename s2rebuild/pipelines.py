@@ -36,6 +36,11 @@ NOT_CHECKED = 'pipelines and grants: not checked, no owner profile'
 _PIPELINE_NAME = re.compile(r'PIPELINE\s+(?:`[^`]+`\.)?`([^`]+)`', re.I)
 
 
+def starts_at_release(config):
+    """True when O11 starts the recreated pipelines (pipelines.start_at_release: all, the default); False for none."""
+    return getattr(getattr(config, 'pipelines', None), 'start_at_release', 'all') == 'all'
+
+
 def expected_items(items):
     """Captured pipelines the kit recreates (application-managed ones are stopped but not replayed)."""
     return [i for i in items if not i.get('app_managed')]
@@ -175,8 +180,15 @@ def verify_block(names, items, capture_step='O2', placeholder_file=None):
 
 
 def release_block(names, items, grant_snapshot, config=None):
-    """O11: retention and partition checks, GRANT restores first (each checked), START PIPELINE per expected pipeline, parallelism."""
-    b = ownersql.Block('O11', 'Release: restore grants, start pipelines, application restart')
+    """O11: retention and partition checks, GRANT restores first (each checked), START PIPELINE per expected pipeline, parallelism.
+
+    With pipelines.start_at_release: none no pipeline is started: the block checks that every
+    captured partition is present, that none is Running, and notes how to start them later; the
+    retention check belongs to the start and is left out.
+    """
+    start = starts_at_release(config)
+    b = ownersql.Block('O11', 'Release: restore grants, start pipelines, application restart' if start else
+                       'Release: restore grants, pipelines left stopped, application restart')
     for item in expected_items(items):
         known = _offsets_known(item)
         if not known:
@@ -186,6 +198,8 @@ def release_block(names, items, grant_snapshot, config=None):
                 'SELECT COUNT(*) AS n FROM information_schema.PIPELINES_OFFSETS WHERE DATABASE_NAME = %s AND PIPELINE_NAME = %s '
                 'AND SOURCE_PARTITION_ID IN (' + ', '.join(['%s'] * len(parts)) + ')',
                 (names['source'], item['name']) + tuple(parts), ownersql.Expect('column_equals', 'n', len(parts)))
+        if not start:
+            continue
         b.check('no retention gap on %s (recorded committed offset not below EARLIEST_OFFSET)' % item['name'],
                 'SELECT COUNT(*) AS n FROM information_schema.PIPELINES_OFFSETS WHERE DATABASE_NAME = %s AND PIPELINE_NAME = %s AND ('
                 + ' OR '.join(['(SOURCE_PARTITION_ID = %s AND EARLIEST_OFFSET > %s)'] * len(known)) + ')',
@@ -197,10 +211,15 @@ def release_block(names, items, grant_snapshot, config=None):
             b.check('%s write privileges on %s before the restore (informational)' % (grantee, scope), sql, params, ownersql.Expect('some_rows'))
             b.statement('GRANT %s ON %s TO %s' % (', '.join(privs), scope, grantee), 'restore the grants revoked by the lockout')
             b.check('%s holds every restored privilege on %s' % (grantee, scope), sql, params, ownersql.Expect('column_equals', 'n', len(privs)))
-    for item in expected_items(items):
-        b.statement('START PIPELINE %s' % qualified(names['source'], item['name']), 'start pipeline %s on the live database' % item['name'],
-                    skip_if=(IS_RUNNING_SQL, (names['source'], item['name'])))
-    b.check('every expected pipeline Running', RUNNING_SQL, (names['source'],), ownersql.Expect('column_equals', 'n', len(expected_items(items))))
+    if start:
+        for item in expected_items(items):
+            b.statement('START PIPELINE %s' % qualified(names['source'], item['name']), 'start pipeline %s on the live database' % item['name'],
+                        skip_if=(IS_RUNNING_SQL, (names['source'], item['name'])))
+        b.check('every expected pipeline Running', RUNNING_SQL, (names['source'],), ownersql.Expect('column_equals', 'n', len(expected_items(items))))
+    else:
+        b.check('no pipeline Running (pipelines.start_at_release: none)', RUNNING_SQL, (names['source'],), ownersql.Expect('column_equals', 'n', 0))
+        b.note('%d pipeline(s) left stopped by pipelines.start_at_release: none. Start one when you choose: START PIPELINE `%s`.`<name>`;'
+               % (len(expected_items(items)), names['source']))
     if names.get('flexible_parallelism') is not None and config is not None:
         b.check('current query_parallelism_per_leaf_core (informational)', PARALLELISM_SQL, (), ownersql.Expect('some_rows'))
         b.statement('SET GLOBAL query_parallelism_per_leaf_core = %s' % names['flexible_parallelism'], 'flexible parallelism for databases with sub-partitions (new connections)')
@@ -494,7 +513,7 @@ def handle_o11(step, ctx):
         return ownersql.handle_admin(step, ctx, b)
     owner = ctx.owner_session(read_guard('owner O11'))
     try:
-        gaps = retention_gaps(owner, ctx.db.source, items)
+        gaps = retention_gaps(owner, ctx.db.source, items) if starts_at_release(ctx.config) else []
     finally:
         owner.close()
     if gaps:
@@ -505,7 +524,7 @@ def handle_o11(step, ctx):
 
     def _after(results):
         now = iso(utc_now())
-        for item in expected_items(items):
+        for item in expected_items(items) if starts_at_release(ctx.config) else ():
             ctx.journal.upsert_pipeline(item['name'], started_utc=now)
         if snap:
             owner2 = ctx.owner_session(read_guard('owner O11 compare'))
@@ -529,14 +548,21 @@ def _server_time(value):
     return parse_utc(value, 'released_utc').strftime('%Y-%m-%d %H:%M:%S')
 
 
-def after_release_checks(session, db_name, items, journal, log, sleep=time.sleep, started_since=None):
+def after_release_checks(session, db_name, items, journal, log, sleep=time.sleep, started_since=None, start=True):
     """C1: every expected pipeline Running, application-managed ones present, offsets advancing where new data exists, no errors since
-    the start; returns (ok, lines)."""
+    the start; returns (ok, lines). With start False (pipelines.start_at_release: none) the pipelines are reported, not required
+    Running, and the offset sample is skipped."""
     lines, ok = [], True
     expected = expected_items(items)
     states = {str(r['PIPELINE_NAME']): str(r['STATE']) for r in session.query(inventory.PIPELINES_SQL, (db_name,))}
     not_running = [i['name'] for i in expected if states.get(i['name']) != 'Running']
-    if not_running:
+    missing = [i['name'] for i in expected if i['name'] not in states]
+    if not start:
+        if missing:
+            ok = False
+            lines.append('pipelines missing on the live database: ' + ', '.join(missing))
+        lines.append('pipelines left stopped by pipelines.start_at_release: none: %d of %d not Running' % (len(not_running), len(expected)))
+    elif not_running:
         ok = False
         lines.append('pipelines not Running: ' + ', '.join(not_running))
     else:
@@ -546,14 +572,17 @@ def after_release_checks(session, db_name, items, journal, log, sleep=time.sleep
         ok = False
     lines.append('application-managed pipelines present again: %s' % ('yes' if not missing_app else 'missing ' + ', '.join(missing_app)))
     first = offsets_in(session, db_name)
-    sleep(60)
-    second = offsets_in(session, db_name)
+    if start:
+        sleep(60)
+    second = offsets_in(session, db_name) if start else first
     stuck = []
     for key, (e1, l1, loaded1, s1) in first.items():
         e2, l2, loaded2, s2 = second.get(key, (None, None, None, None))
         if l1 is not None and loaded1 is not None and l1 > loaded1 and loaded2 is not None and loaded2 <= loaded1:
             stuck.append('%s partition %s' % key)
-    if stuck:
+    if not start:
+        lines.append('offsets not sampled: no pipeline was started')
+    elif stuck:
         ok = False
         lines.append('offsets not advancing although data waits: ' + ', '.join(stuck))
     else:
@@ -614,7 +643,8 @@ def handle_c1(step, ctx):
         if ctx.owner_configured:
             owner = ctx.owner_session(read_guard('owner C1'))
             try:
-                ok, lines = after_release_checks(owner, ctx.db.source, items, ctx.journal, ctx.log, sleep=sleep, started_since=released)
+                ok, lines = after_release_checks(owner, ctx.db.source, items, ctx.journal, ctx.log, sleep=sleep, started_since=released,
+                                                 start=starts_at_release(ctx.config))
                 snap = grants.snapshot_from_journal(ctx.journal) or grants.reference_from_journal(ctx.journal)
                 if snap:
                     diff = grants.compare(owner, ctx.db.source, snap)

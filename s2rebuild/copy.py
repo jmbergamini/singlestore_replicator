@@ -28,18 +28,20 @@ import contextlib
 import datetime as dt
 import fcntl
 import os
+import re
 import threading
 import time
 import traceback
 from pathlib import Path
 
 from . import estimate, inventory, ownersql, steps, transform
-from .common import EXIT_INCOMPLETE, EXIT_MISMATCH, EXIT_REFUSED, KitError, iso, parse_utc, utc_now
+from .common import EXIT_INCOMPLETE, EXIT_MISMATCH, EXIT_REFUSED, KitError, auto_table_limit, iso, parse_utc, utc_now
 from .sqlutil import ident, qualified, runner_guard
 
 DURABILITY_FLAGS = ('IS_SYNC', 'IS_SYNC_DURABILITY', 'IS_SYNC_DURABILITY_ON_REF_DB_ONLY')
 LOCK_WAIT_ERRNO = 1205
 FRESH_SUFFIX = '__fresh'
+STAGE_SUFFIX = '__stage'
 MAX_NAME_CHARS = 64
 # Journal meta key prefix for the fresh table a load created: value '<fresh name> <phase>', and for loaded
 # also the table's recopy_epoch when the fresh table was complete.
@@ -173,8 +175,27 @@ class Statements:
         return 'INSERT INTO %s (%s) SELECT %s FROM %s' % (qualified(self.target_db, plan.name + FRESH_SUFFIX), cols, cols,
                                                           qualified(self.source_db, plan.name))
 
+    def table_exists(self):
+        """COUNT of tables of one name in one schema (parameters: the schema, the table)."""
+        return 'SELECT COUNT(*) AS n FROM information_schema.TABLES WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s'
+
+    def create_stage(self, plan, stage):
+        """CREATE TABLE replacement.<stage>: the copy columns of a reference table as a sharded table without keys."""
+        return 'CREATE TABLE %s (%s)' % (qualified(self.target_db, stage), ', '.join(stage_columns(plan)))
+
+    def insert_stage(self, plan, stage, bucket):
+        """INSERT INTO the staging table SELECT FROM the source for one bucket (not forwarded to the master aggregator)."""
+        cols = plan.column_list()
+        return 'INSERT INTO %s (%s) SELECT %s FROM %s WHERE %s' % (
+            qualified(self.target_db, stage), cols, cols, qualified(self.source_db, plan.name), plan.predicate(bucket))
+
+    def insert_from_stage(self, plan, stage):
+        """INSERT INTO the reference table SELECT FROM the staging table, both in the replacement."""
+        cols = plan.column_list()
+        return 'INSERT INTO %s (%s) SELECT %s FROM %s' % (qualified(self.target_db, plan.name), cols, cols, qualified(self.target_db, stage))
+
     def drop_table(self, table):
-        """DROP TABLE in the replacement (fresh-table fallback only)."""
+        """DROP TABLE in the replacement (fresh-table fallback and reference staging tables)."""
         return 'DROP TABLE ' + qualified(self.target_db, table)
 
     def rename_fresh(self, plan):
@@ -325,7 +346,8 @@ class Runner:
     """Copies the planned chunks with a pool of workers, one connection each (section 10.9).
 
     A queue per table in plan order (largest first); a worker takes the next chunk of the first
-    table whose in-flight count is below its limit. A lock wait (error 1205) does not consume an
+    table whose in-flight count is below its limit. Under table_concurrency auto the limit of a
+    table is every worker, or half of them above 8 workers (common.auto_table_limit). A lock wait (error 1205) does not consume an
     attempt: the chunk goes to the back of its table's queue, the table's limit becomes 1 when
     table_concurrency is auto, and the table is parked for lock_retry_seconds while the other
     tables continue. Before a chunk on a table that has waited for a lock, the reconciliation
@@ -344,6 +366,7 @@ class Runner:
         self.log = log
         self.cfg = copy_config
         self.workers = max(1, int(workers or copy_config.workers))
+        self.default_limit = auto_table_limit(self.workers)
         self.abort_at = abort_at
         self.stop_file = Path(stop_file) if stop_file else None
         self.after_insert_hook = after_insert_hook
@@ -429,7 +452,7 @@ class Runner:
                     continue
                 if self.parked_until.get(name, 0) > now:
                     continue
-                limit = self.limits.get(name, self.workers)
+                limit = self.limits.get(name, self.default_limit)
                 if self.in_flight[name] >= limit:
                     continue
                 bucket, prior = queue.popleft()
@@ -449,7 +472,7 @@ class Runner:
             if requeue:
                 self.queues[name].append((bucket, 'failed'))
             self.lock_waits[name] += 1
-            if self.cfg.table_concurrency == 'auto' and name not in self.configured and self.limits.get(name, self.workers) != 1:
+            if self.cfg.table_concurrency == 'auto' and name not in self.configured and self.limits.get(name, self.default_limit) != 1:
                 self.limits[name] = 1
                 self.journal.set_table_attr(name, 'concurrency', 1)
                 self.journal.event('serialized', '%s limited to one chunk at a time after a lock wait' % name)
@@ -476,12 +499,38 @@ class Runner:
             if prior_state in ('started', 'failed'):
                 self.journal.event('reconcile_delete', '%s bucket %d removed %d rows before re-insert' % (table, bucket, removed))
                 self.log('Reconciled %s bucket %d: removed %d rows left by an interrupted attempt' % (table, bucket, removed))
-        rows = session.execute(self.st.insert_chunk(p, bucket))
+        rows = self.copy_reference(session, p, bucket) if p.reference else session.execute(self.st.insert_chunk(p, bucket))
         if self.after_insert_hook is not None:
             self.after_insert_hook(table, bucket)
         self.journal.mark_done(table, bucket, rows)
         with self.lock:
             self.rows_since_start += rows
+        return rows
+
+    def copy_reference(self, session, plan, bucket):
+        """One chunk of a reference table through a sharded staging table in the replacement; returns the rows inserted.
+
+        Helios runs an INSERT into a reference table on the master aggregator, and there a READ ONLY
+        source has no master instance to read from (error 1777, October 27, 2026). So the source rows
+        go into a staging table first, then from the staging table into the reference table. A staging
+        table left by an interrupted attempt is dropped first; the staging table is dropped after the
+        copy whatever happens. The two row counts must agree.
+        """
+        stage = stage_name(plan, self.by_name)
+        if one_value(session.query(self.st.table_exists(), (self.st.target_db, stage))):
+            session.execute(self.st.drop_table(stage))
+            self.log('Dropped the staging table %s left by an interrupted attempt' % stage)
+        session.execute(self.st.create_stage(plan, stage))
+        try:
+            staged = session.execute(self.st.insert_stage(plan, stage, bucket))
+            rows = session.execute(self.st.insert_from_stage(plan, stage))
+        finally:
+            try:
+                session.execute(self.st.drop_table(stage))
+            except Exception as exc:  # noqa: BLE001 - the original error must keep propagating
+                self._safe_log('dropping the staging table %s failed: %s' % (stage, exc))
+        if rows != staged:
+            raise KitError('Reference table %s bucket %d: %d rows staged but %d inserted' % (plan.name, bucket, staged, rows))
         return rows
 
     def open_session(self):
@@ -724,6 +773,35 @@ class _CopySession:
     def close(self):
         """Close the worker connection."""
         self.inner.close()
+
+
+def stage_name(plan, planned=()):
+    """The staging table name of a reference table; refuses a name over 64 characters or one that is a planned table name."""
+    name = plan.name + STAGE_SUFFIX
+    if len(name) > MAX_NAME_CHARS:
+        raise KitError('The staging table name for reference table %s has %d characters, over the %d the server allows'
+                       % (plan.name, len(name), MAX_NAME_CHARS))
+    if name in planned:
+        raise KitError('The staging table name %s is a planned table of this run; refusing to stage reference table %s' % (name, plan.name))
+    return name
+
+
+def stage_columns(plan):
+    """The column definitions of a reference table for its staging table: the copy columns in order, AUTO_INCREMENT dropped.
+
+    Read from the captured definition (one line per column in SHOW CREATE TABLE); keys and table
+    options are left out, so the staging table is sharded and keyless. Raises KitError when a copy
+    column has no definition line.
+    """
+    found = {}
+    for line in (plan.definition or '').splitlines():
+        m = re.match(r'\s*`([^`]+)` (.+?),?$', line)
+        if m and m.group(1) in plan.columns:
+            found[m.group(1)] = '%s %s' % (ident(m.group(1)), re.sub(r'\s*\bAUTO_INCREMENT\b', '', m.group(2)).strip())
+    missing = [c for c in plan.columns if c not in found]
+    if missing:
+        raise KitError('Cannot build the staging table of reference table %s: no definition line for %s' % (plan.name, ', '.join(missing)))
+    return [found[c] for c in plan.columns]
 
 
 def fresh_table_hint(table, waits):

@@ -176,6 +176,37 @@ class BlockTests(unittest.TestCase):
         self.assertLess(text.index('current query_parallelism_per_leaf_core'), text.index('SET GLOBAL'))
 
 
+    def test_release_block_leaves_pipelines_stopped_when_start_at_release_is_none(self):
+        import types
+        names = {'source': SRC, 'replacement': TGT}
+        none = types.SimpleNamespace(pipelines=types.SimpleNamespace(start_at_release='none'))
+        b = P.release_block(names, [ITEM, APP], {}, config=none)
+        text = b.render()
+        self.assertNotIn('START PIPELINE', [i.sql[:14] for i in b.statements])
+        self.assertEqual([i for i in b.statements if i.sql.startswith('START')], [])
+        self.assertIn("no pipeline Running (pipelines.start_at_release: none); expect n = 0", text)
+        self.assertIn('every captured partition of p1 present on the live name', text)
+        self.assertNotIn('no retention gap', text, 'the retention check belongs to the start')
+        self.assertIn('1 pipeline(s) left stopped by pipelines.start_at_release: none. Start one when you choose: START PIPELINE `%s`.`<name>`;' % SRC, text)
+        self.assertIn('START PIPELINE `%s`.`p1`' % SRC, P.release_block(names, [ITEM], {}, config=None).render(), 'all stays the default')
+        with self.assertRaises(KitError):
+            config_from(mutate=lambda d: d.setdefault('pipelines', {}).update(start_at_release='some'))
+        self.assertEqual(config_from().pipelines.start_at_release, 'all')
+
+    def test_c1_reports_pipelines_left_stopped_without_requiring_them_running(self):
+        h = owner_harness(self, mutate=lambda d: d.setdefault('pipelines', {}).update(start_at_release='none'))
+        self.assertEqual(h.o5_o6().status, steps.PASSED, h.text())
+        pass_steps(h, 'O7', 'O8', 'O9', 'O10', 'O11')
+        h.journal.set_meta('released_utc', '2026-11-01T07:00:00Z')
+        write_o2(h, [ITEM])
+        with_source_pipeline(h, state='Stopped')
+        slept = []
+        out = h.step('C1', redo=False, options={'sleep': slept.append, 'idle_workload': 'test database, no application'})
+        self.assertEqual(out.status, steps.PASSED, h.text())
+        self.assertIn('pipelines left stopped by pipelines.start_at_release: none: 1 of 1 not Running', h.text())
+        self.assertIn('offsets not sampled: no pipeline was started', h.text())
+        self.assertNotIn('pipelines not Running', h.text())
+
 class CredentialTests(unittest.TestCase):
     def test_resolution_order_and_refusals(self):
         cfg = config_from()
@@ -227,7 +258,7 @@ class CaptureRobustnessTests(unittest.TestCase):
                 h = owner_harness(self)
                 with_source_pipeline(h)
                 h.fake.pipelines[0]['definition'] = definition
-                h.journal.record_attachment('source', SRC, 'sid-source', 'cid-1', 'READWRITE')
+                h.journal.record_attachment('source', SRC, '1028600672070281646:7367158985892520834', 'cid-1', 'READWRITE')
                 o2_file = inventory.inventory_dir(h.config, h.run_id, h.db, 'O2') / inventory.INVENTORY_FILE
                 if point == 'journal':
                     fired = crash_journal(self, h.journal, 'upsert_pipeline')
@@ -262,7 +293,7 @@ class CaptureRobustnessTests(unittest.TestCase):
                   "\"sasl.password\": \"******\"}' CREDENTIALS <CREDENTIALS REDACTED> INTO TABLE `t_single`")
         plain = owner_harness(self)
         with_source_pipeline(plain)
-        plain.journal.record_attachment('source', SRC, 'sid-source', 'cid-1', 'READWRITE')
+        plain.journal.record_attachment('source', SRC, '1028600672070281646:7367158985892520834', 'cid-1', 'READWRITE')
         self.assertEqual(plain.step('O2', redo=True).status, steps.PASSED, plain.text())
         self.assertFalse(P.capture_for(plain.ctx())['items'][0]['redaction_marker'], 'the CREDENTIALS token alone is not a marker O9 refuses')
         notebook_capture = {'states': [{'PIPELINE_NAME': 'p1', 'STATE': 'Stopped'}, {'PIPELINE_NAME': 'p2', 'STATE': 'Stopped'}],
@@ -272,7 +303,7 @@ class CaptureRobustnessTests(unittest.TestCase):
         h = owner_harness(self)
         with_source_pipeline(h)
         h.fake.pipelines[0]['definition'] = masked
-        h.journal.record_attachment('source', SRC, 'sid-source', 'cid-1', 'READWRITE')
+        h.journal.record_attachment('source', SRC, '1028600672070281646:7367158985892520834', 'cid-1', 'READWRITE')
         self.assertEqual(h.step('O2', redo=True).status, steps.PASSED, h.text())
         item = P.capture_for(h.ctx())['items'][0]
         self.assertIn('"sasl.password": "******"', item['definition'])
@@ -303,7 +334,7 @@ class CaptureRobustnessTests(unittest.TestCase):
                 h = owner_harness(self)
                 with_source_pipeline(h)
                 h.fake.pipelines[0]['definition'] = masked
-                h.journal.record_attachment('source', SRC, 'sid-source', 'cid-1', 'READWRITE')
+                h.journal.record_attachment('source', SRC, '1028600672070281646:7367158985892520834', 'cid-1', 'READWRITE')
                 self.assertEqual(h.step('O2', redo=True).status, steps.PASSED, h.text())
                 self.assertEqual(h.o5_o6().status, steps.PASSED, h.text())
                 pass_steps(h, 'O7', 'O8')
@@ -333,7 +364,7 @@ class HandlerTests(unittest.TestCase):
     def test_o2_o9_o11_c1_with_the_owner_profile(self):
         h = owner_harness(self)
         with_source_pipeline(h)
-        h.journal.record_attachment('source', SRC, 'sid-source', 'cid-1', 'READWRITE')
+        h.journal.record_attachment('source', SRC, '1028600672070281646:7367158985892520834', 'cid-1', 'READWRITE')
         out2 = h.step('O2', redo=True)
         self.assertEqual(out2.status, steps.PASSED, h.text())
         self.assertEqual(h.fake.pipelines[0]['STATE'], 'Stopped')
@@ -391,7 +422,7 @@ class HandlerTests(unittest.TestCase):
         h = owner_harness(self)
         with_source_pipeline(h)
         write_o2(h, [])
-        h.journal.record_attachment('source', SRC, 'sid-source', 'cid-1', 'READWRITE')
+        h.journal.record_attachment('source', SRC, '1028600672070281646:7367158985892520834', 'cid-1', 'READWRITE')
         out = h.step('O2', redo=True)
         self.assertEqual(out.status, steps.PASSED, h.text())
         self.assertIn('STOP PIPELINE `%s`.`p1`' % SRC, h.fake.writes)
@@ -831,7 +862,7 @@ class ReleaseBoundaryTests(unittest.TestCase):
         self.assertIsNone(h.journal.get_meta('release_started_utc'))
         self.assertFalse(ownersql.block_inputs(h.ctx())['released'])
         self.assertEqual(machine_for(h)[0].rollback(), switch.NOT_STARTED, 'nothing was released, so the rollback runs')
-        self.assertEqual(h.fake.attachment(SRC)['STORAGE_ID'], 'sid-source')
+        self.assertEqual(h.fake.attachment(SRC)['STORAGE_ID'], '1028600672070281646:7367158985892520834')
         hp = Harness(self)
         write_o2(hp, [ITEM])
         pass_steps(hp, 'O5', 'O6', 'O7', 'O8', 'O9', 'O10')
@@ -900,7 +931,7 @@ class ReleaseBoundaryTests(unittest.TestCase):
                 self.assertEqual(h.fake.writes, before, 'the proof reads only')
                 result = run_rollback_block(h)
                 self.assertEqual((result['status'], result['statements']), ('passed', 3), 'nothing was released, so the rollback runs')
-                self.assertEqual((h.fake.attachment(SRC)['STORAGE_ID'], h.fake.attachment(SRC)['ATTACH_TYPE']), ('sid-source', 'READWRITE'))
+                self.assertEqual((h.fake.attachment(SRC)['STORAGE_ID'], h.fake.attachment(SRC)['ATTACH_TYPE']), ('1028600672070281646:7367158985892520834', 'READWRITE'))
                 h = self.stop_o11_before_its_first_statement(case)
                 out = h.step('O11', redo=True)
                 if case == 'check expectation':
@@ -940,7 +971,7 @@ class ReleaseBoundaryTests(unittest.TestCase):
                     self.assertEqual(live_state(h), ['Stopped'])
                     result = run_dict(h, stale)
                     self.assertEqual((result['status'], result['statements']), ('passed', 3), 'nothing was released, so the rollback runs')
-                    self.assertEqual(h.fake.attachment(SRC)['STORAGE_ID'], 'sid-source')
+                    self.assertEqual(h.fake.attachment(SRC)['STORAGE_ID'], '1028600672070281646:7367158985892520834')
                     continue
                 self.assertEqual(live_state(h), ['Running'])
                 before = list(h.fake.writes)
@@ -1049,9 +1080,9 @@ O3_EVENTS = {'DETACH': 'O3 detach the source', 'ATTACH': 'O3 attach the same sto
 
 
 def o3_harness(test, owner=True):
-    """A Path A harness with the source STORAGE_ID (sid-source) recorded, with or without the owner profile."""
+    """A Path A harness with the source STORAGE_ID (1028600672070281646:7367158985892520834) recorded, with or without the owner profile."""
     h = owner_harness(test) if owner else Harness(test)
-    h.journal.record_attachment('source', SRC, 'sid-source', 'cid-1', 'READWRITE')
+    h.journal.record_attachment('source', SRC, '1028600672070281646:7367158985892520834', 'cid-1', 'READWRITE')
     return h
 
 
@@ -1094,17 +1125,17 @@ def o3_writes(h, word):
 def assert_between_detach_and_attach(test, h):
     """The source storage is detached, no database carries the source name, no ATTACH was applied and freeze_time is unset."""
     test.assertIsNone(h.fake.attachment(SRC))
-    test.assertEqual([b['IS_DETACHED'] for b in h.fake.branches if b['STORAGE_ID'] == 'sid-source'], [1])
+    test.assertEqual([b['IS_DETACHED'] for b in h.fake.branches if b['STORAGE_ID'] == '1028600672070281646:7367158985892520834'], [1])
     test.assertEqual(o3_writes(h, 'ATTACH'), [])
     test.assertIsNone(h.journal.get_meta('freeze_time'))
 
 
 def assert_frozen_once(test, h):
-    """READONLY on sid-source after exactly one DETACH and one ATTACH; the probe ran and was refused; freeze_time is recorded."""
+    """READONLY on 1028600672070281646:7367158985892520834 after exactly one DETACH and one ATTACH; the probe ran and was refused; freeze_time is recorded."""
     att = h.fake.attachment(SRC)
-    test.assertEqual((att['ATTACH_TYPE'], att['STORAGE_ID']), ('READONLY', 'sid-source'))
+    test.assertEqual((att['ATTACH_TYPE'], att['STORAGE_ID']), ('READONLY', '1028600672070281646:7367158985892520834'))
     test.assertEqual(o3_writes(h, 'DETACH'), ['DETACH DATABASE `%s`' % SRC], 'DETACH is issued exactly once')
-    test.assertEqual(o3_writes(h, 'ATTACH'), ["ATTACH DATABASE `%s` STORAGEID 'sid-source' READ ONLY" % SRC], 'ATTACH is issued exactly once')
+    test.assertEqual(o3_writes(h, 'ATTACH'), ["ATTACH DATABASE `%s` READ ONLY STORAGEID 1028600672070281646:7367158985892520834" % SRC], 'ATTACH is issued exactly once')
     test.assertTrue(any(w.startswith("DELETE FROM `%s`.`t_comp` WHERE `a` = 's2rebuild-probe-" % SRC) for w in h.fake.writes), 'the probe ran')
     test.assertIn('refused as read only', h.text())
     test.assertIsNotNone(h.journal.get_meta('freeze_time'))
@@ -1152,21 +1183,21 @@ class FreezeTests(unittest.TestCase):
     def test_o3_path_a_with_the_owner_profile(self):
         h = owner_harness(self)
         h.fake.privileges.append({'GRANTEE': "'app'@'%'", 'PRIVILEGE_TYPE': 'INSERT'})
-        h.journal.record_attachment('source', SRC, 'sid-source', 'cid-1', 'READWRITE')
+        h.journal.record_attachment('source', SRC, '1028600672070281646:7367158985892520834', 'cid-1', 'READWRITE')
         out = h.step('O3', redo=True)
         self.assertEqual(out.status, steps.PASSED, h.text())
         self.assertEqual(h.fake.attachment(SRC)['ATTACH_TYPE'], 'READONLY')
         self.assertIsNotNone(h.journal.get_meta('freeze_time'))
         writes = [w for w in h.fake.writes if w.startswith(('DETACH', 'ATTACH', 'DELETE'))]
         self.assertEqual(writes[0], 'DETACH DATABASE `%s`' % SRC)
-        self.assertTrue(writes[1].startswith("ATTACH DATABASE `%s` STORAGEID 'sid-source' READ ONLY" % SRC))
+        self.assertTrue(writes[1].startswith("ATTACH DATABASE `%s` READ ONLY STORAGEID 1028600672070281646:7367158985892520834" % SRC))
         self.assertTrue(writes[2].startswith("DELETE FROM `%s`.`t_comp` WHERE `a` = 's2rebuild-probe-" % SRC))
         self.assertEqual(grants.reference_from_journal(h.journal), {"'app'@'%'": {'*.*': ['INSERT']}}, 'Path A keeps a grants reference for C1')
 
     def test_o3_resumes_after_the_read_only_attachment_without_the_owner(self):
         h = Harness(self)
         h.fake.attachment(SRC)['ATTACH_TYPE'] = 'READONLY'
-        h.journal.record_attachment('source', SRC, 'sid-source', 'cid-1', 'READWRITE')
+        h.journal.record_attachment('source', SRC, '1028600672070281646:7367158985892520834', 'cid-1', 'READWRITE')
         out = h.step('O3', redo=True)
         self.assertEqual(out.status, steps.PASSED, h.text())
         self.assertIn('O3 resumed', out.note)
@@ -1187,7 +1218,7 @@ class FreezeTests(unittest.TestCase):
 
     def test_o3_detach_escalation_through_the_admin_block(self):
         h = owner_harness(self, mutate=lambda d: d.setdefault('freeze', {}).update(detach_wait_seconds=1))
-        h.journal.record_attachment('source', SRC, 'sid-source', 'cid-1', 'READWRITE')
+        h.journal.record_attachment('source', SRC, '1028600672070281646:7367158985892520834', 'cid-1', 'READWRITE')
         h.fake.detach_blocks.add(SRC)
         out = h.step('O3', redo=True)
         self.assertEqual(out.status, steps.PASSED, h.text())
@@ -1277,10 +1308,10 @@ class FreezeTests(unittest.TestCase):
         out = h.step('O3', redo=True)
         self.assertEqual(out.status, steps.PENDING, h.text())
         self.assertIn('-- O3: Freeze: re-entry between DETACH and ATTACH (Path A)', h.text())
-        self.assertIn("ATTACH DATABASE `%s` STORAGEID 'sid-source' READ ONLY;" % SRC, h.text())
+        self.assertIn("ATTACH DATABASE `%s` READ ONLY STORAGEID 1028600672070281646:7367158985892520834;" % SRC, h.text())
         self.assertNotIn('DETACH DATABASE `%s`;' % SRC, h.text())
         self.assertEqual(o3_writes(h, 'ATTACH'), [], 'the runner issues no admin statement')
-        h.fake.connect('ops_owner').cursor().execute("ATTACH DATABASE `%s` STORAGEID 'sid-source' READ ONLY" % SRC)
+        h.fake.connect('ops_owner').cursor().execute("ATTACH DATABASE `%s` READ ONLY STORAGEID 1028600672070281646:7367158985892520834" % SRC)
         out = h.step('O3', redo=True)
         self.assertEqual(out.status, steps.PASSED, h.text())
         self.assertIn('O3 resumed', out.note)
@@ -1309,8 +1340,8 @@ class FreezeTests(unittest.TestCase):
         h = o3_harness(self)
         names = names_of(h)
         detach = 'DETACH DATABASE `%s`' % SRC
-        attach = "ATTACH DATABASE `%s` STORAGEID 'sid-source' READ ONLY" % SRC
-        gate = ('check', 'source storage detached', switch.BRANCH_SQL, ['sid-source'])
+        attach = "ATTACH DATABASE `%s` READ ONLY STORAGEID 1028600672070281646:7367158985892520834" % SRC
+        gate = ('check', 'source storage detached', switch.BRANCH_SQL, ['1028600672070281646:7367158985892520834'])
         for form, items in (('kit', [i.to_dict() for i in freeze.block(names).items]), ('notebook', block_now(h, 'O3')['items'])):
             with self.subTest(form=form):
                 self.assertEqual((items[0]['kind'], items[0]['label']), ('note', freeze.REENTRY_NOTE), 'the re-entry note comes before the first check')
@@ -1393,7 +1424,7 @@ class FreezeTests(unittest.TestCase):
                 out = h.step('O3', redo=True)
                 self.assertEqual(out.status, steps.REFUSED, h.text())
                 self.assertIn('O3 stopped at check "source attached READWRITE"', out.note)
-                self.assertIn('could not read MV_CLOUD_BRANCHES for STORAGE_ID sid-source as the owner (FakeDisconnect, error %s)'
+                self.assertIn('could not read MV_CLOUD_BRANCHES for STORAGE_ID 1028600672070281646:7367158985892520834 as the owner (FakeDisconnect, error %s)'
                               % ('1142' if failure == 'denied' else '2013'), h.text())
                 self.assertNotIn(denied, h.text())
                 self.assertEqual(h.fake.writes, writes, 'nothing is issued')
@@ -1409,7 +1440,7 @@ class FreezeTests(unittest.TestCase):
             writes = list(h.fake.writes)
             out = h.step('O3', redo=True)
             self.assertEqual(out.status, steps.PENDING, h.text())
-            self.assertIn('could not read MV_CLOUD_BRANCHES for STORAGE_ID sid-source as the runner (FakeDisconnect, error 1142)', h.text())
+            self.assertIn('could not read MV_CLOUD_BRANCHES for STORAGE_ID 1028600672070281646:7367158985892520834 as the runner (FakeDisconnect, error 1142)', h.text())
             self.assertIn('-- O3: Freeze: read-only attachment (Path A)', h.text())
             self.assertIn('-- NOTE: ' + freeze.REENTRY_NOTE, h.text())
             self.assertEqual(h.fake.writes, writes, 'nothing is issued')
@@ -1436,7 +1467,7 @@ class FreezeTests(unittest.TestCase):
                 writes = list(h.fake.writes)
                 out = h.step('O3', redo=True)
                 self.assertEqual(out.status, steps.REFUSED, h.text())
-                self.assertIn('STORAGE_ID sid-source is detached: an earlier run stopped between DETACH and ATTACH; resuming at the ATTACH', h.text(),
+                self.assertIn('STORAGE_ID 1028600672070281646:7367158985892520834 is detached: an earlier run stopped between DETACH and ATTACH; resuming at the ATTACH', h.text(),
                               'the position read saw the source name free')
                 self.assertIn('O3 stopped at check "no attached database named source"', out.note)
                 self.assertEqual(h.fake.writes, writes, 'nothing is issued')
@@ -1671,7 +1702,7 @@ class LockoutTests(unittest.TestCase):
         from tests.helpers import run_cli
         h = owner_harness(self, mutate=lambda d: d.update(freeze={'mode': 'lockout', 'lockout': {'connections': 2, 'quiet_passes_required': 2,
                                                                                                     'interval_seconds': 0}}))
-        h.journal.record_attachment('source', SRC, 'sid-source', 'cid-1', 'READWRITE')
+        h.journal.record_attachment('source', SRC, '1028600672070281646:7367158985892520834', 'cid-1', 'READWRITE')
         grant = {'GRANTEE': "'app'@'%'", 'PRIVILEGE_TYPE': 'INSERT'}
         h.fake.privileges.append(dict(grant))
         proofs = []

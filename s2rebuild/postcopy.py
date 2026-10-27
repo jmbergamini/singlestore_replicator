@@ -6,7 +6,9 @@ Section 10.11 and 10.10 of the architecture. Views run under their definer and C
 runner, so the runner never creates them. With the owner profile they are created through the
 owner session in rounds, until a round creates none: the original DEFINER is kept when that
 account still exists and is not the runner, else the clause is removed and the owner account
-becomes the definer; the choice is recorded per view. Without the owner profile O7 prints and
+becomes the definer; when the server refuses the kept definer (error 1227: naming another
+account as DEFINER needs SUPER, which no account holds on Helios), the view is created again without
+the clause and the owner is the definer; the choice is recorded per view. Without the owner profile O7 prints and
 writes the O7 block for the admin, runs the stale check and the counters, and ends pending
 until a rerun finds the views. A view whose definition names the source database is refused
 before any view statement. For every AUTO_INCREMENT column the replacement counter is set to the
@@ -102,9 +104,9 @@ def definer_choice(session, view, runner_user):
     The original DEFINER is kept when that account still exists in the workspace and is not the
     runner, which C4 removes; otherwise the clause is removed and the owner session that runs
     the CREATE becomes the definer. Existence is read from information_schema.USER_PRIVILEGES
-    (the rows of 'user'@'host') through the owner session, which sees every account. To be
-    confirmed on the first live test: every account has a row there, and the owner may name
-    another account as DEFINER. An account without a row gets the owner, which stays.
+    (the rows of 'user'@'host') through the owner session, which sees every account. An account
+    without a row gets the owner, which stays. Confirmed live on October 27, 2026: Helios refuses
+    another account as DEFINER (error 1227), so create_views falls back to the owner (_create).
     """
     account = definer_account(view.get('definer'))
     if account is None:
@@ -132,6 +134,26 @@ def record_found(session, target_db, view, journal):
     observed = (row['DEFINER'] if isinstance(row, dict) else row[0]) if row else None
     journal.event('view', json.dumps({'view': view['name'], 'original_definer': view.get('definer'), 'definer': FOUND,
                                       'observed_definer': observed, 'reason': 'found in the replacement; definer %s' % observed}))
+
+
+DEFINER_REFUSED = 1227
+DEFINER_REFUSED_REASON = ('the server refused the original definer (error 1227: another account as DEFINER needs SUPER, which no account '
+                          'holds on Helios); the owner account is the definer')
+
+
+def _create(session, view, target_db, choice, reason):
+    """CREATE VIEW with the chosen definer; when the server refuses a kept definer (1227), again without the clause. Returns (choice, reason)."""
+    try:
+        session.execute(view_statement(view, target_db, keep_definer=(choice == KEPT)))
+        return choice, reason
+    except KitError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - only the definer refusal falls back; every other error goes to the caller
+        args = getattr(exc, 'args', ())
+        if choice != KEPT or not args or args[0] != DEFINER_REFUSED:
+            raise
+    session.execute(view_statement(view, target_db))
+    return OWNER_DEFINER, DEFINER_REFUSED_REASON
 
 
 def _error_text(exc):
@@ -171,7 +193,7 @@ def create_views(session, target_db, views, journal, log, runner_user=None):
                 continue
             choice, reason = definer_choice(session, view, runner_user)
             try:
-                session.execute(view_statement(view, target_db, keep_definer=(choice == KEPT)))
+                choice, reason = _create(session, view, target_db, choice, reason)
             except KitError:
                 raise
             except Exception as exc:  # noqa: BLE001 - one view's server error is kept and that view is tried again next round
@@ -285,6 +307,25 @@ def _counter_of(session, db, table):
     return inventory.auto_increment_counter(row['Create Table'] if isinstance(row, dict) else row[1])
 
 
+COUNTER_REFUSED = 1749
+COUNTER_REFUSED_ACTION = ('the server does not set the counter of a sharded table (error 1749); AGGREGATOR SYNC moved every aggregator '
+                          'past MAX')
+
+
+def _alter_counter(session, target_db, table, value):
+    """ALTER TABLE ... AUTO_INCREMENT; False when the server refuses it for a sharded table (1749), every other error goes to the caller."""
+    try:
+        session.execute(alter_counter_sql(target_db, table, value))
+        return True
+    except KitError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - only the sharded-table refusal is expected
+        args = getattr(exc, 'args', ())
+        if not args or args[0] != COUNTER_REFUSED:
+            raise
+    return False
+
+
 def set_counters(session, target_db, tables, journal, log):
     """For every table with an AUTO_INCREMENT column: the larger of the source counter and MAX plus one, then the sync on every aggregator.
 
@@ -292,7 +333,10 @@ def set_counters(session, target_db, tables, journal, log):
     AGGREGATOR SYNC AUTO_INCREMENT ... ALL, then SHOW CREATE TABLE again. The source counter is the
     one the inventory captured (auto_increment.counter). An empty table without a source counter
     keeps the default. tables are the inventory table dicts. Returns the list of actions recorded
-    in the journal: both values, the decision and the counter before and after.
+    in the journal: both values, the decision and the counter before and after. Helios does not
+    set the counter of a sharded table (error 1749, October 27, 2026): its values carry the
+    aggregator id, so the source counter cannot be carried over, and the sync alone moves every
+    aggregator past MAX; the action records that.
     """
     actions = []
     for t in tables:
@@ -312,10 +356,11 @@ def set_counters(session, target_db, tables, journal, log):
         if value is None:
             action.update(target_after=before, action='table empty, counter left at default')
         else:
-            session.execute(alter_counter_sql(target_db, t['name'], value))
+            altered = _alter_counter(session, target_db, t['name'], value)
             session.execute(sync_counter_sql(target_db, t['name']))
             action.update(target_after=_counter_of(session, target_db, t['name']),
-                          action='counter set to %s and synced on every aggregator' % ('the source counter' if decision == COUNTER_SOURCE else 'MAX+1'))
+                          action=('counter set to %s and synced on every aggregator' % ('the source counter' if decision == COUNTER_SOURCE else 'MAX+1'))
+                          if altered else COUNTER_REFUSED_ACTION)
         journal.event('counter', json.dumps(action))
         log('%s: %s (%d rows, MAX(%s)=%s, source counter %s)' % (t['name'], action['action'], n, column, m, auto.get('counter')))
         actions.append(action)

@@ -7,7 +7,7 @@ The facts the kit relies on, in plain words, and what a real rebuild night taugh
 ## Helios facts
 
 1. A database's partition layout is fixed at CREATE DATABASE. Sub-partitions cannot be added later, so a new layout means a new database and a copy.
-2. ATTACH DATABASE takes a name, an optional new name (AS), an optional STORAGEID and COMPUTEID, and READ ONLY. AS creates a branch with its own STORAGE_ID. When two databases could share a name, only the STORAGE_ID tells them apart.
+2. ATTACH DATABASE takes a name, an optional new name (AS), READ ONLY, then an optional STORAGEID and COMPUTEID, the ids unquoted. AS creates a branch with its own STORAGE_ID. When two databases could share a name, only the STORAGE_ID tells them apart.
 3. DETACH DATABASE waits while writers are active. DETACH ... KILL ends the blocking work and detaches after the upload. DETACH ... FORCE can lose unsynced data; the kit never uses it.
 4. A database has one read-write attachment and may have several read-only ones. DETACH followed by ATTACH ... READ ONLY stops every writer, for every account, within minutes. The Portal does the same.
 5. MV_CLOUD_BRANCHES lists every storage with its STORAGE_ID and whether it is detached. Its database names are not unique.
@@ -24,6 +24,15 @@ The facts the kit relies on, in plain words, and what a real rebuild night taugh
 16. Attaching needs compute cores times 8 at or above the partition count.
 17. query_parallelism_per_leaf_core is global, applies only to databases with sub-partitions, and is picked up by new connections.
 18. Reference throughput with 4 workers on an S-16 at 2x: 13.1 million rows scanned and 339 thousand rows inserted per second per worker; 1.43 billion rows and about 490 GiB per hour in aggregate.
+19. Engine 10.8.0, October 26, 2026: PIPELINES_BATCHES_SUMMARY has START_TIME (the batch timestamp), BATCH_TIME (the batch duration in seconds), ROWS_INSERTED and ROWS_UPDATED, and no BATCH_ROWS_WRITTEN. PIPELINES_ERRORS has ERROR_UNIX_TIMESTAMP and no ERROR_TIME.
+20. Engine 10.8.0, October 26, 2026: a workspace can enforce a password policy (GLOBAL_VARIABLES PASSWORD_MIN_LENGTH, PASSWORD_MIN_UPPERCASE_CHARS and the other PASSWORD_ variables). CREATE USER with a password that misses it fails with error 1144.
+21. Engine 10.8.0, October 26, 2026: an account without routine privileges sees no rows in information_schema.ROUTINES; the owner sees them all.
+22. Engine 10.8.0, October 26, 2026: ATTACH takes the STORAGEID unquoted and READ ONLY before it: ATTACH DATABASE x [AS y] [READ ONLY] [STORAGEID id]. A quoted id, or READ ONLY after STORAGEID, is error 1064. MV_CLOUD_BRANCHES.ATTACH_SYNTAX shows the form for each storage.
+23. Engine 10.8.0, October 26, 2026: on a READ ONLY attachment information_schema.PIPELINES shows no rows, while PIPELINES_OFFSETS keeps them. Pipelines must be captured before the freeze.
+24. Engine 10.8.0, October 27, 2026: an INSERT into a REFERENCE table runs on the master aggregator, and there a READ ONLY source has no master instance: `INSERT INTO new.ref SELECT ... FROM frozen.ref` fails with error 1777 ("Partitions of <db> has no master instance"). TABLE_STATISTICS shows no rows for reference tables. The copy stages each reference table through a sharded table in the replacement.
+25. Engine 10.8.0, October 27, 2026: even the workspace admin cannot name another account as a view's DEFINER; CREATE VIEW with DEFINER=`other`@`%` fails with error 1227 (SUPER needed, and SUPER cannot be granted). O7 then creates the view without the clause, so the owner account is the definer.
+26. Engine 10.8.0, October 27, 2026: ALTER TABLE ... AUTO_INCREMENT = X on a sharded table fails with error 1749 (not supported). Sharded counters carry the aggregator id, so a source counter cannot be carried over; AGGREGATOR SYNC AUTO_INCREMENT ON db.table ALL moves every aggregator past MAX.
+27. Engine 10.8.0, October 27, 2026: `ATTACH DATABASE x AS y STORAGEID <x's id>` while x is attached keeps x's STORAGE_ID for y. y is still its own branch: writes through one name do not reach the other, DETACH or DROP of x leaves y attached with its data, and MV_CLOUD_BRANCHES shows y with its own COMPUTE_ID, ATTACH_TYPE pitr, PREV_DATABASE_NAME x and ATTACH_SOURCE_TIME. An attachment is identified by STORAGE_ID and COMPUTE_ID (or the branch row), not by STORAGE_ID alone.
 
 ## Run lessons
 

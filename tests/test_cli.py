@@ -35,7 +35,7 @@ class HelpTests(unittest.TestCase):
         code, text = run_cli(['--help'])
         self.assertEqual(code, 0)
         expected = ['check', 'account-sql', 'profile', 'plan', 'rehearse', 'run', 'step', 'gate', 'status', 'watch',
-                    'quiet-proof', 'lockout', 'owner-sql', 'owner-notebook', 'mark-recopy', 'pause', 'resume', 'report',
+                    'quiet-proof', 'lockout', 'owner-sql', 'owner-notebook', 'mark-recopy', 'pause', 'resume', 'abandon', 'report',
                     'calibrate', 'bundle', 'docs-flags']
         self.assertEqual(cli.COMMAND_NAMES, expected)
         for name in expected:
@@ -818,7 +818,7 @@ class EntryPointRuleTests(unittest.TestCase):
                 self.assertEqual(code, EXIT_DONE, text)
                 with h.journal() as journal:
                     self.assertEqual(journal.step_status('P2'), 'passed')
-                    self.assertEqual(journal.attachment('source')['storage_id'], 'sid-source')
+                    self.assertEqual(journal.attachment('source')['storage_id'], '1028600672070281646:7367158985892520834')
         for after in (False, True):
             with self.subTest(result_write='after' if after else 'before'):
                 h = LiveRun(self)
@@ -872,7 +872,7 @@ class EntryPointRuleTests(unittest.TestCase):
                     with h.journal() as journal:
                         self.assertEqual(journal.step_status(step_id), 'passed')
                         self.assertEqual(journal.get_meta('inventory_dir_' + step_id), str(target))
-                        self.assertEqual(journal.attachment('source')['storage_id'], 'sid-source')
+                        self.assertEqual(journal.attachment('source')['storage_id'], '1028600672070281646:7367158985892520834')
                     self.assertTrue((target / 'inventory.json').is_file())
                     self.assertEqual((target / 'plan.json').is_file(), step_id == 'O4')
                     code, text = h.cli(*argv)

@@ -362,11 +362,12 @@ def final_summary_rows(inventory, plans, journal, config, db, run_id, name_map=N
     board = journal.steps_board()
     per_table, total = copy_stats(journal)
     meta = journal.meta()
+    window = '%s to %s' % (meta['window_start'], meta.get('window_end', '?')) if meta.get('window_start') else 'none configured'
     rows = [('SingleStore Database Rebuild Kit final report', None), (None, None),
             ('Run', run_id), ('Customer', config.customer), ('Database', db.source), ('Replacement', db.replacement), ('Retained', db.retained),
             ('Freeze path', 'A read-only attachment' if config.freeze.mode == 'readonly' else 'B lockout'),
-            ('Freeze time', meta.get('freeze_time') or 'not recorded'), ('Window', '%s to %s' % (meta.get('window_start', '?'), meta.get('window_end', '?'))),
-            ('Abort deadline', meta.get('abort_deadline') or 'not recorded'), (None, None), ('Steps', None)]
+            ('Freeze time', meta.get('freeze_time') or 'not recorded'), ('Window', window),
+            ('Abort deadline', meta.get('abort_deadline') or 'none'), (None, None), ('Steps', None)]
     for step_id in steps.ORDER:
         row = board.get(step_id)
         if row:

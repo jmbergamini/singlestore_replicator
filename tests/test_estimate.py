@@ -116,6 +116,14 @@ class ModelTests(unittest.TestCase):
         empty = E.simulate([], 4, b)
         self.assertEqual(empty.wall_seconds, 0.0)
 
+    def test_schedule_caps_one_table_at_half_the_workers_above_eight(self):
+        b = E.Baseline(scan_s_per_row=0.0, insert_s_per_row=1e-3, chunk_overhead_s=0.0)
+        big = [Plan('big', 12000, 12)]
+        self.assertAlmostEqual(E.simulate(big, 12, b).wall_seconds, 2.0, msg='12 workers: 6 chunks of one table at a time')
+        self.assertAlmostEqual(E.simulate(big, 8, b).wall_seconds, 2.0, msg='8 workers: no cap, 8 then 4')
+        two = [Plan('big', 12000, 12), Plan('next', 6000, 6)]
+        self.assertAlmostEqual(E.simulate(two, 12, b).wall_seconds, 2.0, msg='the other 6 workers copy the next table')
+
     def test_estimate_allowances_bands_and_fit(self):
         cfg = config_from()
         inv = I.load(FIXTURE_INVENTORY)
@@ -175,7 +183,7 @@ class ModelTests(unittest.TestCase):
         self.assertIn('Rehearsal  none recorded', text)
         no_window = config_from(lambda d: d.pop('window'))
         text = '\n'.join(E.plan_sheet(no_window, no_window.databases[0], 'r', inv, E.estimate(plans, no_window), None))
-        self.assertIn('Window     not configured', text)
+        self.assertIn('Window     none configured: no abort deadline', text)
 
 
 if __name__ == '__main__':

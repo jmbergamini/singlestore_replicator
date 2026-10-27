@@ -4,6 +4,7 @@ Author: John Bergamini
 """
 import json
 import os
+import re
 import stat
 import tempfile
 import unittest
@@ -83,8 +84,9 @@ def canned_answers():
         'SELECT ID, USER, HOST': [{'ID': 1, 'USER': 'app', 'HOST': 'app-host:4455', 'DB': DB, 'COMMAND': 'Query', 'TIME': 1, 'INFO': 'INSERT INTO t_keyed VALUES (1)'}],
         'SELECT PIPELINE_NAME, STATE': [{'PIPELINE_NAME': 'p1', 'STATE': 'Running'}],
         'SELECT PIPELINE_NAME, SOURCE_TYPE': [{'PIPELINE_NAME': 'p1', 'SOURCE_TYPE': 'KAFKA', 'SOURCE_PARTITION_ID': 0, 'EARLIEST_OFFSET': 1, 'LATEST_OFFSET': 12, 'LATEST_LOADED_OFFSET': 10, 'LATEST_SUCCESSFUL_OFFSET': 10}],
-        'SELECT PIPELINE_NAME, BATCH_STATE': [{'PIPELINE_NAME': 'p1', 'BATCH_STATE': 'Succeeded', 'BATCH_TIME': '2026-10-20 10:00:00', 'BATCH_ROWS_WRITTEN': 500}],
-        'SELECT PIPELINE_NAME, ERROR_TIME': [{'PIPELINE_NAME': 'p1', 'ERROR_TIME': '2026-10-20 09:00:00', 'ERROR_MESSAGE': 'example error'}],
+        'SELECT PIPELINE_NAME, BATCH_STATE': [{'PIPELINE_NAME': 'p1', 'BATCH_STATE': 'Succeeded', 'START_TIME': '2026-10-20 10:00:00',
+                                               'ROWS_INSERTED': 400, 'ROWS_UPDATED': 100}],
+        'SELECT PIPELINE_NAME, ERROR_UNIX_TIMESTAMP': [{'PIPELINE_NAME': 'p1', 'ERROR_UNIX_TIMESTAMP': 1792486800.25, 'ERROR_MESSAGE': 'example error'}],
         'SHOW CREATE': show_create,
         'SELECT COUNT(*) AS n FROM `example_orders_db`.`t_email`': [{'n': 100}],
         'SELECT COUNT(*) AS n': [{'n': 42}],
@@ -129,6 +131,7 @@ class CaptureTests(unittest.TestCase):
         self.assertEqual(p1['alter_statements'], ["ALTER PIPELINE `p1` SET OFFSETS '{\"0\": 10}'"])
         self.assertEqual(p1['offsets'][0]['loaded'], 10)
         self.assertEqual((p1['rows_24h'], p1['errors_24h'], p1['last_error']['message']), (500, 1, 'example error'))
+        self.assertEqual((p1['last_batch_time'], p1['last_error']['time']), ('2026-10-20 10:00:00', '2026-10-20 09:00:00'))
         self.assertEqual(len(lines), 1)
         for sql, _ in runner.statements + owner.statements:
             read_guard().check(sql)
@@ -139,6 +142,22 @@ class CaptureTests(unittest.TestCase):
             if 'PIPELINES_BATCHES_SUMMARY' in sql or 'PIPELINES_ERRORS' in sql:
                 since = dt.datetime.strptime(args[1], '%Y-%m-%d %H:%M:%S')
                 self.assertAlmostEqual((captured - since).total_seconds(), 24 * 3600, delta=5, msg='the 24 hour window starts a day before the capture')
+
+    def test_pipeline_queries_name_only_columns_helios_10_8_has(self):
+        """Columns read live on engine 10.8.0 (October 26, 2026); P3 failed with error 1054 on BATCH_ROWS_WRITTEN before."""
+        helios = {
+            'PIPELINES_BATCHES_SUMMARY': {'DATABASE_NAME', 'PIPELINE_NAME', 'BATCH_ID', 'ROWS_INSERTED', 'ROWS_UPDATED', 'ROWS_DELETED',
+                                          'BATCH_STATE', 'START_TIME', 'BATCH_TIME', 'ROWS_PER_SEC', 'ROWS_STREAMED', 'NUM_PARTITIONS',
+                                          'NUM_PARTITIONS_FINISHED', 'MB_STREAMED', 'MB_PER_SEC', 'EXTRACTOR_WAIT_TIME', 'TRANSFORM_WAIT_TIME'},
+            'PIPELINES_ERRORS': {'DATABASE_NAME', 'PIPELINE_NAME', 'ERROR_UNIX_TIMESTAMP', 'ERROR_TYPE', 'ERROR_CODE', 'ERROR_MESSAGE',
+                                 'ERROR_KIND', 'STD_ERROR', 'LOAD_DATA_LINE', 'LOAD_DATA_LINE_NUMBER', 'BATCH_ID', 'ERROR_ID',
+                                 'BATCH_SOURCE_PARTITION_ID', 'BATCH_EARLIEST_OFFSET', 'BATCH_LATEST_OFFSET', 'HOST', 'PORT', 'PARTITION'},
+        }
+        for sql in (I.BATCHES_SQL, I.ERRORS_SQL):
+            view = next(name for name in helios if name in sql)
+            named = set(re.findall(r'\b[A-Z][A-Z_]+[A-Z]\b', sql)) - {'SELECT', 'FROM', 'WHERE', 'AND', 'UNIX_TIMESTAMP', view}
+            named.discard('information_schema'.upper())
+            self.assertEqual(named - helios[view], set(), sql)
 
     def test_capture_without_owner_marks_pipelines_not_captured(self):
         inv = I.capture(FakeSession(canned_answers()), self.db, self.cfg, None, sleep=lambda s: None)

@@ -18,7 +18,7 @@ import sys
 import traceback
 from pathlib import Path
 
-from . import __title__, __version__, bundle, copy as copy_module, estimate, freeze, grants, inventory, lockout, notebook, ownersql, pipelines, postcopy, rehearse, report_md, report_xlsx, steps, switch, watch
+from . import __title__, __version__, abandon, bundle, copy as copy_module, estimate, freeze, grants, inventory, lockout, notebook, ownersql, pipelines, postcopy, rehearse, report_md, report_xlsx, steps, switch, watch
 from .common import EXIT_DONE, EXIT_GATE, EXIT_MISMATCH, EXIT_REFUSED, KitError, check_run_id, parse_utc, run_date, unique_run_id, utc_now
 from .sqlutil import secret_forms, sql_literal
 from .config import load_config
@@ -56,6 +56,8 @@ COMMANDS = [
                                 'and O7 and O8 run again', None),
     ('pause', 'O6', 'Create the stop file: running chunks finish, no new chunk starts', None),
     ('resume', 'O6', 'Remove the stop file', None),
+    ('abandon', 'before O10', 'Back out a run stopped before the switch: the source READWRITE again on its recorded STORAGE_ID, '
+                              'the replacement dropped, the run closed; --execute --note TEXT runs it with the owner profile', None),
     ('report', 'C2', 'Final Excel and Markdown for a run', None),
     ('calibrate', 'C2', 'Fit the throughput model from a journal and write customer/baseline.json', None),
     ('bundle', 'packaging', 'Write MANIFEST.json, check the denylist, zip the static tree to dist/; --verify ZIP checks a zip', None),
@@ -161,6 +163,8 @@ def build_parser():
                               help='Path B: keep the loop running after the quiet proof until S1 of O10 has run (the source left its STORAGE_ID)')
     p['owner-sql'].add_argument('--rollback', action='store_true', help='O10 only: print the rollback block R1 to R3 instead of the forward block')
     p['owner-sql'].add_argument('step_id', metavar='ID', help='admin step id: %s' % ', '.join(steps.OWNER_SQL_STEPS))
+    p['abandon'].add_argument('--execute', action='store_true', help='run the block with the owner profile (needs --note)')
+    p['abandon'].add_argument('--note', metavar='TEXT', help='why the run is abandoned; recorded in the journal')
     p['mark-recopy'].add_argument('table', metavar='TABLE', help='table name as recorded in the journal')
     p['mark-recopy'].add_argument('--bucket', metavar='N', type=int, help='one bucket instead of every bucket of the table')
     p['calibrate'].add_argument('--journal', metavar='FILE', help='journal to fit (default: the run journal)')
@@ -364,6 +368,13 @@ class Invocation:
         self.log = Log(redactor=redactor, stream=self.out, path=path, verbose=self.args.verbose)
         return self.log
 
+    def refuse_abandoned(self):
+        """Raise KitError when s2rebuild abandon closed this run for any selected database."""
+        for journal in self.journals.values():
+            why = abandon.abandoned(journal)
+            if why:
+                raise KitError('Run %s: %s' % (self.run_id, why))
+
     def open_sessions(self):
         """The SessionFactory for this command (recording sessions in a dry run)."""
         self.sessions = SessionFactory(self.config, self.env, self.log, self.dry_run)
@@ -410,6 +421,7 @@ def cmd_run(args, env, out, state):
     inv = Invocation(args, env, out, state, run_mode=RUN_NEW if args.new else (RUN_FIRST if step_ids[0] == 'O1' else RUN_EXISTING))
     try:
         inv.open_journals()
+        inv.refuse_abandoned()
         log = inv.open_log('run')
         log(_header(inv, 'run'))
         sessions = inv.open_sessions()
@@ -426,6 +438,7 @@ def cmd_step(args, env, out, state):
     inv = Invocation(args, env, out, state, run_mode=RUN_NEW_IF_NONE if step.phase == 'P' else RUN_EXISTING)
     try:
         inv.open_journals()
+        inv.refuse_abandoned()
         log = inv.open_log('step-%s' % step.id)
         log(_header(inv, 'step ' + step.id))
         options = {'retry_failed': args.retry_failed, 'env': env, 'no_rehearsal': args.no_rehearsal}
@@ -454,7 +467,7 @@ def _gate_warnings(inv, step):
         if missing:
             lines.append('warning: %s: earlier steps are not passed: %s; the %s gate is recorded anyway, since it records what a person '
                          'observed. %s' % (db.source, ', '.join(missing), step.id, steps.missing_hint(missing, db, run_id=inv.run_id)))
-        if step.id == 'O1' and journal.get_meta('abort_deadline') is None:
+        if step.id == 'O1' and journal.get_meta('config_hash') is None:
             lines.append('warning: %s: O1 has not run in this journal, so its checks (P2, rehearsal evidence) and its records (window, '
                          'deadline, names, configuration hash) are missing; run s2rebuild run --from O1 --to O1 --redo --db %s%s, then record the go '
                          'again' % (db.source, db.source, steps.run_flag(inv.run_id)))
@@ -480,6 +493,7 @@ def cmd_gate(args, env, out, state):
     inv = Invocation(args, env, out, state, run_mode=RUN_FIRST if step.phase == 'P' else RUN_EXISTING)
     try:
         inv.open_journals()
+        inv.refuse_abandoned()
         verdict = 'PASS' if args.passed else 'FAIL'
         targets = ', '.join(inv.journals)
         o10_pass = args.passed and step.id == 'O10'
@@ -1156,6 +1170,24 @@ def cmd_account_sql(args, env, out, state):
         inv.close()
 
 
+def cmd_abandon(args, env, out, state):
+    """abandon: print the block that backs out a run stopped before the switch; --execute --note TEXT runs it with the owner profile."""
+    if args.execute and not args.note:
+        raise KitError('abandon --execute needs --note TEXT: why the run is abandoned')
+    inv = Invocation(args, env, out, state, run_mode=RUN_EXISTING)
+    try:
+        inv.open_journals()
+        log = inv.open_log('abandon')
+        log(_header(inv, 'abandon'))
+        sessions = inv.open_sessions() if args.execute and not inv.dry_run else None
+        for db in inv.databases:
+            ctx = steps.StepContext(inv.config, db, inv.journals[db.source], inv.run_id, log, dry_run=inv.dry_run, sessions=sessions)
+            log(abandon.run(ctx, args.note or '', args.execute))
+        return EXIT_DONE
+    finally:
+        inv.close()
+
+
 def cmd_lockout(args, env, out, state):
     """lockout: Path B revoke and kill loop with the quiet proof (owner profile required); --hold passes on until S1 of O10 has run.
 
@@ -1340,7 +1372,7 @@ DISPATCH = {'run': cmd_run, 'step': cmd_step, 'gate': cmd_gate, 'status': cmd_st
             'profile': cmd_profile, 'plan': cmd_plan, 'calibrate': cmd_calibrate, 'mark-recopy': cmd_mark_recopy, 'pause': cmd_pause,
             'resume': cmd_resume, 'watch': cmd_watch, 'quiet-proof': cmd_quiet_proof, 'report': cmd_report, 'owner-sql': cmd_owner_sql,
             'owner-notebook': cmd_owner_notebook, 'account-sql': cmd_account_sql, 'lockout': cmd_lockout, 'rehearse': cmd_rehearse,
-            'check': cmd_check, 'bundle': cmd_bundle}
+            'check': cmd_check, 'bundle': cmd_bundle, 'abandon': cmd_abandon}
 for _name, _label, _help, _milestone in COMMANDS:
     if _milestone is not None:
         DISPATCH[_name] = not_implemented(_name, _milestone)

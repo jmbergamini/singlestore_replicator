@@ -150,6 +150,8 @@ OWNER_ALLOWANCES = {
     'C3': (('DROP DATABASE',), ('retained', 'replacement'), {}, {}),
     'C4': (('DROP USER',), (), {}, {}),
     'lockout': (('REVOKE', 'GRANT', 'KILL CONNECTION'), ('source',), {}, {}),
+    'abandon': (('DETACH DATABASE', 'ATTACH DATABASE', 'DROP DATABASE'), ('source', 'replacement'),
+                {'DETACH DATABASE': ('source',), 'ATTACH DATABASE': ('source',), 'DROP DATABASE': ('replacement',)}, {}),
 }
 
 
@@ -318,33 +320,34 @@ def o1_readiness(ctx):
 def o1_start(step, ctx):
     """O1: check the window, P2 and the rehearsal evidence, record window and deadline, then wait for the go decision.
 
-    A missing window or a past deadline fails the gate. A real run then refuses, before any
-    journal write, when P2 is not passed in this run or there is no rehearsal evidence and no
-    --no-rehearsal NOTE (o1_readiness); a dry run reports both and goes on. A waiver is recorded
-    as a no_rehearsal event and in the O1 note.
+    The window is optional. Without one there is no abort deadline: O1 records that, and the copy,
+    the switch and the lockout run without a time limit. With one, a past deadline fails the gate.
+    A real run then refuses, before any journal write, when P2 is not passed in this run or there
+    is no rehearsal evidence and no --no-rehearsal NOTE (o1_readiness); a dry run reports both and
+    goes on. A waiver is recorded as a no_rehearsal event and in the O1 note.
     """
     config = ctx.config
-    if config.window is None:
-        return Outcome(FAILED, 'window.start and window.end are not configured; record them at P4 first', EXIT_GATE)
     window = config.window
-    longest, longest_note = 0.0, 'no capture yet, so no longest-chunk allowance; O6 recomputes it from the plan'
-    try:
-        from . import copy as copy_module
-        _, plans, _ = copy_module.load_plans(ctx)
-        longest = copy_module.longest_chunk_seconds(plans, config)
-        longest_note = 'longest modeled chunk %s' % format_duration(longest)
-    except KitError:
-        pass
-    deadline = window.abort_deadline(longest)
-    lines = [
-        'names: source %s, replacement %s, retained %s' % ctx.db.names,
-        'window: %s to %s (%s)' % (iso(window.start), iso(window.end), format_duration(window.duration.total_seconds())),
-        'abort deadline: %s (end minus %d m restart allowance, %d m buffer; %s)' % (
-            iso(deadline), window.restart_allowance_minutes, window.buffer_minutes, longest_note),
-        'freeze path: %s' % ('A read-only attachment' if config.freeze.mode == 'readonly' else 'B lockout'),
-    ]
+    deadline = None
+    lines = ['names: source %s, replacement %s, retained %s' % ctx.db.names]
+    if window is None:
+        lines.append('window: none configured, so no abort deadline; the copy and the switch run without a time limit')
+    else:
+        longest, longest_note = 0.0, 'no capture yet, so no longest-chunk allowance; O6 recomputes it from the plan'
+        try:
+            from . import copy as copy_module
+            _, plans, _ = copy_module.load_plans(ctx)
+            longest = copy_module.longest_chunk_seconds(plans, config)
+            longest_note = 'longest modeled chunk %s' % format_duration(longest)
+        except KitError:
+            pass
+        deadline = window.abort_deadline(longest)
+        lines.append('window: %s to %s (%s)' % (iso(window.start), iso(window.end), format_duration(window.duration.total_seconds())))
+        lines.append('abort deadline: %s (end minus %d m restart allowance, %d m buffer; %s)' % (
+            iso(deadline), window.restart_allowance_minutes, window.buffer_minutes, longest_note))
+    lines.append('freeze path: %s' % ('A read-only attachment' if config.freeze.mode == 'readonly' else 'B lockout'))
     now = utc_now()
-    if now >= deadline:
+    if deadline is not None and now >= deadline:
         if ctx.dry_run:
             lines.append('abort deadline is in the past relative to now (%s); a real run stops here' % iso(now))
         else:
@@ -367,11 +370,15 @@ def o1_start(step, ctx):
         journal.set_meta('replacement_db', ctx.db.replacement)
         journal.set_meta('retained_db', ctx.db.retained)
         journal.set_meta('config_hash', config.config_hash())
-        journal.set_meta('window_start', iso(window.start))
-        journal.set_meta('window_end', iso(window.end))
-        journal.set_meta('abort_deadline', iso(deadline))
+        # empty values clear a window an earlier O1 recorded; resolve_abort_at ignores an empty deadline
+        journal.set_meta('window_start', iso(window.start) if window else '')
+        journal.set_meta('window_end', iso(window.end) if window else '')
+        journal.set_meta('abort_deadline', iso(deadline) if deadline else '')
         journal.set_meta('freeze_mode', config.freeze.mode)
-        journal.event('window', 'start=%s end=%s deadline=%s' % (iso(window.start), iso(window.end), iso(deadline)))
+        if window is None:
+            journal.event('window', 'none configured; no abort deadline')
+        else:
+            journal.event('window', 'start=%s end=%s deadline=%s' % (iso(window.start), iso(window.end), iso(deadline)))
         if waiver:
             journal.event('no_rehearsal', 'O1 without rehearsal evidence: %s' % waiver)
     outcome = gate_pending(step, ctx, lines + ['go decision recorded by the operator'])

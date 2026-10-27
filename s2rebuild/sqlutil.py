@@ -14,7 +14,9 @@ from .common import KitError
 IDENT = re.compile(r'^[A-Za-z0-9_]+$')
 _BT = r'`([A-Za-z0-9_]+)`'
 _QUAL = _BT + r'\.' + _BT
-_ID_LITERAL = r"'[A-Za-z0-9_-]+'"
+# Helios STORAGE_IDs are two numbers joined by a colon, for example 1028600672070281646:7367158985892520834,
+# and ATTACH takes them unquoted (MV_CLOUD_BRANCHES.ATTACH_SYNTAX, engine 10.8.0); a quoted id is error 1064
+_ID_VALUE = r'[A-Za-z0-9_:-]+'
 _DEFINER_CLAUSE = r"(?:DEFINER ?= ?(?:`[^`]*`|'[^']*')@(?:`[^`]*`|'[^']*') )?"
 
 READ_KINDS = frozenset({'SELECT', 'SHOW', 'EXPLAIN', 'DESCRIBE', 'SET SESSION'})
@@ -179,8 +181,8 @@ def classify(sql):
     m = _match(r'DETACH DATABASE ' + _BT + r'(?: (KILL|FORCE))?$', text)
     if m:
         return Statement('DETACH DATABASE', (m.group(1),), (m.group(2) or '').upper(), text)
-    m = _match(r'ATTACH DATABASE ' + _BT + r'(?: AS ' + _BT + r')?(?: STORAGEID ' + _ID_LITERAL +
-               r')?(?: COMPUTEID ' + _ID_LITERAL + r')?( READ ONLY)?$', text)
+    m = _match(r'ATTACH DATABASE ' + _BT + r'(?: AS ' + _BT + r')?( READ ONLY)?(?: STORAGEID ' + _ID_VALUE +
+               r')?(?: COMPUTEID ' + _ID_VALUE + r')?$', text)
     if m:
         names = (m.group(1),) if m.group(2) is None else (m.group(1), m.group(2))
         return Statement('ATTACH DATABASE', names, 'READ ONLY' if m.group(3) else '', text)

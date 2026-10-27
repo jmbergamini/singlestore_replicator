@@ -36,6 +36,7 @@ WRITE_PRIVILEGES = ('INSERT', 'UPDATE', 'DELETE', 'ALTER', 'CREATE', 'DROP', 'IN
 _AUTO_INCREMENT_OPTION = re.compile(r'\bAUTO_INCREMENT=(\d+)')
 _DEFINER = re.compile(r'DEFINER=(`[^`]*`@`[^`]*`)')
 _VARCHAR = re.compile(r'(?:var)?char\((\d+)\)', re.I)
+_REFERENCE = re.compile(r'\s*CREATE\s+(?:ROWSTORE\s+)?REFERENCE\s+TABLE\b', re.I)
 _CREDENTIALS = re.compile(r"""(CREDENTIALS\s+)(?:'(?:[^'\\]|\\.|'')*'|"(?:[^"\\]|\\.|"")*")""", re.I)
 _CREDENTIALS_TOKEN = re.compile(r'(CREDENTIALS\s+)<[^<>]*REDACTED[^<>]*>', re.I)
 _CREDENTIALS_CLAUSE = re.compile(r"""\bCREDENTIALS\s*(?:['"]|<(?!-))""", re.I)
@@ -74,10 +75,11 @@ PROCESSLIST_SQL = ('SELECT ID, USER, HOST, DB, COMMAND, TIME, LEFT(INFO, 160) AS
 PIPELINES_SQL = 'SELECT PIPELINE_NAME, STATE FROM information_schema.PIPELINES WHERE DATABASE_NAME = %s ORDER BY PIPELINE_NAME'
 OFFSETS_SQL = ('SELECT PIPELINE_NAME, SOURCE_TYPE, SOURCE_PARTITION_ID, EARLIEST_OFFSET, LATEST_OFFSET, LATEST_LOADED_OFFSET, '
                'LATEST_SUCCESSFUL_OFFSET FROM information_schema.PIPELINES_OFFSETS WHERE DATABASE_NAME = %s')
-BATCHES_SQL = ('SELECT PIPELINE_NAME, BATCH_STATE, BATCH_TIME, BATCH_ROWS_WRITTEN '
-               'FROM information_schema.PIPELINES_BATCHES_SUMMARY WHERE DATABASE_NAME = %s AND BATCH_TIME >= %s')
-ERRORS_SQL = ('SELECT PIPELINE_NAME, ERROR_TIME, ERROR_MESSAGE FROM information_schema.PIPELINES_ERRORS '
-              'WHERE DATABASE_NAME = %s AND ERROR_TIME >= %s')
+# Helios 10.8: START_TIME is the batch timestamp (BATCH_TIME is its duration in seconds); errors carry ERROR_UNIX_TIMESTAMP
+BATCHES_SQL = ('SELECT PIPELINE_NAME, BATCH_STATE, START_TIME, ROWS_INSERTED, ROWS_UPDATED '
+               'FROM information_schema.PIPELINES_BATCHES_SUMMARY WHERE DATABASE_NAME = %s AND START_TIME >= %s')
+ERRORS_SQL = ('SELECT PIPELINE_NAME, ERROR_UNIX_TIMESTAMP, ERROR_MESSAGE FROM information_schema.PIPELINES_ERRORS '
+              'WHERE DATABASE_NAME = %s AND ERROR_UNIX_TIMESTAMP >= UNIX_TIMESTAMP(%s)')
 ALL_LAYOUTS_SQL = ('SELECT DATABASE_NAME, NUM_PARTITIONS, NUM_SUB_PARTITIONS FROM information_schema.DISTRIBUTED_DATABASES '
                    'ORDER BY DATABASE_NAME')
 ALL_ROWS_SQL = ('SELECT DATABASE_NAME, TABLE_NAME, SUM(ROWS) AS estimated_rows FROM information_schema.TABLE_STATISTICS '
@@ -107,6 +109,14 @@ def _int(value, default=0):
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _epoch_text(value):
+    """'YYYY-MM-DD HH:MM:SS' in UTC for a Unix timestamp, or '' when it is missing."""
+    try:
+        return dt.datetime.fromtimestamp(float(value), dt.timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+    except (TypeError, ValueError, OverflowError, OSError):
+        return ''
 
 
 def _float(value):
@@ -317,15 +327,15 @@ def _pipelines(owner_session, db_name, app_managed, now):
     for b in batches:
         item = by_name.get(b['PIPELINE_NAME'])
         if item is not None:
-            when = str(b.get('BATCH_TIME'))
+            when = str(b.get('START_TIME'))
             if item['last_batch_time'] is None or when > item['last_batch_time']:
                 item['last_batch_time'] = when
-            item['rows_24h'] += _int(b.get('BATCH_ROWS_WRITTEN'))
+            item['rows_24h'] += _int(b.get('ROWS_INSERTED')) + _int(b.get('ROWS_UPDATED'))
     for e in errors:
         item = by_name.get(e['PIPELINE_NAME'])
         if item is not None:
             item['errors_24h'] += 1
-            when = str(e.get('ERROR_TIME'))
+            when = _epoch_text(e.get('ERROR_UNIX_TIMESTAMP'))
             if item['last_error'] is None or when > item['last_error']['time']:
                 item['last_error'] = {'time': when, 'message': str(e.get('ERROR_MESSAGE') or '')[:500]}
     return {'captured': True, 'note': '%d pipelines captured with the owner profile' % len(by_name),
@@ -534,6 +544,15 @@ class TablePlan:
         for c in self.key_columns:
             if c not in self.columns:
                 raise KitError('Key column %s of %s is not a copyable column' % (c, name))
+
+    @property
+    def reference(self):
+        """True for a REFERENCE table (a full copy on every node), read from the captured definition.
+
+        Helios runs an INSERT into a reference table on the master aggregator, which cannot read a
+        READ ONLY source, so the copy stages its rows first (copy.Runner.copy_reference).
+        """
+        return bool(_REFERENCE.match(self.definition or ''))
 
     @property
     def key_expr(self):

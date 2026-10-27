@@ -222,7 +222,7 @@ class RealRunTests(unittest.TestCase):
             steps.record_gate(h.journals, 'O99', True, 'x')
 
     def test_failed_check_exits_4_and_stops(self):
-        h = Harness(self, lambda d: d.pop('window'))
+        h = Harness(self, lambda d: d['window'].update(start='2000-01-01T00:00:00Z', end='2000-01-01T08:00:00Z'))
         self.assertEqual(h.run(), EXIT_GATE)
         self.assertEqual(h.journal.step_status('O1'), 'failed')
         self.assertIn('Stopped at O1: gate failed', h.text())
@@ -328,11 +328,29 @@ class RealRunTests(unittest.TestCase):
                          'Record O2 with s2rebuild gate O2 --pass --note TEXT; then run O4, O6 with s2rebuild run --from O4.',
                          'python outage steps with only passed steps between them share one run --from')
 
-    def test_o1_fails_without_a_window_or_with_a_past_deadline(self):
-        h = Harness(self, lambda d: d.pop('window'))
+    def test_o1_without_a_window_reaches_the_go_with_no_deadline(self):
+        """The window is optional: O1 records no deadline, waits for the go, and the copy deadline resolves to None."""
+        from s2rebuild import copy as copy_module
+        h = Harness(self, lambda d: d.pop('window')).ready_for_o1()
         self.assertEqual(h.run(), EXIT_GATE)
-        self.assertEqual(h.journal.step_status('O1'), 'failed')
-        self.assertIn('window.start and window.end are not configured', h.text())
+        self.assertEqual(h.journal.step_status('O1'), 'pending')
+        self.assertIn('window: none configured, so no abort deadline', h.text())
+        self.assertIn('Stopped at O1', h.text())
+        self.assertEqual(h.journal.get_meta('abort_deadline'), '')
+        self.assertEqual(h.journal.get_meta('window_start'), '')
+        self.assertIsNotNone(h.journal.get_meta('config_hash'), 'O1 ran, so the gate warning stays quiet')
+        self.assertEqual(h.journal.events('window'), ['none configured; no abort deadline'])
+        self.assertIsNone(copy_module.resolve_abort_at(h.journal, h.config, 600))
+
+    def test_o1_without_a_window_clears_a_deadline_an_earlier_o1_recorded(self):
+        from s2rebuild import copy as copy_module
+        h = Harness(self, lambda d: d.pop('window')).ready_for_o1()
+        h.journal.set_meta('abort_deadline', '2000-01-01T00:00:00Z')
+        self.assertEqual(h.run(), EXIT_GATE)
+        self.assertEqual(h.journal.get_meta('abort_deadline'), '')
+        self.assertIsNone(copy_module.resolve_abort_at(h.journal, h.config))
+
+    def test_o1_fails_with_a_past_deadline(self):
         h = Harness(self, lambda d: d['window'].update(start='2000-01-01T00:00:00Z', end='2000-01-01T08:00:00Z'))
         self.assertEqual(h.run(), EXIT_GATE)
         self.assertEqual(h.journal.step_status('O1'), 'failed')

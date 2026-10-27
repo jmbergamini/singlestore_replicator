@@ -40,9 +40,11 @@ class ClassifyTests(unittest.TestCase):
             ('DROP DATABASE `ret`', 'DROP DATABASE', ('ret',)),
             ('DETACH DATABASE `src`', 'DETACH DATABASE', ('src',)),
             ('DETACH DATABASE `src` KILL', 'DETACH DATABASE', ('src',)),
-            ("ATTACH DATABASE `src` STORAGEID 'abc-123' READ ONLY", 'ATTACH DATABASE', ('src',)),
-            ("ATTACH DATABASE `src` AS `ret` STORAGEID 'abc' READ ONLY", 'ATTACH DATABASE', ('src', 'ret')),
-            ("ATTACH DATABASE `repl` AS `src` STORAGEID 'def'", 'ATTACH DATABASE', ('repl', 'src')),
+            ("ATTACH DATABASE `src` READ ONLY STORAGEID abc-123", 'ATTACH DATABASE', ('src',)),
+            ("ATTACH DATABASE `src` AS `ret` READ ONLY STORAGEID abc", 'ATTACH DATABASE', ('src', 'ret')),
+            ("ATTACH DATABASE `repl` AS `src` STORAGEID def", 'ATTACH DATABASE', ('repl', 'src')),
+            # a real Helios STORAGE_ID (engine 10.8.0); the colon was refused as an unsupported kind before October 26, 2026
+            ("ATTACH DATABASE `src` READ ONLY STORAGEID 1028600672070281646:7367158985892520834", 'ATTACH DATABASE', ('src',)),
             ('CREATE TABLE `repl`.`t` LIKE `src`.`t`', 'CREATE TABLE', ('repl',)),
             ('CREATE TABLE `repl`.`t__fresh` LIKE `repl`.`t`', 'CREATE TABLE', ('repl',)),
             ('DROP TABLE `repl`.`t`', 'DROP TABLE', ('repl',)),
@@ -70,7 +72,7 @@ class ClassifyTests(unittest.TestCase):
             self.assertEqual((st.kind, st.databases), (kind, dbs), sql)
         self.assertEqual(classify('ALTER TABLE `r`.`t` ADD COLUMN x int').detail, 'OTHER')
         self.assertEqual(classify('DETACH DATABASE `s` FORCE').detail, 'FORCE')
-        self.assertEqual(classify("ATTACH DATABASE `s` STORAGEID 'x' READ ONLY").detail, 'READ ONLY')
+        self.assertEqual(classify("ATTACH DATABASE `s` READ ONLY STORAGEID x").detail, 'READ ONLY')
         self.assertEqual(classify('SET GLOBAL Query_Parallelism_Per_Leaf_Core = 1').detail, 'query_parallelism_per_leaf_core')
 
     def test_f7_create_view_with_a_definer_names_the_replacement_only(self):
@@ -98,7 +100,10 @@ class ClassifyTests(unittest.TestCase):
                     'STOP PIPELINE `p`', 'START PIPELINE `p`', 'DROP PIPELINE `p`', 'KILL QUERY x', 'GRANT SELECT TO u',
                     "SET PASSWORD = 'x'", "SET PASSWORD FOR 'u'@'%' = 'x'", 'SET ROLE admin', 'SET a = 1, b = 2',
                     'SET SESSION a = 1, GLOBAL b = 2', "SELECT * FROM `a`.`b` INTO OUTFILE '/tmp/x'",
-                    "SELECT 1 INTO S3 'b/k' CREDENTIALS '{}'", 'SELECT a INTO @v FROM `a`.`b`', 'SET PERSIST x = 1'):
+                    "SELECT 1 INTO S3 'b/k' CREDENTIALS '{}'", 'SELECT a INTO @v FROM `a`.`b`', 'SET PERSIST x = 1',
+                    # Helios 10.8.0 rejects a quoted STORAGEID with error 1064, so the guard never lets one through
+                    "ATTACH DATABASE `s` READ ONLY STORAGEID '1028600672070281646:7367158985892520834'",
+                    'ATTACH DATABASE `s` STORAGEID 1:1 READ ONLY', 'ATTACH DATABASE `s` STORAGEID 1 2', 'ATTACH DATABASE `s` READ ONLY STORAGEID x;DROP'):
             with self.assertRaises(GuardError, msg=sql):
                 classify(sql)
 
@@ -195,7 +200,7 @@ class GuardTests(unittest.TestCase):
             'UPDATE `%s`.`t` SET a = 1' % TGT,
             'DROP DATABASE `%s`' % TGT,
             'DETACH DATABASE `%s`' % TGT,
-            "ATTACH DATABASE `%s` STORAGEID 'x'" % TGT,
+            "ATTACH DATABASE `%s` STORAGEID x" % TGT,
             'STOP PIPELINE `%s`.`p`' % TGT,
             'CREATE PIPELINE `p` AS LOAD DATA KAFKA "x"',
             "GRANT SELECT ON *.* TO 'u'@'%'",
@@ -246,11 +251,11 @@ class GuardTests(unittest.TestCase):
         g = Guard('owner O10', ('DETACH DATABASE', 'ATTACH DATABASE'), (SRC, TGT, RET), per_kind={'DROP DATABASE': (RET,)})
         g.check('DETACH DATABASE `%s`' % SRC)
         g.check('DETACH DATABASE `%s` KILL' % SRC)
-        g.check("ATTACH DATABASE `%s` AS `%s` STORAGEID 'sid' READ ONLY" % (SRC, RET))
-        g.check("ATTACH DATABASE `%s` AS `%s` STORAGEID 'sid2'" % (TGT, SRC))
+        g.check("ATTACH DATABASE `%s` AS `%s` READ ONLY STORAGEID sid" % (SRC, RET))
+        g.check("ATTACH DATABASE `%s` AS `%s` STORAGEID sid2" % (TGT, SRC))
         g.check('DROP DATABASE `%s`' % RET)
         for sql in ('DROP DATABASE `%s`' % SRC, 'DROP DATABASE `%s`' % TGT, 'DETACH DATABASE `other_db`',
-                    "ATTACH DATABASE `%s` AS `other_db` STORAGEID 'x'" % SRC, 'DETACH DATABASE `%s` FORCE' % SRC,
+                    "ATTACH DATABASE `%s` AS `other_db` STORAGEID x" % SRC, 'DETACH DATABASE `%s` FORCE' % SRC,
                     'DROP TABLE `%s`.`t`' % RET, "GRANT ALL ON *.* TO 'u'@'%'"):
             with self.assertRaises(GuardError, msg=sql):
                 g.check(sql)
@@ -304,13 +309,13 @@ class StepGuardTests(unittest.TestCase):
         o3 = steps.guard_for('O3', self.db, steps.OWNER)
         o3.check('DETACH DATABASE `%s`' % SRC)
         o3.check('DETACH DATABASE `%s` KILL' % SRC)
-        o3.check("ATTACH DATABASE `%s` STORAGEID 'sid' READ ONLY" % SRC)
+        o3.check("ATTACH DATABASE `%s` READ ONLY STORAGEID sid" % SRC)
         with self.assertRaises(GuardError):
             o3.check('DETACH DATABASE `%s`' % TGT)
         with self.assertRaisesRegex(GuardError, 'requires ATTACH DATABASE with READ ONLY'):
-            o3.check("ATTACH DATABASE `%s` STORAGEID 'sid'" % SRC)
+            o3.check("ATTACH DATABASE `%s` STORAGEID sid" % SRC)
         with self.assertRaises(GuardError):
-            o3.check("ATTACH DATABASE `%s` AS `%s` STORAGEID 'sid' READ ONLY" % (SRC, RET))
+            o3.check("ATTACH DATABASE `%s` AS `%s` READ ONLY STORAGEID sid" % (SRC, RET))
         o9 = steps.guard_for('O9', self.db, steps.OWNER)
         o9.check('USE `%s`' % TGT)
         o9.check('CREATE PIPELINE `p` AS LOAD DATA KAFKA "x"')
@@ -320,7 +325,7 @@ class StepGuardTests(unittest.TestCase):
         with self.assertRaises(GuardError):
             o9.check('START PIPELINE `%s`.`p`' % TGT)
         o10 = steps.guard_for('O10', self.db, steps.OWNER)
-        o10.check("ATTACH DATABASE `%s` AS `%s` STORAGEID 'sid' READ ONLY" % (SRC, RET))
+        o10.check("ATTACH DATABASE `%s` AS `%s` READ ONLY STORAGEID sid" % (SRC, RET))
         o10.check('DROP DATABASE `%s`' % RET)
         with self.assertRaises(GuardError):
             o10.check('DROP DATABASE `%s`' % SRC)
@@ -367,6 +372,7 @@ ALLOWANCES = {
     'lockout.py': {'grant', 'revoke', 'kill'},                         # the loop's REVOKE and KILL CONNECTION statements, grants module
     'pipelines.py': {'pipeline', 'grant', 'revoke'},                   # pipeline statements, grant restore at O11 (grants revoked by the lockout)
     'notebook.py': {'grant', 'revoke', 'kill', 'pipeline', 'detach'},  # the lockout cell text and the run payload
+    'abandon.py': {'detach', 'attach', 'drop', 'kill', 'revoke'},  # the abandon block, detach_kill of the escalation, the Path B refusal text
     'rehearse.py': {'drop', 'attach', 'detach', 'kill', 'pipeline'},  # cleanup DROP DATABASE, attachment records, the SIGKILL test, detached storage note
     'config.py': {'pipeline', 'detach', 'kill'},  # pipelines section, detach_wait_seconds, detach_kill
     'journal.py': {'pipeline', 'grant', 'attach', 'revoke'},  # pipelines, grants_snapshot (never overwritten by a revoked state) and attachments tables

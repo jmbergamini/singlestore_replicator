@@ -31,6 +31,7 @@ N spreads the connections over N aggregators (connection id modulo N); a process
 AGGREGATOR value is listed and killed only from a connection on that aggregator, since thread
 ids are per aggregator.
 """
+import datetime as dt
 import re
 import threading
 import time
@@ -39,6 +40,9 @@ from collections import Counter
 
 GOOD_LAYOUT = {'NUM_PARTITIONS': 16, 'NUM_SUB_PARTITIONS': 0, 'IS_SYNC': 1, 'IS_SYNC_DURABILITY': 0,
                'IS_SYNC_DURABILITY_ON_REF_DB_ONLY': 1}
+
+
+REFERENCE_CREATE = re.compile(r'\s*CREATE\s+(?:ROWSTORE\s+)?REFERENCE\s+TABLE\b', re.I)
 
 
 class FakeDisconnect(Exception):
@@ -324,6 +328,19 @@ class FakeCursor:
             # Helios fact 14: LIKE copies the AUTO_INCREMENT attribute but not the counter
             db.databases[tdb]['tables'][tt] = {'create': create, 'rows': [], 'auto_increment': None}
             return
+        m = re.match(r'CREATE TABLE `([^`]+)`\.`([^`]+)` \((.+)\)$', s)
+        if m:
+            db.writes.append(s)
+            tdb, tt, body = m.groups()
+            if tt in db.databases[tdb]['tables']:
+                raise FakeDisconnect(1050, "Table '%s' already exists" % tt)
+            db.databases[tdb]['tables'][tt] = {'create': 'CREATE TABLE `%s` (%s)' % (tt, body), 'rows': [], 'auto_increment': None}
+            return
+        m = re.match(r'SELECT COUNT\(\*\) AS n FROM information_schema\.TABLES WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s$', s)
+        if m:
+            d = db.databases.get(args[0])
+            self.rows = [{'n': int(bool(d) and args[1] in d['tables'])}]
+            return
         m = re.match(r'SHOW CREATE TABLE `([^`]+)`\.`([^`]+)`$', s)
         if m:
             t = db.databases[m.group(1)]['tables'][m.group(2)]
@@ -387,6 +404,12 @@ class FakeCursor:
             cols = [c.strip('`') for c in cols1.split(', ')]
             src = db.databases[sdb]['tables'][st]
             dst = db.databases[tdb]['tables'][tt]
+            src_att = db.attachment(sdb)
+            if REFERENCE_CREATE.match(dst['create']) and src_att is not None and src_att['ATTACH_TYPE'] == 'READONLY':
+                # Helios 10.8.0, October 27, 2026: an INSERT into a reference table runs on the master aggregator,
+                # where a READ ONLY source has no master instance to read from
+                raise FakeDisconnect(1777, 'Forwarding Error (node-master-0:3306): Partitions of %s has no master instance. This is likely '
+                                           'because the node or nodes that hold a copy of the partition are down.' % sdb)
             if src['rows']:
                 assert list(src['rows'][0].keys()) == cols, 'the copy must name every saved column in ordinal order'
             moved = [{c: r[c] for c in cols} for r in src['rows'] if pred is None or evaluate_predicate(pred, r)]
@@ -434,6 +457,9 @@ class FakeCursor:
             return
         m = re.match(r'ALTER TABLE `([^`]+)`\.`([^`]+)` AUTO_INCREMENT = (\d+)$', s)
         if m:
+            if db.refuse_sharded_counter and not REFERENCE_CREATE.match(db.databases[m.group(1)]['tables'][m.group(2)]['create']):
+                raise FakeDisconnect(1749, "Forwarding Error (node-master-0:3306): Feature 'ALTER TABLE...AUTO_INCREMENT=X for sharded tables' "
+                                           "is not supported by SingleStore Distributed.")
             db.writes.append(s)
             db.databases[m.group(1)]['tables'][m.group(2)]['auto_increment'] = int(m.group(3))
             return
@@ -450,6 +476,8 @@ class FakeCursor:
         if m:
             db.writes.append(s)
             user, host, vdb, name, body = m.groups()
+            if user and db.refuse_other_definer and user.strip("`'") != (self.conn.user or db.current_user):
+                raise FakeDisconnect(1227, 'Access denied; you need (at least one of) the SUPER privilege(s) for this operation')
             if self.conn.current_db != vdb:
                 raise FakeDisconnect('view body resolves against the current database; USE the replacement first')
             for qual, ref in re.findall(r'\b(?:FROM|JOIN)\s+(?:`([^`]+)`\.)?`([^`]+)`', body, re.I):
@@ -489,6 +517,10 @@ class FakeCursor:
             self.rows = [{'n': sum(1 for a in db.attachments if a['DATABASE_NAME'] == args[0] and self._sees_storage(a)
                                    and (a['STORAGE_ID'] != args[1] or a['ATTACH_TYPE'] != args[2]))}]
             return
+        m = re.match(r'SELECT COUNT\(\*\) AS n FROM information_schema\.MV_CLOUD_ATTACHED_DATABASES WHERE DATABASE_NAME = %s AND STORAGE_ID <> %s$', s)
+        if m:
+            self.rows = [{'n': sum(1 for a in db.attachments if a['DATABASE_NAME'] == args[0] and self._sees_storage(a) and a['STORAGE_ID'] != args[1])}]
+            return
         m = re.match(r'SELECT COUNT\(\*\) = 0 AS n FROM information_schema\.MV_CLOUD_ATTACHED_DATABASES '
                      r'WHERE DATABASE_NAME = %s AND STORAGE_ID = %s AND ATTACH_TYPE = %s$', s)
         if m:
@@ -499,6 +531,12 @@ class FakeCursor:
         if m:
             self.rows = [{'n': sum(1 for a in db.attachments if a['STORAGE_ID'] == args[0] and self._sees_storage(a)
                                    and (not m.group(1) or a['DATABASE_NAME'] != args[1]))}]
+            return
+        m = re.match(r'SELECT COUNT\(\*\) AS n FROM information_schema\.MV_CLOUD_BRANCHES WHERE DATABASE_NAME = %s AND STORAGE_ID = %s '
+                     r'AND PREV_DATABASE_NAME = %s AND IS_DROPPED = 0 AND IS_DETACHED = 0$', s)
+        if m:
+            self.rows = [{'n': sum(1 for b in db.branches if b['DATABASE_NAME'] == args[0] and b['STORAGE_ID'] == args[1]
+                                   and b.get('PREV_DATABASE_NAME') == args[2] and not b['IS_DROPPED'] and not b['IS_DETACHED'])}]
             return
         m = re.match(r'SELECT STORAGE_ID, DATABASE_NAME, IS_DETACHED, .* FROM information_schema\.MV_CLOUD_BRANCHES WHERE STORAGE_ID = %s$', s)
         if m:
@@ -521,7 +559,7 @@ class FakeCursor:
                     p['DATABASE_NAME'] = None
             db.attachments.remove(att)
             for b in db.branches:
-                if b['STORAGE_ID'] == att['STORAGE_ID']:
+                if b['STORAGE_ID'] == att['STORAGE_ID'] and (not db.branch_keeps_storage_id or b['DATABASE_NAME'] == m.group(1)):
                     b['IS_DETACHED'] = 1
                     b['IS_ATTACHED_TO_THIS_COMPUTE'] = 0
             content = db.databases.pop(m.group(1), None)
@@ -530,10 +568,16 @@ class FakeCursor:
                     db.storage_content = {}
                 db.storage_content[att['STORAGE_ID']] = content
             return
-        m = re.match(r"ATTACH DATABASE `([^`]+)`(?: AS `([^`]+)`)?(?: STORAGEID '([^']+)')?( READ ONLY)?$", s)
+        if re.match(r"ATTACH DATABASE .* STORAGEID '", s):
+            raise FakeDisconnect(1064, "You have an error in your SQL syntax; check the manual that corresponds to your MySQL "
+                                         "server version for the right syntax to use near the quoted STORAGEID")
+        if re.match(r'ATTACH DATABASE .* STORAGEID \S+ READ ONLY$', s):
+            raise FakeDisconnect(1064, "You have an error in your SQL syntax; check the manual that corresponds to your MySQL "
+                                         "server version for the right syntax to use near 'READ ONLY' at line 1")
+        m = re.match(r"ATTACH DATABASE `([^`]+)`(?: AS `([^`]+)`)?( READ ONLY)?(?: STORAGEID ([A-Za-z0-9_:-]+))?$", s)
         if m:
             db.writes.append(s)
-            parent, alias, sid, ro = m.group(1), m.group(2), m.group(3), bool(m.group(4))
+            parent, alias, ro, sid = m.group(1), m.group(2), bool(m.group(3)), m.group(4)
             name = alias or parent
             if db.attachment(name) is not None:
                 raise FakeDisconnect('a database named %s is already attached' % name)
@@ -541,8 +585,8 @@ class FakeCursor:
             if source_sid is None or source_sid not in db.storage:
                 raise FakeDisconnect('unknown storage for ' + parent)
             if alias:
-                new_sid = db.new_sid()
-                db.storage[new_sid] = name
+                new_sid = source_sid if db.branch_keeps_storage_id else db.new_sid()
+                db.storage.setdefault(new_sid, name)
                 db.branches.append({'STORAGE_ID': new_sid, 'DATABASE_NAME': name, 'IS_DETACHED': 0, 'IS_ATTACHED_TO_THIS_COMPUTE': 1, 'IS_ATTACHABLE': 1,
                                     'IS_DROPPED': 0, 'PREV_DATABASE_NAME': parent, 'LATEST_ATTACH_TIME': 'now'})
                 use_sid = new_sid
@@ -566,7 +610,8 @@ class FakeCursor:
                 for p in db.pipelines + db.pipeline_offsets:
                     if p.get('_storage') == source_sid and p.get('DATABASE_NAME') is None:
                         p['DATABASE_NAME'] = name
-            db.attachments.append({'DATABASE_NAME': name, 'ATTACH_TYPE': 'READONLY' if ro else 'READWRITE', 'STORAGE_ID': use_sid, 'COMPUTE_ID': 'cid-1', 'ATTACH_SYNTAX': s})
+            compute = 'cid-%d' % (len(db.attachments) + len(db.branches)) if db.branch_keeps_storage_id and alias else 'cid-1'
+            db.attachments.append({'DATABASE_NAME': name, 'ATTACH_TYPE': 'READONLY' if ro else 'READWRITE', 'STORAGE_ID': use_sid, 'COMPUTE_ID': compute, 'ATTACH_SYNTAX': s})
             content = db.storage_content.get(source_sid) if hasattr(db, 'storage_content') else None
             if content is None and alias and parent in db.databases:
                 content = db.databases[parent]
@@ -648,9 +693,10 @@ class FakeCursor:
         if s.startswith('SELECT PIPELINE_NAME, BATCH_STATE'):
             self.rows = [dict(b) for b in db.pipeline_batches]
             return
-        if s.startswith('SELECT PIPELINE_NAME, ERROR_TIME'):
+        if s.startswith('SELECT PIPELINE_NAME, ERROR_UNIX_TIMESTAMP'):
+            since = dt.datetime.strptime(str(args[1]), '%Y-%m-%d %H:%M:%S').replace(tzinfo=dt.timezone.utc).timestamp()
             self.rows = [dict(e) for e in db.pipeline_errors if self.conn.is_admin and e.get('DATABASE_NAME', db.source) == args[0]
-                         and str(e.get('ERROR_TIME', '')) >= str(args[1])]
+                         and float(e.get('ERROR_UNIX_TIMESTAMP', 0)) >= since]
             return
         m = re.match(r"SHOW CREATE PIPELINE `([^`]+)`\.`([^`]+)` EXTENDED$", s)
         if m:
@@ -856,6 +902,9 @@ class FakeDB:
         self.writes = []
         self.fail_insert = {}
         self.fail_drop = set()
+        self.refuse_other_definer = False  # Helios: another account as DEFINER needs SUPER (error 1227)
+        self.refuse_sharded_counter = False
+        self.branch_keeps_storage_id = False  # Helios 10.8.0: ATTACH x AS y keeps x's STORAGE_ID; y gets its own COMPUTE_ID  # Helios: ALTER TABLE ... AUTO_INCREMENT on a sharded table is error 1749
         self.lock_tables = set()
         self.lock_hits = 0
         self.lock_wait_settings = []
@@ -886,10 +935,10 @@ class FakeDB:
         self.users = set()
         self.globals = {}
         self.sid_counter = 100
-        self.attachments = [{'DATABASE_NAME': source, 'ATTACH_TYPE': 'READWRITE', 'STORAGE_ID': 'sid-source', 'COMPUTE_ID': 'cid-1', 'ATTACH_SYNTAX': None}]
-        self.branches = [{'STORAGE_ID': 'sid-source', 'DATABASE_NAME': source, 'IS_DETACHED': 0, 'IS_ATTACHED_TO_THIS_COMPUTE': 1, 'IS_ATTACHABLE': 1,
+        self.attachments = [{'DATABASE_NAME': source, 'ATTACH_TYPE': 'READWRITE', 'STORAGE_ID': '1028600672070281646:7367158985892520834', 'COMPUTE_ID': 'cid-1', 'ATTACH_SYNTAX': None}]
+        self.branches = [{'STORAGE_ID': '1028600672070281646:7367158985892520834', 'DATABASE_NAME': source, 'IS_DETACHED': 0, 'IS_ATTACHED_TO_THIS_COMPUTE': 1, 'IS_ATTACHABLE': 1,
                           'IS_DROPPED': 0, 'PREV_DATABASE_NAME': None, 'LATEST_ATTACH_TIME': '2026-01-01 00:00:00'}]
-        self.storage = {'sid-source': source}
+        self.storage = {'1028600672070281646:7367158985892520834': source}
         self.databases = {source: {'layout': dict(layout), 'tables': {
             name: {'create': spec['create'], 'rows': [dict(r) for r in spec.get('rows', [])], 'auto_increment': spec.get('auto_increment')}
             for name, spec in tables.items()}, 'views': dict(views or {})}}
@@ -975,7 +1024,8 @@ class FakeDB:
 
     def new_sid(self):
         self.sid_counter += 1
-        return 'sid-%d' % self.sid_counter
+        # Helios STORAGE_IDs are two numbers joined by a colon
+        return '%d:%d' % (1000000000000000000 + self.sid_counter, 7000000000000000000 + self.sid_counter)
 
     def rows(self, db, table):
         return self.databases[db]['tables'][table]['rows']

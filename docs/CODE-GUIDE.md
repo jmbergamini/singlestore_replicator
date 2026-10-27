@@ -22,6 +22,7 @@ The package is `s2rebuild/`. Every module starts with `s2rebuild <module>: <purp
 - `watch.py`: the writer watch and the quiet proof.
 - `ownersql.py`: admin blocks (checks, statements, stops, skip conditions, captures) and their companion blocks (the O3 re-entry block), their execution with gates, the DETACH escalation, the P1, C3 and C4 blocks and handlers, and `ownerlib`, the dependency-free copy of the gate logic for the notebook.
 - `freeze.py`: O3 Path A with the write probe and the resume paths (after the READONLY attachment, and at the ATTACH after a stop between DETACH and ATTACH).
+- `abandon.py`: the abandon command, a run backed out before O10 (source READWRITE again, replacement dropped, run closed).
 - `lockout.py` and `grants.py`: O3 Path B: per-scope snapshots, revoke, the kill loop, restore and compare.
 - `pipelines.py`: O2 stop and capture, O9 replay or verification, O11 release, C1 checks, and the import of a notebook capture.
 - `switch.py`: the O10 state machine and rollback.

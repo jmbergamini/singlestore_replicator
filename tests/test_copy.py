@@ -32,7 +32,7 @@ from s2rebuild import copy as C
 from s2rebuild import estimate as E
 from s2rebuild import inventory as I
 from s2rebuild import steps
-from s2rebuild.common import EXIT_DONE, EXIT_GATE, EXIT_INCOMPLETE, EXIT_MISMATCH, EXIT_REFUSED, KitError
+from s2rebuild.common import EXIT_DONE, EXIT_GATE, EXIT_INCOMPLETE, EXIT_MISMATCH, EXIT_REFUSED, KitError, auto_table_limit
 from s2rebuild.config import load_config
 from s2rebuild.connect import Log, Redactor, Secrets, SessionFactory
 from s2rebuild.journal import Journal
@@ -512,6 +512,114 @@ class SecretTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # New: section 10.9 changes
 # ---------------------------------------------------------------------------
+REF_CREATE = ('CREATE REFERENCE TABLE `t_ref` (\n  `k` int(11) DEFAULT NULL,\n  `label` varchar(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL,\n'
+              '  SORT KEY `k` (`k`)\n) AUTOSTATS_CARDINALITY_MODE=INCREMENTAL')
+REF_TABLES = dict(FIXTURE_TABLES, t_ref=([('k', 'int(11)', True), ('label', 'varchar(20)', True)], [], 0, REF_CREATE))
+
+
+def ref_harness(test):
+    """The fixture tables plus one reference table with 7 rows, O5 passed and the source attached READ ONLY (after the freeze)."""
+    rows = fixture_rows()
+    rows['t_ref'] = [{'k': i, 'label': 'l%d' % i} for i in range(7)]
+    h = Harness(test, tables=REF_TABLES, rows=rows)
+    test.assertEqual(h.step('O5').status, steps.PASSED, h.text())
+    h.fake.attachment(SRC)['ATTACH_TYPE'] = 'READONLY'
+    return h
+
+
+class ReferenceTableTests(unittest.TestCase):
+    def ref_plan(self, h):
+        return next(p for p in h.plans() if p.name == 't_ref')
+
+    def test_a_plain_insert_into_a_reference_table_from_a_read_only_source_fails_with_1777(self):
+        h = ref_harness(self)
+        sql = C.statements_for(h.db).insert_chunk(self.ref_plan(h), 0)
+        with self.assertRaises(Exception) as caught:
+            h.fake.connect(user='s2rebuild_runner').cursor().execute(sql)
+        self.assertEqual(caught.exception.args[0], 1777)
+        self.assertIn('has no master instance', caught.exception.args[1])
+
+    def test_reference_table_copies_through_a_staging_table(self):
+        h = ref_harness(self)
+        out = h.step('O6')
+        self.assertEqual(out.status, steps.PASSED, h.text())
+        self.assertEqual(multiset(h.fake.rows(TGT, 't_ref')), multiset(h.fake.rows(SRC, 't_ref')))
+        self.assertNotIn('t_ref__stage', h.fake.databases[TGT]['tables'], 'the staging table is dropped')
+        writes = [w for w in h.fake.writes if 't_ref' in w and ' LIKE ' not in w]
+        self.assertTrue(writes[0].startswith('CREATE TABLE `%s`.`t_ref__stage` (`k` int(11) DEFAULT NULL, `label` varchar(20) CHARACTER SET' % TGT), writes)
+        self.assertNotIn('KEY', writes[0])
+        self.assertTrue(writes[1].startswith('INSERT INTO `%s`.`t_ref__stage`' % TGT))
+        self.assertIn('FROM `%s`.`t_ref` WHERE' % SRC, writes[1])
+        self.assertEqual(writes[2], 'INSERT INTO `%s`.`t_ref` (`k`, `label`) SELECT `k`, `label` FROM `%s`.`t_ref__stage`' % (TGT, TGT))
+        self.assertEqual(writes[3], 'DROP TABLE `%s`.`t_ref__stage`' % TGT)
+        self.assertEqual(h.journal.chunks('t_ref')[0]['rows_inserted'], 7)
+
+    def test_a_staging_table_left_by_an_interrupted_attempt_is_dropped_first(self):
+        h = ref_harness(self)
+        h.fake.databases[TGT]['tables']['t_ref__stage'] = {'create': 'CREATE TABLE `t_ref__stage` (`k` int(11))', 'rows': [{'k': 99, 'label': 'x'}],
+                                                           'auto_increment': None}
+        self.assertEqual(h.step('O6').status, steps.PASSED, h.text())
+        self.assertIn('Dropped the staging table t_ref__stage left by an interrupted attempt', h.text())
+        self.assertEqual(multiset(h.fake.rows(TGT, 't_ref')), multiset(h.fake.rows(SRC, 't_ref')))
+
+    def test_a_failed_staging_insert_drops_the_staging_table_and_the_rerun_copies(self):
+        h = ref_harness(self)
+        h.fake.fail_insert[('t_ref__stage', self.ref_plan(h).predicate(0))] = 'before'
+        self.assertEqual(h.step('O6').exit_code, EXIT_INCOMPLETE, h.text())
+        self.assertNotIn('t_ref__stage', h.fake.databases[TGT]['tables'])
+        self.assertEqual(h.fake.rows(TGT, 't_ref'), [])
+        self.assertEqual(h.step('O6').status, steps.PASSED, h.text())
+        self.assertEqual(multiset(h.fake.rows(TGT, 't_ref')), multiset(h.fake.rows(SRC, 't_ref')))
+
+    def test_detection_names_and_columns(self):
+        h = ref_harness(self)
+        plans = {p.name: p for p in h.plans()}
+        self.assertTrue(plans['t_ref'].reference)
+        self.assertFalse(plans['t_single'].reference)
+        rowstore = I.TablePlan('r', ['a'], 0, 'row', [], 'CREATE ROWSTORE REFERENCE TABLE `r` (\n  `a` bigint(20) NOT NULL AUTO_INCREMENT,\n  PRIMARY KEY (`a`)\n)', 1)
+        self.assertTrue(rowstore.reference)
+        self.assertEqual(C.stage_columns(rowstore), ['`a` bigint(20) NOT NULL'])
+        long_plan = I.TablePlan('x' * 60, ['a'], 0, 'row', [], 'CREATE REFERENCE TABLE `x` (\n  `a` int(11)\n)', 1)
+        with self.assertRaisesRegex(KitError, 'over the 64'):
+            C.stage_name(long_plan)
+        with self.assertRaisesRegex(KitError, 'planned table'):
+            C.stage_name(plans['t_ref'], {'t_ref__stage'})
+        broken = I.TablePlan('b', ['a', 'c'], 0, 'row', [], 'CREATE REFERENCE TABLE `b` (\n  `a` int(11)\n)', 1)
+        with self.assertRaisesRegex(KitError, 'no definition line for c'):
+            C.stage_columns(broken)
+
+
+FORMATS = {
+    # name: (create text, reference): every table format Helios writes in SHOW CREATE TABLE
+    'f_col': ('CREATE TABLE `f_col` (\n  `k` int(11) DEFAULT NULL,\n  `label` varchar(20) DEFAULT NULL,\n  SORT KEY `k` (`k`),\n  SHARD KEY `k` (`k`)\n)', False),
+    'f_row': ('CREATE ROWSTORE TABLE `f_row` (\n  `k` int(11) NOT NULL,\n  `label` varchar(20) DEFAULT NULL,\n  PRIMARY KEY (`k`)\n)', False),
+    'f_ref': ('CREATE REFERENCE TABLE `f_ref` (\n  `k` int(11) DEFAULT NULL,\n  `label` varchar(20) DEFAULT NULL,\n  SORT KEY `k` (`k`)\n)', True),
+    'f_rowref': ('CREATE ROWSTORE REFERENCE TABLE `f_rowref` (\n  `k` bigint(20) NOT NULL AUTO_INCREMENT,\n  `label` varchar(20) DEFAULT NULL,\n'
+                 '  PRIMARY KEY (`k`)\n)', True),
+}
+
+
+class TableFormatTests(unittest.TestCase):
+    def test_every_table_format_copies_from_a_read_only_source(self):
+        tables = dict(FIXTURE_TABLES)
+        rows = fixture_rows()
+        for name, (create, _) in FORMATS.items():
+            tables[name] = ([('k', 'int(11)', True), ('label', 'varchar(20)', True)], [], 0, create)
+            rows[name] = [{'k': i, 'label': '%s-%d' % (name, i)} for i in range(5)]
+        h = Harness(self, tables=tables, rows=rows)
+        self.assertEqual(h.step('O5').status, steps.PASSED, h.text())
+        h.fake.attachment(SRC)['ATTACH_TYPE'] = 'READONLY'
+        plans = {p.name: p for p in h.plans()}
+        self.assertEqual({n: plans[n].reference for n in FORMATS}, {n: ref for n, (_, ref) in FORMATS.items()})
+        self.assertEqual(h.step('O6').status, steps.PASSED, h.text())
+        for name, (_, reference) in FORMATS.items():
+            self.assertEqual(multiset(h.fake.rows(TGT, name)), multiset(h.fake.rows(SRC, name)), name)
+            staged = any(w.startswith('CREATE TABLE `%s`.`%s__stage`' % (TGT, name)) for w in h.fake.writes)
+            self.assertEqual(staged, reference, '%s: only reference tables are staged' % name)
+            self.assertNotIn(name + '__stage', h.fake.databases[TGT]['tables'])
+            self.assertTrue(h.fake.databases[TGT]['tables'][name]['create'].startswith(FORMATS[name][0].split(' `')[0]), 'O5 keeps the format of ' + name)
+
+
 class SchedulerTests(unittest.TestCase):
     def test_lock_wait_requeues_serializes_and_probes(self):
         h = Harness(self, mutate=lambda d: d['copy'].update(lock_retry_seconds=1, lock_probe_timeout_seconds=5))
@@ -549,6 +657,22 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(runner.limits['t_nokey'], 2)
         self.assertTrue(runner.copy())
         self.assertLessEqual(runner.peak_in_flight['t_single'], 1)
+
+    def test_auto_caps_one_table_at_half_the_workers_above_eight(self):
+        self.assertEqual([auto_table_limit(w) for w in (1, 4, 8, 9, 12, 16)], [1, 4, 8, 4, 6, 8])
+        h = Harness(self)
+        self.assertEqual(h.step('O5').status, steps.PASSED)
+        plans = h.plans()
+        for workers, expected in ((12, 6), (8, 8)):
+            runner = C.Runner(plans, C.statements_for(h.db), h.journal, h.fake.connect, h.log, h.config.copy, workers=workers, sleep=lambda s: None)
+            for name in runner.queues:
+                runner.queues[name].clear()
+            first, second = plans[0].name, plans[1].name
+            runner.queues[first].extend((b, 'pending') for b in range(20))
+            runner.queues[second].extend((b, 'pending') for b in range(20))
+            taken = [runner.take() for _ in range(workers)]
+            self.assertEqual(sum(1 for t in taken if t and t[0] == first), expected, workers)
+            self.assertEqual(sum(1 for t in taken if t and t[0] == second), workers - expected, 'the other workers go to the next table')
 
     def test_parked_chunks_need_retry_failed(self):
         h = Harness(self, mutate=lambda d: d['copy'].update(max_attempts=1))

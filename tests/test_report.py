@@ -145,6 +145,26 @@ class WorkbookTests(unittest.TestCase):
             self.assertEqual(wb['Pipelines'].cell(row=2, column=1).value, 'pipelines not captured: no owner profile')
             self.assertEqual(wb['Pipeline offsets'].cell(row=2, column=1).value, 'none captured')
 
+    def test_final_summary_without_a_window(self):
+        """A run whose O1 recorded no window shows 'none configured' and no deadline in the final workbook."""
+        from s2rebuild.journal import MEMORY, Journal
+        cfg = config_from(lambda d: d.pop('window'))
+        db = cfg.databases[0]
+        inv = I.load(FIXTURE_INVENTORY)
+        plans = I.plan_tables(inv, cfg, db)
+        journal = Journal(MEMORY)
+        self.addCleanup(journal.close)
+        journal.set_meta('window_start', '')
+        journal.set_meta('window_end', '')
+        journal.set_meta('abort_deadline', '')
+        summary = {label: value for label, value in R.final_summary_rows(inv, plans, journal, cfg, db, 'r') if label}
+        self.assertEqual(summary['Window'], 'none configured')
+        self.assertEqual(summary['Abort deadline'], 'none')
+        journal.set_meta('window_start', '2026-10-27T00:00:00Z')
+        journal.set_meta('window_end', '2026-10-27T05:00:00Z')
+        summary = {label: value for label, value in R.final_summary_rows(inv, plans, journal, cfg, db, 'r') if label}
+        self.assertEqual(summary['Window'], '2026-10-27T00:00:00Z to 2026-10-27T05:00:00Z')
+
 
 if __name__ == '__main__':
     unittest.main()

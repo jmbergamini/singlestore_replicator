@@ -15,7 +15,7 @@ import json
 import sqlite3
 from pathlib import Path
 
-from .common import KitError, format_duration, iso, parse_utc, utc_now
+from .common import KitError, auto_table_limit, format_duration, iso, parse_utc, utc_now
 from .inventory import unmigrated
 from .journal import read_only_uri
 
@@ -140,13 +140,15 @@ def simulate_rows(jobs, workers, baseline, limits=None, names=None):
     """List scheduling of (rows, buckets) jobs over workers with per-table concurrency limits.
 
     jobs: list of (rows, buckets); names: optional table names in the same order (index when
-    absent); limits: {name: max in-flight chunks}. Chunks are offered in table order (largest
+    absent); limits: {name: max in-flight chunks}, else common.auto_table_limit(workers), as
+    the copy does under table_concurrency auto. Chunks are offered in table order (largest
     table first, as the caller sorted them), each chunk taking its modeled seconds. A worker
     takes the first chunk whose table is below its limit. Returns a Schedule.
     """
     workers = max(1, int(workers))
     names = list(names) if names is not None else [str(i) for i in range(len(jobs))]
     limits = dict(limits or {})
+    default_limit = auto_table_limit(workers)
     queue = []
     for name, (rows, buckets) in zip(names, jobs):
         seconds = chunk_seconds(baseline, rows, buckets)
@@ -164,7 +166,7 @@ def simulate_rows(jobs, workers, baseline, limits=None, names=None):
         progressed = False
         while free and queue:
             idx = next((i for i, (name, _, _) in enumerate(queue)
-                        if in_flight[name] < limits.get(name, workers)), None)
+                        if in_flight[name] < limits.get(name, default_limit)), None)
             if idx is None:
                 break
             name, bucket, seconds = queue.pop(idx)
@@ -492,7 +494,7 @@ def plan_sheet(config, db, run_id, inventory, est, fit, rehearsal=None, env=None
             lines.append('Deadline   %s abort for the copy (end minus %d m restart, %d m buffer, %s longest chunk)' % (
                 iso(fit.deadline), window.restart_allowance_minutes, window.buffer_minutes, format_duration(fit.longest_chunk_seconds)))
     else:
-        lines.append('Window     not configured; record window.start and window.end at P4')
+        lines.append('Window     none configured: no abort deadline; the copy and the switch run without a time limit')
     lines.append('Freeze     %s; application stop owner: <name recorded in the P4 gate note>' % (
         'Path A read-only attachment' if config.freeze.mode == 'readonly' else 'Path B lockout (revoke and kill loop)'))
     lines.extend(fit_lines(est, fit))

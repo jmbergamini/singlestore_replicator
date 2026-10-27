@@ -92,7 +92,7 @@ def run_fake_rehearsal(test, h, kill_test='inprocess', rows=300, keep=False):
 class NotebookTests(unittest.TestCase):
     def test_generate_writes_a_private_notebook_whose_first_cell_runs(self):
         h = owner_harness(self, mutate=lambda d: d['workspace'].update(id='ws-example-1'))
-        h.journal.record_attachment('source', SRC, 'sid-source', 'cid-1', 'READWRITE')
+        h.journal.record_attachment('source', SRC, '1028600672070281646:7367158985892520834', 'cid-1', 'READWRITE')
         write_o2(h, [ITEM])
         names, blocks, inputs = notebook.blocks_for_run(h.ctx())
         self.assertEqual(sorted(blocks), ['C3', 'C4', 'O10', 'O10-rollback', 'O11', 'O2', 'O3', 'O3-reentry', 'O9'])
@@ -282,7 +282,7 @@ class RehearsalRunTests(unittest.TestCase):
 class M4CliTests(unittest.TestCase):
     def setUp(self):
         self.h = owner_harness(self)
-        self.h.journal.record_attachment('source', SRC, 'sid-source', 'cid-1', 'READWRITE')
+        self.h.journal.record_attachment('source', SRC, '1028600672070281646:7367158985892520834', 'cid-1', 'READWRITE')
         write_o2(self.h, [ITEM])
         self.h.journal.close()
         self.base = ['--config', str(self.h.config_path), '--run', self.h.run_id]

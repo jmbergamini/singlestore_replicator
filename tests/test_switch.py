@@ -44,7 +44,7 @@ def switched_harness(test, mutate=None, mutate_inventory=None, owner=True):
     h.env['S2REBUILD_OWNER_PASSWORD'] = 'owner-fixture'
     assert h.o5_o6().status == steps.PASSED, h.text()
     h.fake.attachment(SRC)['ATTACH_TYPE'] = 'READONLY'
-    h.journal.record_attachment('source', SRC, 'sid-source', 'cid-1', 'READONLY')
+    h.journal.record_attachment('source', SRC, '1028600672070281646:7367158985892520834', 'cid-1', 'READONLY')
     assert h.journal.attachment('replacement')['storage_id'] == h.fake.attachment(TGT)['STORAGE_ID'], 'O5 records the replacement'
     return h
 
@@ -144,7 +144,7 @@ def path_b_harness(test):
     """A switched harness on Path B (freeze.mode lockout, two held connections, two quiet passes): the source stays READWRITE on its recorded STORAGE_ID."""
     h = switched_harness(test, mutate=lambda d: d.update(freeze={'mode': 'lockout', 'lockout': {'connections': 2, 'quiet_passes_required': 2}}))
     h.fake.attachment(SRC)['ATTACH_TYPE'] = 'READWRITE'
-    h.journal.record_attachment('source', SRC, 'sid-source', 'cid-1', 'READWRITE')
+    h.journal.record_attachment('source', SRC, '1028600672070281646:7367158985892520834', 'cid-1', 'READWRITE')
     return h
 
 
@@ -153,7 +153,7 @@ def verified_path_b(test, owner=True):
     h = verified_harness(test, owner=owner, mutate=lambda d: d.update(freeze={'mode': 'lockout', 'lockout': {'connections': 2,
                                                                                                              'quiet_passes_required': 2}}))
     h.fake.attachment(SRC)['ATTACH_TYPE'] = 'READWRITE'
-    h.journal.record_attachment('source', SRC, 'sid-source', 'cid-1', 'READWRITE')
+    h.journal.record_attachment('source', SRC, '1028600672070281646:7367158985892520834', 'cid-1', 'READWRITE')
     return h
 
 
@@ -289,7 +289,7 @@ def move_attachment(fake, name, new_name):
     att = dict(fake.attachment(name))
     cur = fake.connect('admin').cursor()
     cur.execute('DETACH DATABASE `%s`' % name)
-    cur.execute("ATTACH DATABASE `%s` STORAGEID '%s'%s" % (new_name, att['STORAGE_ID'], ' READ ONLY' if att['ATTACH_TYPE'] == 'READONLY' else ''))
+    cur.execute("ATTACH DATABASE `%s`%s STORAGEID %s" % (new_name, ' READ ONLY' if att['ATTACH_TYPE'] == 'READONLY' else '', att['STORAGE_ID']))
 
 
 def drift_name(h, **names):
@@ -310,7 +310,7 @@ class ExpectAndBlockTests(unittest.TestCase):
         self.assertFalse(ownersql.Expect('some_rows').evaluate([])[0])
         self.assertEqual(ownersql.Expect('column_equals', 'ATTACH_TYPE', 'READONLY').evaluate(rows), (True, 'ATTACH_TYPE = READONLY'))
         self.assertEqual(ownersql.Expect('column_equals', 'n', 1).evaluate([])[1], 'no rows')
-        self.assertTrue(ownersql.Expect('column_not_in', 'STORAGE_ID', ['sid-source', 'sid-101']).evaluate(rows)[0])
+        self.assertTrue(ownersql.Expect('column_not_in', 'STORAGE_ID', ['1028600672070281646:7367158985892520834', '1000000000000000101:7000000000000000101']).evaluate(rows)[0])
         self.assertFalse(ownersql.Expect('column_not_in', 'STORAGE_ID', ['sid-9']).evaluate(rows)[0])
         ok, observed = ownersql.Expect('columns_equal', value={'NUM_PARTITIONS': 32, 'NUM_SUB_PARTITIONS': 512}).evaluate(rows)
         self.assertEqual((ok, observed), (True, 'NUM_PARTITIONS = 32, NUM_SUB_PARTITIONS = 512'))
@@ -330,7 +330,7 @@ class ExpectAndBlockTests(unittest.TestCase):
         self.assertLess(text.index('S1 before (for S3): replacement attached READWRITE with the recorded STORAGE_ID'), detach_at)
         self.assertLess(text.index('S1 before (for S2): no attached database named retained'), detach_at)
         self.assertIn("expect STORAGE_ID = %s, ATTACH_TYPE = READWRITE" % names['replacement_sid'], text)
-        self.assertIn('S3 after: the live STORAGE_ID is a new branch; expect STORAGE_ID not in (sid-source, %s)' % names['replacement_sid'], text)
+        self.assertIn('S3 after: the live STORAGE_ID is a new branch; expect STORAGE_ID not in (1028600672070281646:7367158985892520834, %s)' % names['replacement_sid'], text)
         self.assertIn('expect NUM_PARTITIONS = 32, NUM_SUB_PARTITIONS = 512', text)
         self.assertIn('S3 after: tables count equals the capture; expect n = 4', text)
         self.assertIn('S3 after: pipelines count equals the capture; expect n = 2', text)
@@ -348,7 +348,7 @@ class ExpectAndBlockTests(unittest.TestCase):
         text = switch.rollback_block(names, released=True).render()
         self.assertIn('-- STOP: rollback refused: O11 released writers on the live name', text)
         self.assertLess(text.index('-- STOP'), text.index('DETACH DATABASE'))
-        self.assertIn("expect STORAGE_ID = sid-source, ATTACH_TYPE = READWRITE", text, 'R2 after checks READWRITE too')
+        self.assertIn("expect STORAGE_ID = 1028600672070281646:7367158985892520834, ATTACH_TYPE = READWRITE", text, 'R2 after checks READWRITE too')
         self.assertIn('C1 saw application writes', switch.rollback_block(names, app_writes_seen='2026-11-01T07:00:00Z').render())
 
     def test_block_dispatch_and_account_block(self):
@@ -372,7 +372,7 @@ class MachineTests(unittest.TestCase):
         self.assertEqual(machine.forward(), switch.SWITCHED)
         live = h.fake.attachment(SRC)
         self.assertEqual(live['ATTACH_TYPE'], 'READWRITE')
-        self.assertNotIn(live['STORAGE_ID'], ('sid-source', names['replacement_sid']), 'the live name is a new branch')
+        self.assertNotIn(live['STORAGE_ID'], ('1028600672070281646:7367158985892520834', names['replacement_sid']), 'the live name is a new branch')
         self.assertEqual(h.fake.attachment(RET)['ATTACH_TYPE'], 'READONLY')
         self.assertEqual(h.journal.attachment('live')['storage_id'], live['STORAGE_ID'])
         self.assertEqual(h.journal.attachment('retained')['database_name'], RET)
@@ -381,6 +381,36 @@ class MachineTests(unittest.TestCase):
         self.assertEqual(sum(1 for w in h.fake.writes if w.startswith(('DETACH', 'ATTACH'))), 3)
         self.assertEqual(machine.forward(), switch.SWITCHED, 'a rerun at switched reruns the after-checks and issues nothing')
         self.assertEqual(sum(1 for w in h.fake.writes if w.startswith(('DETACH', 'ATTACH'))), 3)
+
+    def test_forward_accepts_a_live_branch_on_the_replacement_storage_id(self):
+        """Helios 10.8.0 (October 27, 2026): ATTACH replacement AS live keeps the replacement's STORAGE_ID; the live name is still its own branch."""
+        h = switched_harness(self)
+        h.fake.branch_keeps_storage_id = True
+        machine, names = machine_for(h)
+        self.assertEqual(machine.forward(), switch.SWITCHED, h.text())
+        live, replacement = h.fake.attachment(SRC), h.fake.attachment(names['replacement'])
+        self.assertEqual(live['STORAGE_ID'], names['replacement_sid'], 'the fake keeps the storage id, as Helios does')
+        self.assertNotEqual(live['COMPUTE_ID'], replacement['COMPUTE_ID'])
+        self.assertIn('the live name is its own branch of the replacement', h.text())
+        self.assertEqual(h.journal.attachment('live')['storage_id'], names['replacement_sid'])
+        self.assertEqual(machine.position(), switch.SWITCHED)
+        self.assertEqual(machine.forward(), switch.SWITCHED, 'a rerun at switched reruns the after-checks and issues nothing')
+
+    def test_the_replacement_storage_id_without_a_branch_row_is_refused(self):
+        h = switched_harness(self)
+        h.fake.branch_keeps_storage_id = True
+        machine, names = machine_for(h)
+        machine.s1()
+        machine.s2()
+        h.fake.branches.append({'STORAGE_ID': 'x', 'DATABASE_NAME': 'x', 'IS_DETACHED': 0, 'IS_ATTACHED_TO_THIS_COMPUTE': 1, 'IS_ATTACHABLE': 1,
+                                'IS_DROPPED': 0, 'PREV_DATABASE_NAME': None, 'LATEST_ATTACH_TIME': 'now'})
+        real = switch.live_is_branch_of_replacement
+        try:
+            switch.live_is_branch_of_replacement = lambda *a: False
+            with self.assertRaisesRegex(KitError, 'which is not a new branch'):
+                machine.s3()
+        finally:
+            switch.live_is_branch_of_replacement = real
 
     def test_out_of_order_statements_are_refused(self):
         h = switched_harness(self)
@@ -456,7 +486,7 @@ class MachineTests(unittest.TestCase):
         h = switched_harness(self)
         machine, _ = machine_for(h)
         machine.s1()
-        h.fake.storage_content['sid-source']['tables']['t_comp']['rows'].pop()
+        h.fake.storage_content['1028600672070281646:7367158985892520834']['tables']['t_comp']['rows'].pop()
         with self.assertRaisesRegex(KitError, 'retained_20261101.t_comp holds 299 rows'):
             machine.s2()
         machine2, _ = machine_for(h)
@@ -485,14 +515,14 @@ class MachineTests(unittest.TestCase):
         machine.forward()
         self.assertEqual(machine.rollback(drop_retained=True), switch.NOT_STARTED)
         src = h.fake.attachment(SRC)
-        self.assertEqual((src['STORAGE_ID'], src['ATTACH_TYPE']), ('sid-source', 'READWRITE'))
+        self.assertEqual((src['STORAGE_ID'], src['ATTACH_TYPE']), ('1028600672070281646:7367158985892520834', 'READWRITE'))
         self.assertIsNone(h.fake.attachment(RET))
         self.assertIsNotNone(h.journal.get_meta('rolled_back_utc'))
         h2 = switched_harness(self)
         machine2, _ = machine_for(h2)
         machine2.s1()
         self.assertEqual(machine2.rollback(), switch.NOT_STARTED, 'R2 alone after S1')
-        self.assertEqual(h2.fake.attachment(SRC)['STORAGE_ID'], 'sid-source')
+        self.assertEqual(h2.fake.attachment(SRC)['STORAGE_ID'], '1028600672070281646:7367158985892520834')
         h3 = switched_harness(self)
         machine3, _ = machine_for(h3)
         machine3.forward()
@@ -518,7 +548,7 @@ class MachineTests(unittest.TestCase):
         h = switched_harness(self)
         machine, _ = machine_for(h)
         machine.s1()
-        h.fake.storage.pop('sid-source')
+        h.fake.storage.pop('1028600672070281646:7367158985892520834')
         with self.assertRaisesRegex(KitError, 'Switch statement "S2 ATTACH retained READ ONLY" failed: .*the switch is now at "source detached"'):
             machine.s2()
         self.assertIn('switch_statement_failed', [e['kind'] for e in h.journal.events()])
@@ -785,7 +815,7 @@ class RollbackBoundaryTests(unittest.TestCase):
                     machine_for(h)[0].forward()
                 self.assertEqual(machine_for(h)[0].rollback(), switch.NOT_STARTED)
                 src = h.fake.attachment(SRC)
-                self.assertEqual((src['STORAGE_ID'], src['ATTACH_TYPE']), ('sid-source', 'READWRITE'))
+                self.assertEqual((src['STORAGE_ID'], src['ATTACH_TYPE']), ('1028600672070281646:7367158985892520834', 'READWRITE'))
                 proofs = h.journal.events('rollback_proof')
                 if point == 'before':
                     self.assertEqual(proofs, [], 'no proof is needed when S3 never ran')
@@ -841,7 +871,7 @@ class RollbackBoundaryTests(unittest.TestCase):
         self.assertEqual(result['status'], 'passed', result)
         self.assertEqual(result['statements'], 3, 'R1, R2 and R3')
         src = h.fake.attachment(SRC)
-        self.assertEqual((src['STORAGE_ID'], src['ATTACH_TYPE']), ('sid-source', 'READWRITE'))
+        self.assertEqual((src['STORAGE_ID'], src['ATTACH_TYPE']), ('1028600672070281646:7367158985892520834', 'READWRITE'))
 
     def test_f1_r1_fault_points_resume_the_rollback(self):
         """Before, after and before-the-journal around R1 DETACH, the statement the zero-change proof guards: the rerun completes with one R1.
@@ -868,7 +898,7 @@ class RollbackBoundaryTests(unittest.TestCase):
                 self.assertEqual(len(h.journal.events('rollback_proof')), 2 if point == 'before' else 1)
                 self.assertEqual(len([w for w in h.fake.writes if w == 'DETACH DATABASE `%s`' % SRC]), 2, 'S1 and one R1, never R1 twice')
                 src = h.fake.attachment(SRC)
-                self.assertEqual((src['STORAGE_ID'], src['ATTACH_TYPE']), ('sid-source', 'READWRITE'))
+                self.assertEqual((src['STORAGE_ID'], src['ATTACH_TYPE']), ('1028600672070281646:7367158985892520834', 'READWRITE'))
                 self.assertIsNone(h.fake.attachment(RET), 'R3 ran')
                 self.assertIsNotNone(h.journal.get_meta('rolled_back_utc'))
 
@@ -913,7 +943,7 @@ class RollbackBoundaryTests(unittest.TestCase):
                     finished = ownerlib()['run_block'](h.fake.connect().cursor(), tail.to_dict(), {'run_id': h.run_id})
                 self.assertEqual((finished['status'], finished['statements']), ('passed', 2), 'R2 and R3')
                 src = h.fake.attachment(SRC)
-                self.assertEqual((src['STORAGE_ID'], src['ATTACH_TYPE']), ('sid-source', 'READWRITE'))
+                self.assertEqual((src['STORAGE_ID'], src['ATTACH_TYPE']), ('1028600672070281646:7367158985892520834', 'READWRITE'))
 
 
 class PipelinesAcrossTheSwitchTests(unittest.TestCase):

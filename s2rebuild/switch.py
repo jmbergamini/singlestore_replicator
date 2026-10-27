@@ -65,22 +65,44 @@ def _known(value):
     return bool(value) and not ownersql.placeholders(str(value))
 
 
+BRANCH_OF_SQL = ('SELECT COUNT(*) AS n FROM information_schema.MV_CLOUD_BRANCHES WHERE DATABASE_NAME = %s AND STORAGE_ID = %s '
+                 'AND PREV_DATABASE_NAME = %s AND IS_DROPPED = 0 AND IS_DETACHED = 0')
+
+
+def live_is_branch_of_replacement(session, names, live_att, replacement_att):
+    """True when the live name sits on the replacement's STORAGE_ID as its own branch of it; issues the MV_CLOUD_BRANCHES COUNT.
+
+    Helios 10.8.0 (October 27, 2026): ATTACH replacement AS live keeps the parent's STORAGE_ID.
+    The branch is still independent (writes are not shared, and a DROP of the parent leaves it
+    attached); it has its own COMPUTE_ID and a branch row whose PREV_DATABASE_NAME is the
+    replacement. Both must hold.
+    """
+    if live_att is None or str(live_att.get('STORAGE_ID')) != str(names['replacement_sid']):
+        return False
+    if replacement_att is not None and str(replacement_att.get('COMPUTE_ID')) == str(live_att.get('COMPUTE_ID')):
+        return False
+    rows = _rows(session, BRANCH_OF_SQL, (names['source'], str(names['replacement_sid']), names['replacement']))
+    return bool(rows) and int(rows[0].get('n') or 0) > 0
+
+
 class Position:
     """The live attachment facts the machine reasons about."""
 
-    def __init__(self, source_att, retained_att, replacement_att, source_branch, live_branch=None):
+    def __init__(self, source_att, retained_att, replacement_att, source_branch, live_branch=None, live_is_branch=False):
         self.source_att = source_att
         self.retained_att = retained_att
         self.replacement_att = replacement_att
         self.source_branch = source_branch
         self.live_branch = live_branch
+        self.live_is_branch = live_is_branch
 
     def state(self, names):
         """NOT_STARTED, DETACHED, RETAINED, SWITCHED, LIVE_DETACHED or UNKNOWN from the facts and the recorded storage ids.
 
         SWITCHED needs the live name attached READWRITE on a STORAGE_ID that is none of the
         source, replacement or retained ids (and equals the recorded live id once one exists),
-        with the retained copy attached READONLY.
+        with the retained copy attached READONLY. The replacement's id counts when the live name
+        is its own branch of the replacement (live_is_branch_of_replacement), as on Helios 10.8.0.
         """
         src_sid = str(names['source_sid'])
         retained_ok = bool(self.retained_att) and str(self.retained_att.get('ATTACH_TYPE')).upper() == 'READONLY'
@@ -90,7 +112,8 @@ class Position:
                 return NOT_STARTED if not self.retained_att else UNKNOWN
             if not retained_ok or str(self.source_att.get('ATTACH_TYPE')).upper() != 'READWRITE':
                 return UNKNOWN
-            taken = {src_sid, str(names['replacement_sid'])} | ({str(names['retained_sid'])} if _known(names.get('retained_sid')) else set())
+            taken = {src_sid} | (set() if self.live_is_branch else {str(names['replacement_sid'])}) | (
+                {str(names['retained_sid'])} if _known(names.get('retained_sid')) else set())
             if sid in taken:
                 return UNKNOWN
             if _known(names.get('live_sid')) and sid != str(names['live_sid']):
@@ -112,9 +135,15 @@ def read_position(session, names):
     def _first(sql, params):
         rows = _rows(session, sql, params)
         return rows[0] if rows else None
-    live = _first(BRANCH_SQL, (names['live_sid'],)) if _known(names.get('live_sid')) else None
-    return Position(_first(ATTACHED_SQL, (names['source'],)), _first(ATTACHED_SQL, (names['retained'],)),
-                    _first(ATTACHED_SQL, (names['replacement'],)), _first(BRANCH_SQL, (names['source_sid'],)), live)
+    live = None
+    if _known(names.get('live_sid')):
+        rows = _rows(session, BRANCH_SQL, (names['live_sid'],))
+        live = next((r for r in rows if r.get('DATABASE_NAME') == names['source']), rows[0] if rows else None)
+    source_att, replacement_att = _first(ATTACHED_SQL, (names['source'],)), _first(ATTACHED_SQL, (names['replacement'],))
+    branch = (source_att is not None and _known(names.get('replacement_sid')) and str(source_att.get('STORAGE_ID')) == str(names['replacement_sid'])
+              and live_is_branch_of_replacement(session, names, source_att, replacement_att))
+    return Position(source_att, _first(ATTACHED_SQL, (names['retained'],)), replacement_att, _first(BRANCH_SQL, (names['source_sid'],)), live,
+                    live_is_branch=branch)
 
 
 def _sessions_params(names):
@@ -175,7 +204,7 @@ def forward_block(names, counts=None, s0_problems=None, withheld=None):
     block.check('S1 after: source storage detached', BRANCH_SQL, (names['source_sid'],), ownersql.Expect('column_equals', 'IS_DETACHED', 1))
     block.check('S1 after: no attached database named source', ATTACHED_SQL, (names['source'],), ownersql.Expect('no_rows'))
     block.check('S2 before: no attached database named retained', ATTACHED_SQL, (names['retained'],), ownersql.Expect('no_rows'))
-    block.statement("ATTACH DATABASE %s AS %s STORAGEID '%s' READ ONLY" % (ident(names['source']), ident(names['retained']), names['source_sid']),
+    block.statement("ATTACH DATABASE %s AS %s READ ONLY STORAGEID %s" % (ident(names['source']), ident(names['retained']), names['source_sid']),
                     'S2: attach the original storage read only under the retained name')
     block.check('S2 after: retained attached READONLY', ATTACHED_SQL, (names['retained'],), ownersql.Expect('column_equals', 'ATTACH_TYPE', 'READONLY'),
                 record='retained')
@@ -183,7 +212,7 @@ def forward_block(names, counts=None, s0_problems=None, withheld=None):
     block.check('S3 before: replacement attached READWRITE with the recorded STORAGE_ID', ATTACHED_SQL, (names['replacement'],),
                 ownersql.Expect('columns_equal', value={'STORAGE_ID': names['replacement_sid'], 'ATTACH_TYPE': 'READWRITE'}))
     block.check('S3 before: no attached database named source', ATTACHED_SQL, (names['source'],), ownersql.Expect('no_rows'))
-    block.statement("ATTACH DATABASE %s AS %s STORAGEID '%s'" % (ident(names['replacement']), ident(names['source']), names['replacement_sid']),
+    block.statement("ATTACH DATABASE %s AS %s STORAGEID %s" % (ident(names['replacement']), ident(names['source']), names['replacement_sid']),
                     'S3: attach the replacement as a branch under the live name')
     block.check('S3 after: an attached READWRITE database named source', ATTACHED_SQL, (names['source'],),
                 ownersql.Expect('column_equals', 'ATTACH_TYPE', 'READWRITE'), record='live')
@@ -255,7 +284,7 @@ def rollback_block(names, released=False, app_writes_seen=None, withheld=None):
     block.statement('DETACH DATABASE %s' % ident(names['source']), 'R1: detach the live branch')
     block.check('R1 after: no attached database named source', ATTACHED_SQL, (names['source'],), ownersql.Expect('no_rows'))
     block.check('R2 before: the original storage is detached', BRANCH_SQL, (names['source_sid'],), ownersql.Expect('column_equals', 'IS_DETACHED', 1))
-    block.statement("ATTACH DATABASE %s STORAGEID '%s'" % (ident(names['source']), names['source_sid']), 'R2: re-attach the original read write')
+    block.statement("ATTACH DATABASE %s STORAGEID %s" % (ident(names['source']), names['source_sid']), 'R2: re-attach the original read write')
     block.check('R2 after: source attached READWRITE with the original STORAGE_ID', ATTACHED_SQL, (names['source'],),
                 ownersql.Expect('columns_equal', value={'STORAGE_ID': names['source_sid'], 'ATTACH_TYPE': 'READWRITE'}))
     block.check('R3 before: retained attached', ATTACHED_SQL, (names['retained'],), ownersql.Expect('some_rows'))
@@ -424,7 +453,7 @@ class SwitchMachine:
         n = self.names
         self.require('S2', DETACHED)
         self._expect('S2 before: no attached database named retained', ATTACHED_SQL, (n['retained'],), ownersql.Expect('no_rows'))
-        self._run("ATTACH DATABASE %s AS %s STORAGEID '%s' READ ONLY" % (ident(n['source']), ident(n['retained']), n['source_sid']), 'S2 ATTACH retained READ ONLY')
+        self._run("ATTACH DATABASE %s AS %s READ ONLY STORAGEID %s" % (ident(n['source']), ident(n['retained']), n['source_sid']), 'S2 ATTACH retained READ ONLY')
         self.s2_after()
 
     def s2_after(self):
@@ -441,7 +470,7 @@ class SwitchMachine:
         self._expect('S3 before: replacement attached READWRITE with the recorded STORAGE_ID', ATTACHED_SQL, (n['replacement'],),
                      ownersql.Expect('columns_equal', value={'STORAGE_ID': n['replacement_sid'], 'ATTACH_TYPE': 'READWRITE'}))
         self._expect('S3 before: no attached database named source', ATTACHED_SQL, (n['source'],), ownersql.Expect('no_rows'))
-        self._run("ATTACH DATABASE %s AS %s STORAGEID '%s'" % (ident(n['replacement']), ident(n['source']), n['replacement_sid']), 'S3 ATTACH replacement AS source')
+        self._run("ATTACH DATABASE %s AS %s STORAGEID %s" % (ident(n['replacement']), ident(n['source']), n['replacement_sid']), 'S3 ATTACH replacement AS source')
         self.s3_after()
 
     def s3_after(self):
@@ -450,8 +479,14 @@ class SwitchMachine:
         rows = self._expect('S3 after: an attached READWRITE database named source', ATTACHED_SQL, (n['source'],),
                             ownersql.Expect('column_equals', 'ATTACH_TYPE', 'READWRITE'), record='live')
         taken = [str(n['source_sid']), str(n['replacement_sid'])] + ([str(n['retained_sid'])] if _known(n.get('retained_sid')) else [])
-        if str(rows[0].get('STORAGE_ID')) in taken:
-            raise KitError('Switch refused after S3: the live name resolves to STORAGE_ID %s, which is not a new branch' % rows[0].get('STORAGE_ID'))
+        sid = str(rows[0].get('STORAGE_ID'))
+        if sid in taken:
+            replacement_rows = _rows(self.session, ATTACHED_SQL, (n['replacement'],))
+            if not live_is_branch_of_replacement(self.session, n, rows[0], replacement_rows[0] if replacement_rows else None):
+                raise KitError('Switch refused after S3: the live name resolves to STORAGE_ID %s, which is not a new branch' % sid)
+            label = 'S3 after: the live name is its own branch of the replacement (same STORAGE_ID, own COMPUTE_ID, PREV_DATABASE_NAME %s)' % n['replacement']
+            self.journal.event('switch_check', '%s: ok' % label)
+            self.log('    check %s: ok' % label)
         if self.layout is not None:
             self._expect('S3 after: the live database reports the target layout', LAYOUT_SQL, (n['source'],),
                          ownersql.Expect('columns_equal', value={'NUM_PARTITIONS': self.layout.partitions, 'NUM_SUB_PARTITIONS': self.layout.sub_partitions}))
@@ -575,7 +610,7 @@ class SwitchMachine:
             self._expect('R1 after: no attached database named source', ATTACHED_SQL, (n['source'],), ownersql.Expect('no_rows'))
         self._expect('R2 before: the original storage is detached', BRANCH_SQL, (n['source_sid'],), ownersql.Expect('column_equals', 'IS_DETACHED', 1))
         self._expect('R2 before: no attached database named source', ATTACHED_SQL, (n['source'],), ownersql.Expect('no_rows'))
-        self._run("ATTACH DATABASE %s STORAGEID '%s'" % (ident(n['source']), n['source_sid']), 'R2 ATTACH original read write')
+        self._run("ATTACH DATABASE %s STORAGEID %s" % (ident(n['source']), n['source_sid']), 'R2 ATTACH original read write')
         self._expect('R2 after: source attached READWRITE with the original STORAGE_ID', ATTACHED_SQL, (n['source'],),
                      ownersql.Expect('columns_equal', value={'STORAGE_ID': n['source_sid'], 'ATTACH_TYPE': 'READWRITE'}))
         if drop_retained and _rows(self.session, ATTACHED_SQL, (n['retained'],)):
