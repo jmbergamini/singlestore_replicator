@@ -11,7 +11,7 @@ nothing, a real run refuses them. Statements issued by this module: none.
 import dataclasses
 
 from . import sqlutil
-from .connect import DryRunSession
+from .connect import DryRunSession, KeepAlive
 from .common import EXIT_DONE, EXIT_GATE, EXIT_INCOMPLETE, EXIT_MISMATCH, EXIT_REFUSED, KitError, format_duration, iso, utc_now
 
 PYTHON, ADMIN, HUMAN, DECISION = 'python', 'admin', 'human', 'decision'
@@ -363,6 +363,10 @@ def o1_start(step, ctx):
             return Outcome(FAILED, 'abort deadline %s is already past' % iso(deadline), EXIT_GATE)
     readiness, problems, waiver = o1_readiness(ctx)
     lines.extend(readiness)
+    from . import workspace
+    workspace_lines, workspace_problems, workspace_events = workspace.o1_guard(ctx, workspace.recorded(ctx.journal))
+    lines.extend(workspace_lines)
+    problems.extend(workspace_problems)
     if problems:
         if ctx.dry_run:
             lines.append('a real run refuses here: ' + '; '.join(problems))
@@ -388,9 +392,13 @@ def o1_start(step, ctx):
             journal.event('window', 'start=%s end=%s deadline=%s' % (iso(window.start), iso(window.end), iso(deadline)))
         if waiver:
             journal.event('no_rehearsal', 'O1 without rehearsal evidence: %s' % waiver)
+        for kind, detail in workspace_events:
+            journal.event(kind, detail)
     outcome = gate_pending(step, ctx, lines + ['go decision recorded by the operator'])
     if waiver:
         outcome.note += '; rehearsal waived with --no-rehearsal: %s' % waiver
+    for kind, detail in workspace_events:
+        outcome.note += '; ' + detail
     return outcome
 
 
@@ -585,6 +593,22 @@ def _after_switch_refusal(step, ctx, began):
             'or journaled. Finish the switch or roll it back; a new copy is a new run.' % (step.id, ctx.db.source, began, step.id))
 
 
+def start_keepalive(ctx):
+    """Start the keep-alive thread for a live step (workspace.keepalive_minutes above 0, a session factory), else None.
+
+    The thread opens its own runner connection at its first SELECT 1, so a step shorter than the
+    interval opens none; the opener is resolved then, and a failure is logged by the thread,
+    never raised here. A dry run starts none.
+    """
+    minutes = ctx.config.workspace.get('keepalive_minutes', 0) or 0
+    if ctx.dry_run or ctx.sessions is None or not minutes or getattr(ctx.sessions, 'dry_run', False):
+        return None
+
+    def _open():
+        return ctx.sessions.runner_connector()()
+    return KeepAlive(_open, minutes, ctx.log).start()
+
+
 def run_step(step, ctx, redo=False):
     """Run one step for one database and return its Outcome. Journals the attempt unless dry run.
 
@@ -597,7 +621,9 @@ def run_step(step, ctx, redo=False):
     process commits in between refuses it, and a step started first refuses the go.
     A KitError becomes a refusal. Any other exception (a driver error, KeyboardInterrupt, a crash
     stand-in in the tests) records the step as failed with interrupted_note and is raised again,
-    so a step is never left running by an exception the kit sees.
+    so a step is never left running by an exception the kit sees; the command line prints one
+    plain line for a driver reset (connect.is_driver_error) and exits 2. The keep-alive thread
+    runs from before the handler to the end of the step (start_keepalive).
     """
     journal, log = ctx.journal, ctx.log
     if step.id in PATH_B_SINGLE_DATABASE_STEPS:
@@ -628,6 +654,7 @@ def run_step(step, ctx, redo=False):
         if began:
             raise KitError(_after_switch_refusal(step, ctx, began))
     handler = HANDLERS.get(step.id, not_yet)
+    keepalive = start_keepalive(ctx)
     try:
         outcome = handler(step, ctx)
     except KitError as exc:
@@ -641,6 +668,9 @@ def run_step(step, ctx, redo=False):
             except Exception:  # noqa: BLE001 - the handler's exception is the one the caller must see
                 log('    the failed status could not be journaled; status may still show %s running' % step.id)
         raise
+    finally:
+        if keepalive is not None:
+            keepalive.stop()
     log('    result: %s%s' % (outcome.status, (': ' + outcome.note) if outcome.note else ''))
     if not ctx.dry_run:
         recorded = {PASSED: 'passed', PENDING: 'pending', FAILED: 'failed', REFUSED: 'pending', STUB: 'pending',

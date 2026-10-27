@@ -19,7 +19,7 @@ from unittest import mock
 import yaml
 
 from s2rebuild import cli, inventory, rehearse, steps
-from s2rebuild.common import EXIT_DONE, EXIT_GATE, EXIT_REFUSED
+from s2rebuild.common import EXIT_DONE, EXIT_GATE, EXIT_INCOMPLETE, EXIT_REFUSED
 from s2rebuild.journal import Journal
 from tests.fakedb import SimulatedCrash
 from tests.helpers import FAULT_POINTS, FIXTURE, ROOT, crash_journals, fake_driver, record_passed, run_cli, write_config
@@ -798,6 +798,27 @@ class EntryPointRuleTests(unittest.TestCase):
             self.assertEqual(journal.step_status('P2'), 'passed')
             self.assertEqual(journal.events('step_start'), ['P2', 'P2'], 'a passed P2 runs again without --redo')
 
+    def test_w8_a_driver_error_prints_the_plain_line_and_exits_2(self):
+        """A connection reset (2003 as the session opens) ends the command with one plain line and exit 2; the raw error goes
+        to the log file only, redacted; the step is recorded failed, so a rerun re-enters."""
+        h = LiveRun(self)
+        self.assertEqual(h.cli('gate', 'P1', '--pass', '--note', 'in place')[0], EXIT_DONE)
+        h.fake.fail_connect('s2rebuild_runner')
+        code, text = h.cli('check')
+        self.assertEqual(code, EXIT_INCOMPLETE, text)
+        self.assertIn('INCOMPLETE: a node reset the connection; the workspace may be scaling or restarting; rerun the step '
+                      '(driver error 2003; the raw error is in the log file)', text)
+        self.assertNotIn("Can't connect", text)
+        logs = list((h.tmp / 'runs' / RUN / 'logs').glob('check-*.log'))
+        self.assertEqual(len(logs), 1)
+        log_text = logs[0].read_text(encoding='utf8')
+        self.assertIn("driver error 2003: FakeDisconnect: (2003, \"Can't connect to the server (injected)\")", log_text)
+        self.assertIn('result: failed: interrupted by FakeDisconnect (error 2003)', log_text)
+        with h.journal() as journal:
+            self.assertEqual(journal.step_status('P2'), 'failed')
+        code, text = h.cli('check')
+        self.assertEqual(code, EXIT_DONE, text)
+
     def test_f5_check_fault_points_resume_with_a_plain_rerun(self):
         """The P2 preflight at the three points: a lost connection before and after its source attachment read, and a kill after
         every read but before the preflight record is journaled. P2 is left failed, never passed; a plain rerun of check passes
@@ -815,8 +836,11 @@ class EntryPointRuleTests(unittest.TestCase):
                 else:
                     h.fake.fail_statement(r'^SELECT DATABASE_NAME, ATTACH_TYPE, STORAGE_ID', point)
                     code, text = h.cli('check')
-                    self.assertEqual(code, EXIT_REFUSED, text)
-                    self.assertIn('ERROR: FakeDisconnect', text)
+                    # a lost connection (2013) is a driver reset: one plain line and exit 2 (W8); the step is still recorded failed
+                    self.assertEqual(code, EXIT_INCOMPLETE, text)
+                    self.assertIn('INCOMPLETE: a node reset the connection; the workspace may be scaling or restarting; rerun the step '
+                                  '(driver error 2013; the raw error is in the log file)', text)
+                    self.assertNotIn('ERROR: FakeDisconnect', text, 'the raw error goes to the log file')
                     self.assertEqual(h.fake.faults_fired[0][0], point)
                 with h.journal() as journal:
                     row = journal.step('P2')
@@ -871,8 +895,8 @@ class EntryPointRuleTests(unittest.TestCase):
                     else:
                         h.fake.fail_statement(CAPTURE_READ, point)
                         code, text = h.cli(*argv)
-                        self.assertEqual(code, EXIT_REFUSED, text)
-                        self.assertIn('ERROR: FakeDisconnect', text)
+                        self.assertEqual(code, EXIT_INCOMPLETE, text)
+                        self.assertIn('INCOMPLETE: a node reset the connection', text)
                         with h.journal() as journal:
                             self.assertIsNone(journal.step_status(step_id), 'a capture that stops journals nothing')
                         self.assertFalse(target.exists(), 'and writes nothing under inventory/')

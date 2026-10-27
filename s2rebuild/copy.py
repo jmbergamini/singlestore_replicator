@@ -10,7 +10,9 @@ waits requeued without consuming an attempt, the definition diff that ignores on
 AUTO_INCREMENT counter, the refusal of a replacement holding rows the journal cannot explain,
 and the count proof at the end. New: names and sizes from config, the bucket cap, a queue per
 table with per-table concurrency and automatic serialization after a lock wait, the lock probe,
-the fresh-table fallback and per-chunk timings for calibrate. A fresh-table load replaces a whole
+the fresh-table fallback, per-chunk timings for calibrate, the circuit breaker (copy.max_consecutive_failures
+failed chunks in a row end O6 INCOMPLETE) and the 1997 transient (reconciled and requeued without an
+attempt). A fresh-table load replaces a whole
 table, so it reopens O7 and O8 and the table's verification as a mark-recopy does, and the O10
 block files of the database get a STOP first. Stop safety: a chunk fails after copy.max_lock_waits
 lock waits, with the fresh-table command in its error; a second Ctrl-C prints the hard-stop hint
@@ -40,6 +42,11 @@ from .sqlutil import ident, qualified, runner_guard
 
 DURABILITY_FLAGS = ('IS_SYNC', 'IS_SYNC_DURABILITY', 'IS_SYNC_DURABILITY_ON_REF_DB_ONLY')
 LOCK_WAIT_ERRNO = 1205
+# Error 1997 (transaction was already in its commit phase): a chunk in flight while autoscale replaces a node
+# (Helios fact 40). A transient: the chunk is reconciled and requeued without consuming an attempt.
+COMMIT_PHASE_ERRNO = 1997
+BREAKER_MESSAGE = ('chunks are failing in a row; nodes may be restarting, see MV_EVENTS; rerun with --retry-failed when the workspace '
+                   'is steady')
 FRESH_SUFFIX = '__fresh'
 STAGE_SUFFIX = '__stage'
 MAX_NAME_CHARS = 64
@@ -96,6 +103,12 @@ def is_lock_wait(exc):
     """True for error 1205 (lock wait timeout) however the driver wraps it."""
     args = getattr(exc, 'args', ())
     return (bool(args) and args[0] == LOCK_WAIT_ERRNO) or 'Lock wait timeout' in str(exc)
+
+
+def is_commit_phase(exc):
+    """True for error 1997 (already in its commit phase) however the driver wraps it."""
+    args = getattr(exc, 'args', ())
+    return (bool(args) and args[0] == COMMIT_PHASE_ERRNO) or 'commit phase' in str(exc).lower()
 
 
 def one_value(rows, key='n'):
@@ -353,7 +366,12 @@ class Runner:
     tables continue. Before a chunk on a table that has waited for a lock, the reconciliation
     DELETE runs as a probe with lock_wait_timeout = lock_probe_timeout_seconds. The
     max_lock_waits-th lock wait of one chunk in a run fails that chunk as an attempt, with the
-    fresh-table command in its error, so a lock that never clears ends O6 incomplete.
+    fresh-table command in its error, so a lock that never clears ends O6 incomplete. Error 1997
+    (commit phase, a node replaced under the chunk) is a transient: the chunk is marked failed,
+    so its rows are reconciled, and goes to the back of its queue without consuming an attempt.
+    The circuit breaker: copy.max_consecutive_failures failed chunks with no success between
+    them (1997 counted, lock waits not) stop new chunks; the running ones finish, BREAKER_MESSAGE
+    is logged and journaled, and O6 ends INCOMPLETE.
     """
 
     def __init__(self, plans, statements, journal, connect, log, copy_config, workers=None, abort_at=None, stop_file=None,
@@ -393,6 +411,8 @@ class Runner:
         self.rows_since_start = 0
         self.failed_this_run = 0
         self.connect_failures = 0
+        self.consecutive_failures = 0
+        self.breaker_tripped = False
         self.interrupted = False
         self._seed_from_journal()
 
@@ -544,6 +564,31 @@ class Runner:
         except Exception:  # noqa: BLE001 - a broken log must not take a worker down
             pass
 
+    def _count_failure(self):
+        """One more chunk failure with no success since the last one; the breaker trips at copy.max_consecutive_failures."""
+        with self.lock:
+            self.consecutive_failures += 1
+            tripped = self.consecutive_failures >= self.cfg.max_consecutive_failures and not self.breaker_tripped
+            if tripped:
+                self.breaker_tripped = True
+                self.stop_launching.set()
+        if tripped:
+            self._safe_log('circuit breaker: %d chunk failures in a row; %s' % (self.consecutive_failures, BREAKER_MESSAGE))
+            try:
+                self.journal.event('breaker', '%d chunk failures in a row; no new chunk starts' % self.consecutive_failures)
+            except Exception as exc:  # noqa: BLE001 - journal trouble is reported, not fatal
+                self._safe_log('the breaker event could not be journaled: %s' % type(exc).__name__)
+
+    def _count_success(self):
+        """A chunk done resets the breaker's count."""
+        with self.lock:
+            self.consecutive_failures = 0
+
+    def requeue_transient(self, table, bucket):
+        """Put a chunk that failed with 1997 at the back of its table's queue as failed, so it is reconciled; no park, no attempt."""
+        with self.lock:
+            self.queues[table].append((bucket, 'failed'))
+
     def _count_lock_wait(self, table, bucket):
         """Count one more lock wait for a chunk in this run; returns the count."""
         with self.lock:
@@ -591,6 +636,7 @@ class Runner:
                 try:
                     self.log('worker %d start %s bucket %d/%d (prior state %s)' % (idx, table, bucket, self.by_name[table].n_buckets, prior))
                     rows = self.run_chunk(session, table, bucket, prior)
+                    self._count_success()
                     self.log('worker %d done %s bucket %d/%d rows=%d' % (idx, table, bucket, self.by_name[table].n_buckets, rows))
                 except Exception as exc:  # noqa: BLE001 - journal the failure and continue with the next chunk
                     detail = self.log.redactor('%s: %s' % (type(exc).__name__, exc))
@@ -604,6 +650,14 @@ class Runner:
                             self._safe_log('worker %d LOCK WAIT on %s bucket %d; parked for %d s: %s' % (
                                 idx, table, bucket, self.cfg.lock_retry_seconds, detail))
                             self.requeue_after_lock(table, bucket)
+                        elif is_commit_phase(exc):
+                            self.journal.undo_attempt(table, bucket)
+                            self.journal.event('transient', '%s bucket %d: error %d, requeued without an attempt' % (
+                                table, bucket, COMMIT_PHASE_ERRNO))
+                            self._safe_log('worker %d TRANSIENT %s bucket %d (error %d, a node may have been replaced); reconciled and '
+                                           'requeued without an attempt: %s' % (idx, table, bucket, COMMIT_PHASE_ERRNO, detail))
+                            self.requeue_transient(table, bucket)
+                            self._count_failure()
                         else:
                             with self.lock:
                                 self.failed_this_run += 1
@@ -612,6 +666,7 @@ class Runner:
                             self._safe_log('worker %d FAILED %s bucket %d: %s' % (idx, table, bucket, detail))
                             if capped:
                                 self.requeue_after_lock(table, bucket, requeue=False)
+                            self._count_failure()
                     except Exception as inner:  # noqa: BLE001 - journal trouble is reported, not fatal
                         self._safe_log('worker %d could not journal the failure of %s bucket %d: %s' % (
                             idx, table, bucket, self.log.redactor('%s: %s' % (type(inner).__name__, inner))))
@@ -1094,6 +1149,9 @@ def handle_o6(step, ctx):
         totals, _ = journal.totals()
         if totals['pending'][0] + totals['started'][0] + totals['failed'][0] == 0:
             return steps.Outcome(steps.MISMATCH, 'count proof found a per-table mismatch; see the journal counts', EXIT_MISMATCH)
+        if runner.breaker_tripped:
+            return steps.Outcome(steps.INCOMPLETE, 'copy incomplete: pending=%d started=%d failed=%d; %s' % (
+                totals['pending'][0], totals['started'][0], totals['failed'][0], BREAKER_MESSAGE), EXIT_INCOMPLETE)
         return steps.Outcome(steps.INCOMPLETE, 'copy incomplete: pending=%d started=%d failed=%d%s; rerun O6 with the same run to resume%s' % (
             totals['pending'][0], totals['started'][0], totals['failed'][0], ' (interrupted)' if runner.interrupted else '',
             ''.join('; ' + fresh_table_hint(t, ctx.config.copy.max_lock_waits) for t in runner.lock_capped)), EXIT_INCOMPLETE)

@@ -518,8 +518,9 @@ def calibration_lines(cal, size_gib=None):
 # ---------------------------------------------------------------------------
 # Plan sheet (P4, Appendix B)
 # ---------------------------------------------------------------------------
-def plan_sheet(config, db, run_id, inventory, est, fit, rehearsal=None, env=None):
-    """The plan sheet lines for one database."""
+def plan_sheet(config, db, run_id, inventory, est, fit, rehearsal=None, env=None, workspace=None):
+    """The plan sheet lines for one database; workspace is the facts P2 recorded (state, autoscale, auto-suspend) or None."""
+    from . import workspace as workspace_module
     env = {} if env is None else env
     lines = ['%s    run %s    database %s' % ('SingleStore Database Rebuild Kit', run_id, db.source)]
     window = config.window
@@ -563,6 +564,7 @@ def plan_sheet(config, db, run_id, inventory, est, fit, rehearsal=None, env=None
                                                      ' (Path B would revoke these on every database)' if config.freeze.mode == 'lockout' else ''))
     refusals = routines.pipeline_target_refusals(config, db, inventory or {})
     lines.append('Routines   %s' % '; '.join([routines.summary(config, db, inventory or {})] + ['REFUSED: ' + r for r in refusals]))
+    lines.extend(workspace_module.plan_lines(workspace))
     lines.append('Rehearsal  %s' % (rehearsal or 'none recorded'))
     if config.closeout.retain_days < 90:
         lines.append('Retention  closeout.retain_days is %d, under the 90 day default: the retained copy %s may be deleted by the customer '

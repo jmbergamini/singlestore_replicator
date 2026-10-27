@@ -36,6 +36,7 @@ class DefaultsTests(unittest.TestCase):
         self.assertIsNone(cfg.verify.fingerprint_budget_minutes, 'no deadline unless set')
         self.assertIsNone(cfg.verify.sessions, 'copy.workers unless set')
         self.assertEqual((cfg.verify.full_fingerprint_max_rows, cfg.verify.sample_percent, cfg.verify.value_columns), (1_000_000_000, 5, 4))
+        self.assertEqual((cfg.workspace.keepalive_minutes, cfg.workspace.management_api_key_keychain, cfg.copy.max_consecutive_failures), (15, None, 6))
         self.assertEqual(cfg.pipelines.route, 'kit')
         self.assertEqual(cfg.pipelines.credentials_env['KAFKA'], 'S2REBUILD_KAFKA_CREDENTIALS')
         self.assertEqual(cfg.estimate.baseline, 'customer/baseline.json')

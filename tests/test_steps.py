@@ -472,6 +472,39 @@ class RealRunTests(unittest.TestCase):
         self.assertEqual(h.run(redo=True, to_id='O1'), EXIT_GATE)
         self.assertIn('rehearsal evidence: a passed rehearsal under %s' % h.config.runs_dir(), h.text())
 
+    def test_w8_o1_refuses_while_autoscale_is_on_unless_accepted_and_records_the_workspace_answer(self):
+        """O1 reads the workspace facts P2 recorded: autoscale on refuses before any journal write unless --accept-autoscale NOTE,
+        which is recorded as an event and in the O1 note; without an API read O1 prints the three questions and records the
+        operator's --workspace NOTE as evidence of the go."""
+        import json
+        h = Harness(self).ready_for_o1()
+        api = {'source': 'api', 'workspace_id': 'ws-123', 'state': 'ACTIVE', 'autoscale': True, 'auto_suspend': False,
+               'fields': {'state': 'ACTIVE', 'autoScale': {'enabled': True}, 'autoSuspend': {'suspendType': 'DISABLED'}}}
+        h.journal.set_meta('preflight', json.dumps({'workspace': api}))
+        self.assertEqual(h.run(), EXIT_REFUSED)
+        note = h.journal.step('O1')['note']
+        self.assertIn('autoscale is on (Management API at P2); every chunk in flight fails with error 1997', note)
+        self.assertIn('override with --accept-autoscale NOTE', note)
+        self.assertIsNone(h.journal.get_meta('config_hash'), 'the refusal records nothing of O1')
+        self.assertIn('workspace: state ACTIVE, autoscale on (enabled=True), auto-suspend off (suspendType=DISABLED)', h.text())
+        self.assertEqual(h.run(options=dict(h.options, accept_autoscale='owner turned it off by hand at 04:50')), EXIT_GATE)
+        self.assertEqual(h.journal.events('accept_autoscale'), ['O1 with autoscale on: owner turned it off by hand at 04:50'])
+        self.assertIn('O1 with autoscale on: owner turned it off by hand at 04:50', h.journal.step('O1')['note'])
+        self.assertEqual(h.journal.get_meta('config_hash'), h.config.config_hash())
+        api.update(autoscale=False, fields=dict(api['fields'], autoScale={'enabled': False}))
+        h.journal.set_meta('preflight', json.dumps({'workspace': api}))
+        self.assertEqual(h.run(redo=True, to_id='O1'), EXIT_GATE, 'autoscale off needs no override')
+        self.assertEqual(len(h.journal.events('accept_autoscale')), 1)
+        h.journal.set_meta('preflight', json.dumps({'workspace': {'source': 'questions'}}))
+        self.assertEqual(h.run(redo=True, to_id='O1'), EXIT_GATE)
+        self.assertIn('workspace: not read through the Management API; the three questions: is the workspace ACTIVE', h.text())
+        self.assertIn('workspace answer: none recorded; record the answers at O1 with --workspace NOTE', h.text())
+        self.assertEqual(h.journal.events('workspace'), [])
+        self.assertEqual(h.run(redo=True, to_id='O1', options=dict(h.options, workspace='ACTIVE, autoscale off, auto-suspend off')), EXIT_GATE)
+        self.assertEqual(h.journal.events('workspace'), ['O1 workspace answer: ACTIVE, autoscale off, auto-suspend off'])
+        self.assertIn('workspace answer: ACTIVE, autoscale off, auto-suspend off', h.text())
+        self.assertIn('O1 workspace answer: ACTIVE, autoscale off, auto-suspend off', h.journal.step('O1')['note'])
+
     def test_f5_o1_journal_fault_points_resume_on_rerun(self):
         """The O1 journal writes the readiness checks guard, at the three points: before its first write (run_id), after the
         names, hash and window are written (at the no_rehearsal event), and after every meta write but before the step result

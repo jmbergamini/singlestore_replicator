@@ -5,8 +5,11 @@ Author: John Bergamini
 Secrets reads a password from the macOS Keychain or from an environment variable and keeps
 it in memory only. Redactor masks host, user, password and CA path in every line that is
 printed or written. Session applies the active step's Guard to every statement before it
-reaches the server. DryRunSession records statements and issues nothing. Statements issued
-by this module: none of its own; it forwards the statements the steps hand to a Session.
+reaches the server. DryRunSession records statements and issues nothing. KeepAlive sends
+SELECT 1 on its own runner connection every workspace.keepalive_minutes while a step runs, and
+is_driver_error names a connection reset (2003, 2004, 2006, 2013). Statements issued by this
+module: SELECT 1 from the keep-alive thread; otherwise it forwards the statements the steps
+hand to a Session.
 """
 import getpass
 import os
@@ -14,6 +17,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 from .common import KitError, iso, utc_now
@@ -314,8 +318,118 @@ class Log:
         if self.verbose:
             self(msg)
 
+    def file(self, msg):
+        """A timestamped, redacted line to the log file only (the raw text of a driver error); nothing without a file path.
+
+        Works after close() too, by appending to the path, since the command's last line may come
+        after the log was closed.
+        """
+        if self.path is None:
+            return
+        line = iso(utc_now()) + ' ' + self.redactor(msg)
+        with self.lock:
+            if self._file is not None:
+                self._file.write(line + '\n')
+                self._file.flush()
+                return
+            fd = os.open(str(self.path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, LOG_FILE_MODE)
+            with os.fdopen(fd, 'a', encoding='utf8') as handle:
+                handle.write(line + '\n')
+
     def close(self):
         """Close the log file when one is open."""
         if self._file is not None:
             self._file.close()
             self._file = None
+
+
+# ---------------------------------------------------------------------------
+# Driver errors and the keep-alive thread
+# ---------------------------------------------------------------------------
+# The driver numbers of a connection reset: unreachable (2003), no socket (2004), gone away between
+# statements (2006), lost during a statement (2013). A node replaced by autoscale, a restart or a
+# resume shows as one of them.
+DRIVER_RESET_ERRNOS = (2003, 2004, 2006, 2013)
+DRIVER_RESET_LINE = 'a node reset the connection; the workspace may be scaling or restarting; rerun the step'
+KEEPALIVE_SQL = 'SELECT 1'
+
+
+def driver_errno(exc):
+    """The driver error number of an exception, or None when it carries none."""
+    args = getattr(exc, 'args', ())
+    if args and isinstance(args[0], int) and not isinstance(args[0], bool):
+        return args[0]
+    return None
+
+
+def is_driver_error(exc):
+    """True for a connection reset the driver reports with one of DRIVER_RESET_ERRNOS."""
+    return driver_errno(exc) in DRIVER_RESET_ERRNOS
+
+
+class KeepAlive:
+    """A daemon thread that sends SELECT 1 on its own runner connection every interval while a step runs.
+
+    Auto-suspend counts queries from connections as activity, so a long step with no statement
+    for a while (a wait, a slow block) must not leave the workspace idle. The connection opens at
+    the first ping, so a short step opens none; a ping that fails is logged and the next one opens
+    a new connection. run_step starts it and stops it at the end of the step; 0 minutes disables
+    it. clock and poll are injected by the tests (a fake clock, a short poll).
+    """
+
+    def __init__(self, opener, minutes, log=None, clock=None, poll=1.0, guard=None):
+        from .sqlutil import read_guard
+        self.opener = opener
+        self.seconds = float(minutes) * 60.0
+        self.log = log
+        self.clock = clock or time.monotonic
+        self.poll = float(poll)
+        self.guard = guard or read_guard('keep-alive')
+        self.stopped = threading.Event()
+        self.thread = None
+        self.session = None
+        self.sent = []
+        self.failures = 0
+
+    def start(self):
+        """Start the thread; returns self."""
+        self.thread = threading.Thread(target=self._loop, name='keep-alive', daemon=True)
+        self.thread.start()
+        return self
+
+    def stop(self):
+        """Stop the thread, wait for it and close the connection it opened."""
+        self.stopped.set()
+        if self.thread is not None:
+            self.thread.join(timeout=max(5.0, self.poll * 5))
+        if self.session is not None:
+            self.session.close()
+            self.session = None
+
+    def ping(self):
+        """Send SELECT 1 once, opening the connection when needed; a failure is logged, never raised."""
+        try:
+            if self.session is None:
+                self.session = Session(self.opener(), self.guard, self.log)
+            self.session.query(KEEPALIVE_SQL)
+            self.sent.append(self.clock())
+            if self.log is not None:
+                self.log('keep-alive: %s sent' % KEEPALIVE_SQL)
+        except Exception as exc:  # noqa: BLE001 - the keep-alive never ends a step
+            self.failures += 1
+            if self.session is not None:
+                self.session.close()
+                self.session = None
+            if self.log is not None:
+                self.log('keep-alive: %s failed (%s); the next one opens a new connection' % (KEEPALIVE_SQL, type(exc).__name__))
+
+    def _loop(self):
+        due = self.clock() + self.seconds
+        while not self.stopped.is_set():
+            remaining = due - self.clock()
+            if remaining > 0:
+                if self.stopped.wait(min(remaining, self.poll)):
+                    return
+                continue
+            self.ping()
+            due = self.clock() + self.seconds

@@ -4,7 +4,8 @@ Author: John Bergamini
 
 Rows live in Python lists; hash-bucket predicates are evaluated with zlib.crc32 on the string
 form of each value, which matches the server's CRC32 for the values the tests use. Fault
-injection: fail_insert[(table, predicate)] = 'before' | 'after' | 'lock'; lock_tables holds
+injection: fail_insert[(table, predicate)] = 'before' | 'after' | 'lock' | 'commit' (error 1997 after the
+rows were applied, a node replaced under the chunk); lock_tables holds
 (database, table) pairs whose INSERT and DELETE raise error 1205 until removed; the crash hook
 of the runner stands in for kill -9. fail_statement(pattern, when) fails any statement: 'before'
 raises before the server sees it, 'after' raises once the server applied it (the client lost the
@@ -615,6 +616,9 @@ class FakeCursor:
             self.rowcount = len(moved)
             if fail == 'after':
                 raise FakeDisconnect('lost connection after the server committed')
+            if fail == 'commit':
+                # Helios fact 40: a node replaced under the chunk; the server may have applied it, the client gets 1997
+                raise db.error(1997)
             return
         m = re.match(r'DELETE FROM `([^`]+)`\.`([^`]+)` WHERE (.*)$', s)
         if m:

@@ -888,6 +888,43 @@ class SchedulerTests(unittest.TestCase):
 FRESH = {'fresh_table': 't_single'}
 
 
+class WorkspaceGuardTests(unittest.TestCase):
+    def test_w8_the_breaker_trips_after_six_failures_in_a_row(self):
+        """Six chunk failures with no success between them (copy.max_consecutive_failures) stop new chunks: the seventh chunk
+        stays pending, the work order's message is logged, journaled and in the O6 note, and O6 ends INCOMPLETE (exit 2).
+        A plain rerun copies the lot once the workspace is steady."""
+        h = Harness(self, mutate=lambda d: d['copy'].update(workers=1))
+        self.assertEqual(h.config.copy.max_consecutive_failures, 6)
+        h.fake.fail_statement(r'^INSERT INTO', 'before', times=6)
+        outcome = h.o5_o6()
+        self.assertEqual((outcome.status, outcome.exit_code), (steps.INCOMPLETE, EXIT_INCOMPLETE), h.text())
+        self.assertIn(C.BREAKER_MESSAGE, outcome.note)
+        self.assertIn('circuit breaker: 6 chunk failures in a row; ' + C.BREAKER_MESSAGE, h.text())
+        self.assertEqual(h.journal.events('breaker'), ['6 chunk failures in a row; no new chunk starts'])
+        states = h.states()
+        self.assertEqual(sorted(s for s, _ in states.values()), ['failed'] * 6 + ['pending'])
+        self.assertEqual(states[('t_empty', 0)][0], 'pending', 'the chunk after the breaker never started')
+        self.assertEqual(len(h.fake.faults_fired), 6)
+        self.assertEqual(h.step('O6').status, steps.PASSED, h.text())
+        for name in FIXTURE_TABLES:
+            self.assertEqual(multiset(h.fake.rows(TGT, name)), multiset(h.fake.rows(SRC, name)), name)
+
+    def test_w8_error_1997_is_reconciled_and_requeued_without_an_attempt(self):
+        """A chunk that fails with 1997 (a node replaced under it, Helios fact 40) is marked failed, so its rows are reconciled,
+        and goes to the back of its queue without consuming an attempt; the same run completes with every row once."""
+        h = Harness(self, mutate=lambda d: d['copy'].update(workers=1))
+        h.fake.fail_insert[('t_single', 'CRC32(`id`) MOD 3 = 0')] = 'commit'
+        outcome = h.o5_o6()
+        self.assertEqual(outcome.status, steps.PASSED, h.text())
+        self.assertEqual(h.journal.events('transient'), ['t_single bucket 0: error 1997, requeued without an attempt'])
+        self.assertIn('TRANSIENT t_single bucket 0 (error 1997, a node may have been replaced); reconciled and requeued without an attempt', h.text())
+        attempts = {(t, b): a for t, b, _, _, a in h.journal.chunk_states()}
+        self.assertEqual(attempts[('t_single', 0)], 1, 'the transient consumed no attempt')
+        self.assertEqual(len(h.journal.events('reconcile_delete')), 1, 'the rows the server applied were removed before the re-insert')
+        self.assertEqual(multiset(h.fake.rows(TGT, 't_single')), multiset(h.fake.rows(SRC, 't_single')))
+        self.assertEqual({s for s, _ in h.states().values()}, {'done'})
+
+
 class StopSafetyTests(unittest.TestCase):
     def test_f13_lock_that_never_clears_ends_incomplete_with_the_fresh_table_hint(self):
         """A lock that never clears: the chunk fails at its copy.max_lock_waits-th lock wait with the fresh-table command, O6 ends

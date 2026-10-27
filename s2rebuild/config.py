@@ -105,6 +105,8 @@ SCHEMA = {
         'ca_file': Field('str', 'certs/singlestore_bundle.pem'),
         'compute_size': Field('str', None, nullable=True),
         'id': Field('str', None, nullable=True),
+        'management_api_key_keychain': Field('str', None, nullable=True),
+        'keepalive_minutes': Field('int', 15, minimum=0, maximum=60),
     },
     'connections': {
         'runner': PROFILE_SCHEMA,
@@ -140,6 +142,7 @@ SCHEMA = {
         'lock_retry_seconds': Field('int', 120, minimum=1),
         'max_attempts': Field('int', 3, minimum=1),
         'max_lock_waits': Field('int', 10, minimum=1),
+        'max_consecutive_failures': Field('int', 6, minimum=1, maximum=100),
         'progress_seconds': Field('int', 60, minimum=1),
     },
     'verify': {

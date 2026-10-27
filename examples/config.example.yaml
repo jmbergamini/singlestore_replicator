@@ -9,7 +9,10 @@ workspace:
   port: 3306
   ca_file: certs/singlestore_bundle.pem
   compute_size: S-16                    # label stored with the baseline record
-  # id: <workspace id>                 # optional; the owner notebook checks it before running anything
+  # id: <workspace id>                 # optional; the owner notebook checks it; the Management API read (P2) needs it
+  # management_api_key_keychain: s2rebuild-api  # optional Keychain item with a Management API key: P2 reads the workspace
+                                        # state (must be ACTIVE), auto-suspend and autoscale; without it P2 asks three questions
+  keepalive_minutes: 15                 # SELECT 1 on its own connection every N minutes while a step runs; 0 disables
 connections:
   runner:
     user: s2rebuild_runner
@@ -52,6 +55,7 @@ copy:
   lock_retry_seconds: 120
   max_attempts: 3
   max_lock_waits: 10                    # lock waits of one chunk, then it fails with the fresh-table command
+  max_consecutive_failures: 6           # circuit breaker: chunk failures in a row with no success between them, then O6 ends INCOMPLETE
   progress_seconds: 60
 verify:
   tiers: [count, newest, fingerprint]

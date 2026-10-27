@@ -19,10 +19,10 @@ import traceback
 from pathlib import Path
 
 from . import __title__, __version__, abandon, bundle, cleanup, copy as copy_module, enginecapture, estimate, freeze, grants, inventory, lockout, notebook, ownersql, pipelines, postcopy, rehearse, report_md, report_xlsx, routines, steps, switch, watch
-from .common import EXIT_DONE, EXIT_GATE, EXIT_MISMATCH, EXIT_REFUSED, KitError, check_run_id, parse_utc, run_date, unique_run_id, utc_now
+from .common import EXIT_DONE, EXIT_GATE, EXIT_INCOMPLETE, EXIT_MISMATCH, EXIT_REFUSED, KitError, check_run_id, parse_utc, run_date, unique_run_id, utc_now
 from .sqlutil import ident, secret_forms, sql_literal
 from .config import load_config
-from .connect import Log, Redactor, Secrets, Session, SessionFactory
+from .connect import DRIVER_RESET_LINE, Log, Redactor, Secrets, Session, SessionFactory, driver_errno, is_driver_error
 from .journal import Journal, read_only_uri
 from .sqlutil import read_guard
 
@@ -33,7 +33,8 @@ GLOBAL_FLAGS = ('--config', '--run', '--db', '--dry-run', '--yes', '--verbose', 
 # command: (step label, help text, where it arrives; None when implemented here)
 COMMANDS = [
     ('check', 'P2', 'Connect as runner (and owner if configured), check privileges, engine version, source layout and '
-                    'STORAGE_ID, free target names, compute cores times 8 at or above the partition count; needs P1 recorded', None),
+                    'STORAGE_ID, free target names, compute cores times 8 at or above the partition count, the workspace state and '
+                    'settings through the Management API when a key is configured; needs P1 recorded', None),
     ('account-sql', 'P1, C4', 'Print the CREATE USER and GRANT block for the runner account; --execute runs it with the '
                               'owner profile; --drop prints or executes the DROP USER block and the zero-privilege check', None),
     ('profile', 'P3', 'Inventory, sizes, estimate and the profile workbook for the configured databases', None),
@@ -144,6 +145,9 @@ def build_parser():
     p['run'].add_argument('--redo', action='store_true', help='run steps that already passed')
     p['run'].add_argument('--retry-failed', action='store_true', help='O6: also rerun chunks parked after copy.max_attempts failures')
     p['run'].add_argument('--no-rehearsal', metavar='NOTE', help='O1 only: start without rehearsal evidence; the note is recorded as an event and in the O1 note')
+    p['run'].add_argument('--workspace', metavar='NOTE', help='O1 only: the answers to the three workspace questions of P2 (ACTIVE, autoscale off, '
+                                                             'auto-suspend off or a keep-alive job); recorded as evidence of the go')
+    p['run'].add_argument('--accept-autoscale', metavar='NOTE', help='O1 only: go on although P2 read autoscale on; the note is recorded')
     p['run'].add_argument('--new', action='store_true', help='start a new run at O1 instead of resuming the most recent one; with --run ID '
                                                              'the new run takes that id, which must not exist yet')
     p['step'].add_argument('step_id', metavar='ID', help='step id such as O6')
@@ -151,6 +155,9 @@ def build_parser():
     p['step'].add_argument('--fresh-table', metavar='TABLE', help='O6 only: load one table with the fresh-table fallback')
     p['step'].add_argument('--retry-failed', action='store_true', help='O6: also rerun chunks parked after copy.max_attempts failures')
     p['step'].add_argument('--no-rehearsal', metavar='NOTE', help='O1 only: start without rehearsal evidence; the note is recorded as an event and in the O1 note')
+    p['step'].add_argument('--workspace', metavar='NOTE', help='O1 only: the answers to the three workspace questions of P2 (ACTIVE, autoscale off, '
+                                                              'auto-suspend off or a keep-alive job); recorded as evidence of the go')
+    p['step'].add_argument('--accept-autoscale', metavar='NOTE', help='O1 only: go on although P2 read autoscale on; the note is recorded')
     p['step'].add_argument('--idle-workload', metavar='NOTE', help='C1 only: pass without application writes seen; why the live database is idle')
     p['step'].add_argument('--fingerprint', metavar='TABLE', action='append',
                            help='O8 only: run tier 3 for this table only, sampled (repeatable; the other tables keep their recorded result)')
@@ -380,6 +387,7 @@ class Invocation:
         redactor = Redactor(values, soft=users)
         self.state['redactor'] = redactor
         self.log = Log(redactor=redactor, stream=self.out, path=path, verbose=self.args.verbose)
+        self.state['log'] = self.log
         return self.log
 
     def refuse_abandoned(self):
@@ -441,7 +449,8 @@ def cmd_run(args, env, out, state):
         sessions = inv.open_sessions()
         return steps.run_steps(inv.config, inv.databases, inv.journals, log, run_id=inv.run_id, from_id=args.from_id,
                                to_id=args.to_id, redo=args.redo, dry_run=inv.dry_run, yes=args.yes, verbose=args.verbose,
-                               sessions=sessions, options={'retry_failed': args.retry_failed, 'env': env, 'no_rehearsal': args.no_rehearsal})
+                               sessions=sessions, options={'retry_failed': args.retry_failed, 'env': env, 'no_rehearsal': args.no_rehearsal,
+                                                           'workspace': args.workspace, 'accept_autoscale': args.accept_autoscale})
     finally:
         inv.close()
 
@@ -455,7 +464,8 @@ def cmd_step(args, env, out, state):
         inv.refuse_abandoned()
         log = inv.open_log('step-%s' % step.id)
         log(_header(inv, 'step ' + step.id))
-        options = {'retry_failed': args.retry_failed, 'env': env, 'no_rehearsal': args.no_rehearsal}
+        options = {'retry_failed': args.retry_failed, 'env': env, 'no_rehearsal': args.no_rehearsal, 'workspace': args.workspace,
+                   'accept_autoscale': args.accept_autoscale}
         if args.fresh_table:
             options['fresh_table'] = args.fresh_table
         if args.idle_workload:
@@ -857,6 +867,19 @@ def _write_profile(inv, db, step_id, data, plans, est, fit, baseline, target_dir
     log('%s: workbook written to %s (Summary plus %d table tabs)' % (db.source, out_path, len(plans)))
 
 
+def _workspace_facts(inv, db):
+    """The workspace facts P2 recorded in the run's journal for db (the plan sheet's Workspace line), or None without a journal."""
+    from . import workspace
+    path = inv.journal_path(db)
+    if inv.dry_run or not path.exists():
+        return None
+    journal = Journal(path, read_only=True)
+    try:
+        return workspace.recorded(journal)
+    finally:
+        journal.close()
+
+
 def cmd_plan(args, env, out, state):
     """plan: print the P4 plan sheet from the run's P3 inventory (or --inventory DIR)."""
     inv = Invocation(args, env, out, state, run_mode=RUN_EXISTING, dry_run=bool(args.inventory) or args.dry_run)
@@ -869,7 +892,8 @@ def cmd_plan(args, env, out, state):
             pipeline_count = len(data['pipelines']['items']) if data.get('pipelines', {}).get('captured') else 0
             est = estimate.estimate(plans, inv.config, baseline, pipeline_count)
             fit = estimate.window_fit(est, inv.config.window) if inv.config.window is not None else None
-            for line in estimate.plan_sheet(inv.config, db, inv.run_id, data, est, fit, _rehearsal_note(inv.config), env):
+            for line in estimate.plan_sheet(inv.config, db, inv.run_id, data, est, fit, _rehearsal_note(inv.config), env,
+                                            workspace=_workspace_facts(inv, db)):
                 print(line, file=out)
             print('', file=out)
         return EXIT_DONE
@@ -1484,6 +1508,17 @@ def main(argv=None, env=None, stream=None):
         return EXIT_REFUSED
     except Exception as exc:  # noqa: BLE001 - last resort, redacted, never a traceback with values unless --verbose
         redactor = state['redactor']
+        if is_driver_error(exc):
+            # a node reset the connection (2003, 2004, 2006, 2013): one plain line, the raw error to the log file, exit 2
+            raw = 'driver error %s: %s: %s' % (driver_errno(exc), type(exc).__name__, redactor(exc))
+            log = state.get('log')
+            if log is not None:
+                log.file(raw)
+            print('INCOMPLETE: %s (driver error %s%s)' % (DRIVER_RESET_LINE, driver_errno(exc),
+                                                          '; the raw error is in the log file' if log is not None and log.path else ''), file=out)
+            if state['verbose']:
+                print(redactor(raw), file=out)
+            return EXIT_INCOMPLETE
         print('ERROR: %s: %s' % (type(exc).__name__, redactor(exc)), file=out)
         if state['verbose']:
             print(redactor(traceback.format_exc()), file=out)

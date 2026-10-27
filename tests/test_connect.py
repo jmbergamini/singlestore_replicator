@@ -12,7 +12,7 @@ from pathlib import Path
 
 from s2rebuild import sqlutil
 from s2rebuild.common import KitError
-from s2rebuild.connect import DryRunSession, Log, Redactor, Secrets, Session, read_keychain
+from s2rebuild.connect import DryRunSession, KeepAlive, Log, Redactor, Secrets, Session, is_driver_error, read_keychain
 from tests.helpers import FakeConn, config_from
 
 HOST, USER, PASSWORD, CA = 'svc-secret-host.example', 'runner_user', 'Sup3r-Secret-Pw', '/x/ca/bundle.pem'
@@ -182,6 +182,63 @@ class LogTests(unittest.TestCase):
             verbose = Log(stream=out, verbose=True)
             verbose.debug('now shown')
             self.assertIn('now shown', out.getvalue())
+
+
+
+class KeepAliveTests(unittest.TestCase):
+    def test_w8_keep_alive_sends_select_1_on_schedule_with_a_fake_clock(self):
+        """The thread opens one runner connection at its first SELECT 1 and sends one every workspace.keepalive_minutes of the
+        injected clock (a minute per reading); stop() ends it and closes the connection. A ping that fails is counted and logged,
+        never raised; run_step starts no thread for a dry run or 0 minutes."""
+        import threading
+        from s2rebuild import steps
+        ticks = [0.0]
+        lock = threading.Lock()
+
+        def clock():
+            with lock:
+                ticks[0] += 60.0
+                return ticks[0]
+        conn = FakeConn({'SELECT 1': [{'1': 1}]})
+        opens = []
+
+        def opener():
+            opens.append(1)
+            return conn
+        out = io.StringIO()
+        keepalive = KeepAlive(opener, 15, Log(stream=out), clock=clock, poll=0.001)
+        done = threading.Event()
+        original = keepalive.ping
+
+        def ping():
+            original()
+            if len(keepalive.sent) >= 2:
+                done.set()
+        keepalive.ping = ping
+        keepalive.start()
+        self.assertTrue(done.wait(5), 'two pings on the fake clock')
+        keepalive.stop()
+        self.assertEqual([sql for sql, _ in conn.statements][:2], ['SELECT 1', 'SELECT 1'])
+        self.assertEqual(len(opens), 1, 'one connection, opened at the first ping and reused')
+        self.assertGreaterEqual(keepalive.sent[1] - keepalive.sent[0], 15 * 60, 'the second ping waits the interval on the clock')
+        self.assertTrue(conn.closed, 'stop() closes the connection')
+        self.assertIn('keep-alive: SELECT 1 sent', out.getvalue())
+
+        def refuse():
+            raise RuntimeError('cannot connect to svc-secret-host.example')
+        failing = KeepAlive(refuse, 15, Log(Redactor([HOST]), stream=out), clock=clock, poll=0.001)
+        failing.ping()
+        self.assertEqual((failing.failures, failing.sent), (1, []))
+        self.assertIn('keep-alive: SELECT 1 failed (RuntimeError); the next one opens a new connection', out.getvalue())
+        self.assertNotIn(HOST, out.getvalue())
+        cfg = config_from(lambda d: d['workspace'].update(keepalive_minutes=0))
+        ctx = steps.StepContext(cfg, cfg.databases[0], None, 'run', Log(stream=out), sessions=object())
+        self.assertIsNone(steps.start_keepalive(ctx), '0 minutes disables the thread')
+        ctx = steps.StepContext(config_from(), cfg.databases[0], None, 'run', Log(stream=out), dry_run=True, sessions=object())
+        self.assertIsNone(steps.start_keepalive(ctx), 'a dry run starts none')
+        self.assertTrue(is_driver_error(RuntimeError(2013, 'Lost connection to MySQL server during query')))
+        self.assertFalse(is_driver_error(RuntimeError('lost connection before the statement ran')))
+        self.assertFalse(is_driver_error(RuntimeError(1205, 'Lock wait timeout exceeded')))
 
 
 if __name__ == '__main__':

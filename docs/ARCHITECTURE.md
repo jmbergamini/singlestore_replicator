@@ -194,6 +194,9 @@ workspace:
   port: 3306
   ca_file: certs/singlestore_bundle.pem
   compute_size: S-16                    # label stored with the baseline record
+  # id: <workspace id>                 # the owner notebook checks it; the Management API read at P2 needs it
+  # management_api_key_keychain: s2rebuild-api  # optional: P2 reads state (must be ACTIVE), auto-suspend and autoscale
+  keepalive_minutes: 15                 # SELECT 1 on its own connection every N minutes while a step runs; 0 disables
 connections:
   runner:
     user: s2rebuild_runner
@@ -236,6 +239,7 @@ copy:
   lock_retry_seconds: 120
   max_attempts: 3
   max_lock_waits: 10                    # lock waits of one chunk, then it fails with the fresh-table command
+  max_consecutive_failures: 6           # circuit breaker: chunk failures in a row, then O6 ends INCOMPLETE
   progress_seconds: 60
 verify:
   tiers: [count, newest, fingerprint]
@@ -340,6 +344,10 @@ Load, validate and default the YAML. Expose `Config`, `DatabaseSpec`, `Window`. 
 
 `Secrets` reads passwords from Keychain or env; `Redactor` masks values in text; `connect(profile)` returns a PyMySQL connection with TLS (CA verified), autocommit, long read timeout, DictCursor. `Session` wraps a connection with the write guard for the active step (section 10.4).
 
+`KeepAlive` is the kit's own keep-alive: while a step runs (`steps.run_step` starts it before the handler and stops it at the end), a daemon thread sends `SELECT 1` on its own runner connection every `workspace.keepalive_minutes` (default 15; 0 disables), behind a read guard, so auto-suspend sees activity during a long statement or a wait (fact 41). The connection opens at the first ping, so a short step opens none; a ping that fails is logged and the next one opens a new connection. Nothing runs between commands: the plan (P4) records whether auto-suspend is off for the window or a notebook job of the customer runs the same query.
+
+`is_driver_error` names a connection reset: driver errors 2003 (unreachable), 2004 (no socket), 2006 (gone away) and 2013 (lost during a statement). A step that ends in one is recorded failed with `interrupted_note` as before; the command line then prints one plain line ("a node reset the connection; the workspace may be scaling or restarting; rerun the step") and exits 2, and the raw error, redacted, goes to the log file only (`Log.file`).
+
 ### 10.3 journal.py
 
 The schema in section 9 plus migrations keyed by a `schema_version` row (version 1 from the reference runner, version 2 for the re-copy epoch, 3 for the branch records, 4 for the sampling columns). All writes go through one lock. `init_plan`, `check_plan`, chunk state transitions, step transitions, verification rows, attachment rows.
@@ -435,6 +443,8 @@ Changes:
 - Scheduler: a queue per table; a worker takes the next chunk from the first table whose in-flight count is below its limit. `table_concurrency: auto` allows parallel chunks per table, at most half the workers when there are more than 8 (so the rest copy the next tables), and sets the limit to 1 for a table after its first lock wait (error 1205); per-table `concurrency` in config overrides.
 - Lock probe before a chunk on a table that had a lock wait: the reconciliation DELETE runs with `lock_wait_timeout = lock_probe_timeout_seconds`; 1205 means still locked, the chunk is parked for `lock_retry_seconds` and other tables continue.
 - Lock wait cap: the `max_lock_waits`-th lock wait of one chunk in a run fails the chunk as an attempt. Its error and the O6 note name `s2rebuild step O6 --fresh-table <t>`, so a lock that never clears ends O6 INCOMPLETE on its own.
+- Error 1997 ("transaction was already in its commit phase", a node replaced under the chunk by autoscale, fact 40) is a transient: the chunk is marked failed, so its rows are reconciled by the DELETE before the re-insert, and goes to the back of its table's queue without consuming an attempt (`Runner.requeue_transient`, journal event `transient`).
+- Circuit breaker: `copy.max_consecutive_failures` (default 6) chunk failures with no success between them (1997 counted, lock waits not) stop new chunks; the running ones finish, the log and the journal (event `breaker`) carry "chunks are failing in a row; nodes may be restarting, see MV_EVENTS; rerun with --retry-failed when the workspace is steady", and O6 ends INCOMPLETE (exit 2) with that note.
 - Interrupt: the first Ctrl-C stops new chunks while the running ones finish. A later Ctrl-C prints that a hard stop needs kill and that the leaf lock then holds 15 to 20 minutes; the wait goes on, so no worker dies mid INSERT and O6 ends recorded.
 - Copy lock: `<journal>.lock`, an exclusive file lock that carries the holder's pid and purpose. O6 takes it, an O7 re-copy round takes it from its mark through its copy, `mark-recopy` takes it before it checks any journal, and O10 takes it from S0 through S3. A held lock refuses with the holder named. The lock goes with its process, so a holder that died blocks nothing.
 - Reference tables (`CREATE REFERENCE TABLE` in the captured definition): Helios runs an INSERT into a reference table on the master aggregator, where a READ ONLY source has no master instance (error 1777). Each chunk of a reference table runs `CREATE TABLE <replacement>.<t>__stage (<the copy columns from the definition, no keys>)`, `INSERT INTO <t>__stage SELECT ... FROM <source>.<t> WHERE <predicate>`, `INSERT INTO <replacement>.<t> SELECT ... FROM <t>__stage`, `DROP TABLE <t>__stage` (also after a failure), and refuses when the two row counts differ. A staging table left by an interrupted attempt is dropped first. The stage name must be at most 64 characters and not a planned table.
@@ -632,6 +642,10 @@ Routines are part of the database: functions, table-valued functions (a FUNCTION
 
 To be observed on the live ladder (I2): the ROUTINE_TYPE value Helios gives a table-valued function and whether aggregates appear in ROUTINES (the kit tells a TVF by RETURNS TABLE in its text and takes SHOW AGGREGATES as the authority); whether SHOW CREATE PROCEDURE and SHOW CREATE FUNCTION carry a DEFINER clause (the kit reads the clause first, else the ROUTINES column); the error number of a missing function in CREATE AGGREGATE and of a missing INTO PROCEDURE target (the fake answers 1305); whether procedures resolve their table names at CREATE (the fake refuses a missing table or view with 1146).
 
+### 10.23 workspace.py (P2, O1)
+
+The Management API client over urllib (no new dependency). With `workspace.management_api_key_keychain` set, P2 reads the key from the Keychain (it joins the log redactor), calls `GET /v1/workspaces/<workspace.id>` with it as a bearer token and records the state, the autoscale setting and the auto-suspend setting in the preflight record: the state must be ACTIVE or P2 fails; the plan sheet prints the three; O1 refuses while autoscale is on unless `--accept-autoscale NOTE`, recorded as an event. The field names (`state`, `autoSuspend`, `autoScale`) are a best guess the live ladder confirms (fact 41); the raw fields are recorded so a wrong guess is visible. Without a key P2 prints three questions (ACTIVE, autoscale off, auto-suspend off or a keep-alive job) and O1 records the operator's answer from `--workspace NOTE` as evidence of the go. Tests pass a fake transport; nothing reaches the network.
+
 ## 11. Helios facts the code relies on
 
 Verified on the reference run or in the documentation. `docs/LESSONS.md` carries the same list in plain words.
@@ -675,6 +689,8 @@ Verified on the reference run or in the documentation. `docs/LESSONS.md` carries
 37. Engine 10.8.0: the runner sees no routine in `information_schema.ROUTINES` (fact 21) and no other account's grants, so `routines.capture` and the write-capable account list read through the owner session only: ROUTINES with DEFINER, `SHOW AGGREGATES` in the database, and `SHOW CREATE FUNCTION`, `SHOW CREATE AGGREGATE` or `SHOW CREATE PROCEDURE` per routine. P2 without the owner profile prints "routines: not visible to the runner; owner profile needed" and never "none". The replacement gets the routines in dependency order (`routines.O5_KINDS` after the tables, `routines.O7_KINDS` after the views), and the S3 count is the ROUTINES number the O7 gate recorded (`routines.ROUTINE_COUNT_META`). The test fake lists ROUTINES to the admin only.
 38. Engine 10.8.0, Portal, October 27: the Portal may show 0 rows for the tables of a READ ONLY attachment (the frozen source). The kit's own counts in the journal and the O4 capture are the reference; `freeze.finish_freeze` logs `PORTAL_ROWS_NOTE` after the probe. On Path A the O4 capture records `PIPELINES_READ_ONLY_NOTE` instead of listing `PIPELINES` (empty there, fact 23), `inventory.pipeline_drift` compares nothing and the drift report carries the note; O9 replays the O2 capture.
 39. Engine 10.8.0, tpcds3tb, October 27: a sampled fingerprint with `CRC32(key) MOD 100 < p` reads every row, so a 5 percent sample cost as much as a full fingerprint, and one session fingerprinted one side of one table at a time. Tier 3 samples a contiguous range on the first sort key column or the time column (`MIN` and `MAX` from the source, the same predicate on both sides), so segment elimination skips the rest, and runs on `verify.sessions` connections, largest table first with its two sides at once (`Verifier.tier3_all`); `--yes` accepts the recorded result without a rerun when no chunk was copied since (`verify.recorded_state`).
+40. Helios, run 20261026-1301, October 26: autoscale replaces nodes one at a time (MV_EVENTS: SYSTEM_VAR_CHANGED, NEW_MASTER_AGGREGATOR, NODE_DETACHED, NODE_OFFLINE per leaf) and every chunk in flight fails with error 1997 "transaction was already in its commit phase"; 28 chunks were lost that way, and P3 once failed at a connection reset while the workspace was scaling. Run with autoscale off: P2 reads the setting through the Management API when a key is configured and O1 refuses while it is on (`--accept-autoscale NOTE` overrides, recorded). The copy treats 1997 as a transient (`copy.is_commit_phase`: reconciled and requeued without an attempt), `copy.max_consecutive_failures` failures in a row trip the breaker and end O6 INCOMPLETE, and a driver reset (2003, 2004, 2006, 2013) ends a command with one plain line and exit 2.
+41. Helios, October 25: auto-suspend counts queries from connections as activity, not load batches; a workspace suspended while loads ran with no connection open. The kit's own keep-alive (`connect.KeepAlive`) sends `SELECT 1` on its own runner connection every `workspace.keepalive_minutes` while a step runs; between commands the plan (P4) records that auto-suspend is off for the window, or that a notebook job of the customer runs the same query every 15 minutes. The Management API field names the kit reads for the workspace (`GET /v1/workspaces/<id>`: `state`, `autoSuspend`, `autoScale`) are a best guess to confirm in the live ladder (I4); P2 records the raw fields, so a wrong name shows as "not reported" in the journal and on the plan sheet.
 
 ## 12. Documentation and branding
 

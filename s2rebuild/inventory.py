@@ -924,8 +924,23 @@ def preflight(runner, db, config, owner=None):
     return ok, lines, facts
 
 
+def workspace_check(ctx):
+    """The workspace part of P2: (ok, lines, facts) through the Management API when a key is configured, else the three questions.
+
+    With workspace.management_api_key_keychain set, the state must be ACTIVE (workspace.preflight_lines);
+    the facts go into the preflight record for the plan sheet and the O1 guard. Without a key the
+    lines are the questions O1 records the answer to. Reads the API only; no statement.
+    """
+    from . import workspace
+    if not workspace.api_configured(ctx.config):
+        return True, workspace.question_lines(), {'source': 'questions'}
+    facts = workspace.read_workspace(ctx.config, keychain=getattr(ctx.sessions, 'keychain', None), redactor=ctx.log.redactor)
+    lines = workspace.preflight_lines(facts)
+    return facts.get('state') == workspace.ACTIVE, lines, facts
+
+
 def handle_p2(step, ctx):
-    """P2 handler (also behind s2rebuild check): the preflight checks, the source STORAGE_ID recorded in the journal.
+    """P2 handler (also behind s2rebuild check): the preflight checks, the workspace state and settings, the source record in the journal.
 
     Refuses Path B with more than one configured database (steps.path_b_single_database) before any connection.
     """
@@ -952,6 +967,9 @@ def handle_p2(step, ctx):
         runner.close()
         if owner is not None:
             owner.close()
+    workspace_ok, workspace_lines, facts['workspace'] = workspace_check(ctx)
+    ok = ok and workspace_ok
+    lines.extend(workspace_lines)
     for line in lines:
         ctx.log('    ' + line)
     att = facts.get('source_attachment')
