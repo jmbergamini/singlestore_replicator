@@ -98,6 +98,21 @@ class ModelTests(unittest.TestCase):
         self.assertAlmostEqual(E.table_worker_seconds(b, 10_000_000, 2), 2 * (2 + 0.762 + 14.75), places=6)
         self.assertAlmostEqual(E.table_worker_seconds(E.Baseline(1e-6, 1e-6, 0), 1000, 4), 4 * (0.001 + 0.00025), places=9)
 
+    def test_w4_a_reference_table_is_one_chunk_at_the_insert_rate_twice(self):
+        """A reference table copies through a staging table: one chunk, the source scanned once, the rows inserted twice."""
+        b = E.Baseline(scan_s_per_row=1e-6, insert_s_per_row=1e-3, chunk_overhead_s=2.0)
+        self.assertAlmostEqual(E.reference_seconds(b, 1000), 2.0 + 0.001 + 2.0, places=9)
+        plans = [Plan('ref', 1000, 1, reference=True), Plan('plain', 1000, 1, reference=False)]
+        schedule = E.simulate(plans, 1, b)
+        start, end, worker = schedule.per_table['ref']
+        self.assertAlmostEqual(worker, 4.001, places=6)
+        self.assertGreater(worker, schedule.per_table['plain'][2], 'the second insert costs more than the direct path')
+        self.assertAlmostEqual(schedule.per_table['plain'][2], 3.001, places=6)
+        self.assertAlmostEqual(schedule.worker_seconds, 7.002, places=6)
+        forced = E.simulate_rows([(1000, 4, True)], 1, b, names=['ref'])
+        self.assertAlmostEqual(forced.worker_seconds, 4.001, places=6, msg='a reference job is one chunk whatever its bucket count')
+        self.assertAlmostEqual(E.simulate([Plan('legacy', 1000, 1)], 1, b).worker_seconds, 3.001, places=6, msg='a plan without the flag is direct')
+
     def test_schedule_respects_workers_and_limits(self):
         b = E.Baseline(scan_s_per_row=0.0, insert_s_per_row=1e-3, chunk_overhead_s=0.0)
         plans = [Plan('big', 4000, 4), Plan('small', 1000, 1)]

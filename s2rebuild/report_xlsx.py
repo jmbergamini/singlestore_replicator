@@ -168,6 +168,7 @@ def summary_rows(inventory, plans, est, fit, config, db, run_id, baseline, steps
     counters = [p.name for p in plans if _auto(inventory, p.name)]
     computed = [p.name for p in plans if p.computed_columns]
     rows.extend([('Tables with AUTO_INCREMENT counters', ', '.join(counters) or 'none'),
+                 ('Reference tables (copied through a staging table, counted exactly)', ', '.join(p.name for p in plans if getattr(p, 'reference', False)) or 'none'),
                  ('Tables with computed columns', ', '.join(computed) or 'none'),
                  ('Tables without a time column (count only at tier 2)', ', '.join(p.name for p in plans if not p.time_column) or 'none'),
                  ('Tables with unique-key lock risk', ', '.join(p.name for p in plans if p.unique_key_lock_risk) or 'none'),
@@ -204,12 +205,21 @@ def _auto(inventory, name):
     return None
 
 
+REFERENCE_TEXT = 'reference table, copied through a staging table'
+
+
+def copy_path_text(plan):
+    """The Copy path row of a table tab: the staging path for a reference table, else INSERT ... SELECT by bucket."""
+    return REFERENCE_TEXT if getattr(plan, 'reference', False) else 'INSERT ... SELECT by hash bucket'
+
+
 def table_rows(table, plan, est):
     """The (label, value) rows of one table tab's top block."""
     low, expected, high = est.table_minutes(plan.name) if est is not None else (None, None, None)
     primary, unique, shard, sort, other = _key_lists(table)
     auto = table.get('auto_increment') or {}
-    rows = [('Table', plan.name), ('Storage type', table.get('storage_type') or 'unknown'), ('Key kind', plan.key_kind),
+    rows = [('Table', plan.name), ('Storage type', table.get('storage_type') or 'unknown'), ('Copy path', copy_path_text(plan)),
+            ('Key kind', plan.key_kind),
             ('Key columns', ','.join(plan.key_columns) or '(all columns, COALESCE)'), ('Column count', len(plan.columns)),
             ('Rows estimated', plan.est_rows), ('Rows exact', table.get('exact_rows')), ('Size GiB', None if plan.size_gib is None else round(plan.size_gib, 3)),
             (None, None), ('Estimate', None),
@@ -224,6 +234,8 @@ def table_rows(table, plan, est):
             ('Computed columns', ', '.join(plan.computed_columns) or 'none'),
             (None, None), ('Callouts', None)]
     callouts = []
+    if getattr(plan, 'reference', False):
+        callouts.append(REFERENCE_TEXT + ': the row count is an exact COUNT(*), TABLE_STATISTICS reports none')
     if plan.unique_key_lock_risk:
         callouts.append('unique varchar key: chunks on this table may collide on a leaf lock; serialized after the first lock wait')
     if plan.key_kind == 'row':
@@ -485,7 +497,8 @@ def final_table_rows(table, plan, journal, per_table):
         if any(x['detail'] == r['detail'] for x in t2):
             break
         t2.insert(0, r)
-    rows = [('Table', plan.name), ('Storage type', table.get('storage_type') or 'unknown'), ('Key kind', plan.key_kind),
+    rows = [('Table', plan.name), ('Storage type', table.get('storage_type') or 'unknown'), ('Copy path', copy_path_text(plan)),
+            ('Key kind', plan.key_kind),
             ('Key columns', ','.join(plan.key_columns) or '(all columns, COALESCE)'), ('Column count', len(plan.columns)),
             ('Rows source', jt.get('source_count')), ('Rows target', jt.get('target_count')),
             ('Rows match', 'yes' if jt.get('source_count') is not None and jt.get('source_count') == jt.get('target_count') else ('no' if jt.get('source_count') is not None else 'not counted')),

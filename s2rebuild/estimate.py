@@ -3,7 +3,9 @@
 Author: John Bergamini
 
 Section 10.6 of the architecture. The model per chunk of a table with N rows in B buckets is
-chunk_seconds = chunk_overhead_s + scan_s_per_row * N + insert_s_per_row * N / B. The default
+chunk_seconds = chunk_overhead_s + scan_s_per_row * N + insert_s_per_row * N / B. A reference
+table is one bucket through a staging table, so its rows are inserted twice at the insert rate:
+reference_seconds = chunk_overhead_s + scan_s_per_row * N + 2 * insert_s_per_row * N. The default
 constants come from the reference run (4 workers, S-16 compute at 2x) and calibrate refits
 them from a journal. Statements issued: none (calibrate reads a journal file with sqlite3,
 read-only).
@@ -116,6 +118,15 @@ def chunk_seconds(baseline, rows, buckets):
     return baseline.chunk_overhead_s + baseline.scan_s_per_row * rows + baseline.insert_s_per_row * rows / float(buckets)
 
 
+def reference_seconds(baseline, rows):
+    """Modeled seconds for a reference table: one scan of the source and two inserts at the insert rate.
+
+    The copy stages the rows in a sharded staging table and inserts them again into the reference
+    table (copy.Runner.copy_reference), so the rows pass the insert rate twice in one bucket.
+    """
+    return baseline.chunk_overhead_s + baseline.scan_s_per_row * rows + 2.0 * baseline.insert_s_per_row * rows
+
+
 def table_worker_seconds(baseline, rows, buckets):
     """Modeled worker seconds for a whole table: buckets times the chunk time."""
     return buckets * chunk_seconds(baseline, rows, buckets)
@@ -139,7 +150,8 @@ class Schedule:
 def simulate_rows(jobs, workers, baseline, limits=None, names=None):
     """List scheduling of (rows, buckets) jobs over workers with per-table concurrency limits.
 
-    jobs: list of (rows, buckets); names: optional table names in the same order (index when
+    jobs: list of (rows, buckets) or (rows, buckets, reference), a reference table being one
+    chunk at reference_seconds; names: optional table names in the same order (index when
     absent); limits: {name: max in-flight chunks}, else common.auto_table_limit(workers), as
     the copy does under table_concurrency auto. Chunks are offered in table order (largest
     table first, as the caller sorted them), each chunk taking its modeled seconds. A worker
@@ -150,9 +162,11 @@ def simulate_rows(jobs, workers, baseline, limits=None, names=None):
     limits = dict(limits or {})
     default_limit = auto_table_limit(workers)
     queue = []
-    for name, (rows, buckets) in zip(names, jobs):
-        seconds = chunk_seconds(baseline, rows, buckets)
-        for b in range(int(buckets)):
+    for name, job in zip(names, jobs):
+        rows, buckets = job[0], job[1]
+        reference = len(job) > 2 and bool(job[2])
+        seconds = reference_seconds(baseline, rows) if reference else chunk_seconds(baseline, rows, buckets)
+        for b in range(1 if reference else int(buckets)):
             queue.append((name, b, seconds))
     per_table = {name: [None, 0.0, 0.0] for name in names}
     in_flight = {name: 0 for name in names}
@@ -193,8 +207,8 @@ def simulate_rows(jobs, workers, baseline, limits=None, names=None):
 
 
 def simulate(plans, workers, baseline):
-    """Simulate the copy of TablePlan objects (name, est_rows, n_buckets, concurrency)."""
-    jobs = [(p.est_rows, p.n_buckets) for p in plans]
+    """Simulate the copy of TablePlan objects (name, est_rows, n_buckets, concurrency, reference)."""
+    jobs = [(p.est_rows, p.n_buckets, getattr(p, 'reference', False)) for p in plans]
     limits = {p.name: getattr(p, 'concurrency', None) for p in plans if getattr(p, 'concurrency', None)}
     return simulate_rows(jobs, workers, baseline, limits, names=[p.name for p in plans])
 

@@ -588,6 +588,26 @@ class ReferenceTableTests(unittest.TestCase):
         with self.assertRaisesRegex(KitError, 'no definition line for c'):
             C.stage_columns(broken)
 
+    def test_w4_the_capture_on_the_fake_counts_the_reference_table_exactly(self):
+        """The fake's TABLE_STATISTICS has no row for t_ref (fact 36); the capture through the runner session takes COUNT(*) and the
+        plan built from it is one bucket on the staging path, which O6 then copies."""
+        from s2rebuild.sqlutil import read_guard
+        h = ref_harness(self)
+        session = h.ctx().runner_session(read_guard('runner P3'))
+        try:
+            inv = I.capture(session, h.db, h.config, None, log=lambda line: None, sleep=lambda s: None)
+        finally:
+            session.close()
+        by_name = {t['name']: t for t in inv['tables']}
+        self.assertEqual((by_name['t_ref']['reference'], by_name['t_ref']['est_rows'], by_name['t_ref']['exact_rows']), (True, 7, 7))
+        self.assertEqual((by_name['t_single']['reference'], by_name['t_single']['est_rows'], by_name['t_single']['exact_rows']), (False, 700, None))
+        statistics = [s for s, _ in h.fake.statements if 'TABLE_STATISTICS' in s and 'SUM(ROWS)' in s]
+        self.assertEqual(len(statistics), 1, 'the estimate query ran once and answered nothing for t_ref')
+        plans = {p.name: p for p in I.plan_tables(inv, h.config, h.db)}
+        self.assertEqual((plans['t_ref'].n_buckets, plans['t_ref'].copy_path), (1, 'staging'))
+        self.assertEqual(h.step('O6').status, steps.PASSED, h.text())
+        self.assertEqual(multiset(h.fake.rows(TGT, 't_ref')), multiset(h.fake.rows(SRC, 't_ref')))
+
 
 FORMATS = {
     # name: (create text, reference): every table format Helios writes in SHOW CREATE TABLE

@@ -7,6 +7,9 @@ information_schema views, SHOW CREATE TABLE, SHOW CREATE VIEW and, with the owne
 SHOW CREATE PIPELINE ... EXTENDED. Nothing else. Files that hold definitions are written with
 mode 0600 and the CREDENTIALS clause of a pipeline is replaced by a placeholder before it is
 written. The copy plan (TablePlan, hash buckets) built here is what copy.py executes.
+A reference table (CREATE [ROWSTORE] REFERENCE TABLE in its definition) is recorded with
+reference true and an exact COUNT(*) at P3 and O4, because TABLE_STATISTICS reports no rows for
+it (Helios fact 36); its plan is one bucket through the staging path of copy.py.
 Routines are captured by name and type only and are not migrated in this pass: P2, P3 and O4
 refuse while objects.routines.ignore does not list one, or a procedure a pipeline loads into.
 """
@@ -37,6 +40,9 @@ _AUTO_INCREMENT_OPTION = re.compile(r'\bAUTO_INCREMENT=(\d+)')
 _DEFINER = re.compile(r'DEFINER=(`[^`]*`@`[^`]*`)')
 _VARCHAR = re.compile(r'(?:var)?char\((\d+)\)', re.I)
 _REFERENCE = re.compile(r'\s*CREATE\s+(?:ROWSTORE\s+)?REFERENCE\s+TABLE\b', re.I)
+_ROWSTORE = re.compile(r'\s*CREATE\s+ROWSTORE\s+(?:REFERENCE\s+)?TABLE\b', re.I)
+COPY_PATH_STAGING = 'staging'
+COPY_PATH_DIRECT = 'direct'
 _CREDENTIALS = re.compile(r"""(CREDENTIALS\s+)(?:'(?:[^'\\]|\\.|'')*'|"(?:[^"\\]|\\.|"")*")""", re.I)
 _CREDENTIALS_TOKEN = re.compile(r'(CREDENTIALS\s+)<[^<>]*REDACTED[^<>]*>', re.I)
 _CREDENTIALS_CLAUSE = re.compile(r"""\bCREDENTIALS\s*(?:['"]|<(?!-))""", re.I)
@@ -138,11 +144,21 @@ def normalize_definition(sql):
 
 
 def storage_type(definition):
-    """columnstore when the definition carries a SORT KEY or a clustered columnstore index, else rowstore."""
+    """The storage kind of a CREATE TABLE text: rowstore when its CREATE line says ROWSTORE, columnstore when it
+    carries a SORT KEY or a clustered columnstore index, else rowstore; None for an empty text."""
     text = str(definition or '').upper()
+    if not text:
+        return None
+    if _ROWSTORE.match(text):
+        return 'rowstore'
     if 'SORT KEY' in text or 'CLUSTERED COLUMNSTORE' in text:
         return 'columnstore'
-    return 'rowstore' if text else None
+    return 'rowstore'
+
+
+def is_reference(definition):
+    """True for a CREATE [ROWSTORE] REFERENCE TABLE text (a full copy on every node)."""
+    return bool(_REFERENCE.match(str(definition or '')))
 
 
 def view_definer(definition):
@@ -378,15 +394,20 @@ def capture(session, db, config, owner_session=None, exact_counts=False, log=Non
         definition = str(row.get('Create Table') or list(row.values())[1])
         cols = columns.get(obj, [])
         auto = next((c['name'] for c in cols if 'auto_increment' in str(c['extra']).lower()), None)
+        reference = is_reference(definition)
         exact = None
-        if exact_counts:
+        if exact_counts or reference:
+            # TABLE_STATISTICS reports no rows for a reference table (fact 36), so its count is always exact
             count_rows = session.query('SELECT COUNT(*) AS n FROM ' + qualified(name, obj))
             exact = _int(count_rows[0]['n']) if count_rows else None
+            if reference and exact is None:
+                raise KitError('Reference table %s: COUNT(*) returned no row, so its plan would have no row count; '
+                               'check that the runner can read it and capture again' % obj)
         tables.append({
             'name': obj, 'columns': cols, 'keys': keys.get(obj, []), 'definition': definition,
-            'storage_type': storage_type(definition),
+            'storage_type': storage_type(definition), 'reference': reference,
             'auto_increment': {'column': auto, 'counter': auto_increment_counter(definition)} if auto else None,
-            'est_rows': estimates.get(obj, 0), 'exact_rows': exact, 'size_gib': sizes.get(obj),
+            'est_rows': exact if reference else estimates.get(obj, 0), 'exact_rows': exact, 'size_gib': sizes.get(obj),
             'computed_columns': [c['name'] for c in cols if c['generation_expression']],
         })
     inventory = {
@@ -404,8 +425,9 @@ def capture(session, db, config, owner_session=None, exact_counts=False, log=Non
         inventory['pipelines'] = {'captured': False, 'items': [],
                                   'note': 'pipelines not captured: no owner profile; the O9 gate cannot pass without a capture'}
     if log is not None:
-        log('inventory of %s: %d tables, %d views, %d routines, %d write-capable accounts, %s' % (
-            name, len(tables), len(views), len(routines), len(inventory['accounts']), inventory['pipelines']['note']))
+        log('inventory of %s: %d tables (%d reference, counted exactly), %d views, %d routines, %d write-capable accounts, %s' % (
+            name, len(tables), sum(1 for t in tables if t['reference']), len(views), len(routines), len(inventory['accounts']),
+            inventory['pipelines']['note']))
     return inventory
 
 
@@ -477,12 +499,14 @@ def write(inventory, directory, plans=None):
     by_name = {p.name: p for p in plans}
     with (directory / TABLES_CSV).open('w', newline='', encoding='utf8') as fh:
         w = csv.writer(fh)
-        w.writerow(['database', 'table_name', 'estimated_rows', 'exact_rows', 'size_gib', 'storage_type', 'key_kind', 'key_columns',
-                    'buckets', 'time_column', 'unique_key_lock_risk', 'auto_increment_column', 'computed_columns'])
+        w.writerow(['database', 'table_name', 'estimated_rows', 'exact_rows', 'size_gib', 'storage_type', 'reference', 'copy_path',
+                    'key_kind', 'key_columns', 'buckets', 'time_column', 'unique_key_lock_risk', 'auto_increment_column', 'computed_columns'])
         for t in inventory['tables']:
             p = by_name.get(t['name'])
+            reference = bool(t.get('reference', is_reference(t.get('definition'))))
             w.writerow([inventory['database'], t['name'], t['est_rows'], '' if t['exact_rows'] is None else t['exact_rows'],
                         '' if t['size_gib'] is None else round(t['size_gib'], 3), t.get('storage_type') or '',
+                        1 if reference else 0, COPY_PATH_STAGING if reference else COPY_PATH_DIRECT,
                         p.key_kind if p else '', ','.join(p.key_columns) if p else '', p.n_buckets if p else '',
                         (p.time_column or '') if p else '', (1 if p.unique_key_lock_risk else 0) if p else '',
                         (t['auto_increment'] or {}).get('column') or '', ','.join(t.get('computed_columns') or [])])
@@ -550,9 +574,15 @@ class TablePlan:
         """True for a REFERENCE table (a full copy on every node), read from the captured definition.
 
         Helios runs an INSERT into a reference table on the master aggregator, which cannot read a
-        READ ONLY source, so the copy stages its rows first (copy.Runner.copy_reference).
+        READ ONLY source, so the copy stages its rows first (copy.Runner.copy_reference). The plan
+        gives it one bucket, and its row count is the exact count the capture took (fact 36).
         """
-        return bool(_REFERENCE.match(self.definition or ''))
+        return is_reference(self.definition)
+
+    @property
+    def copy_path(self):
+        """'staging' for a reference table (through a sharded staging table), 'direct' for INSERT ... SELECT by bucket."""
+        return COPY_PATH_STAGING if self.reference else COPY_PATH_DIRECT
 
     @property
     def key_expr(self):
@@ -579,7 +609,7 @@ class TablePlan:
                 'key_columns': self.key_columns, 'key_expr': self.key_expr, 'column_count': len(self.columns),
                 'time_column': self.time_column, 'unique_key_lock_risk': self.unique_key_lock_risk,
                 'concurrency': self.concurrency, 'size_gib': self.size_gib, 'chunk_rows': self.chunk_rows,
-                'computed_columns': self.computed_columns}
+                'computed_columns': self.computed_columns, 'reference': self.reference, 'copy_path': self.copy_path}
 
 
 def buckets_for(est_rows, chunk_rows, min_rows_for_chunking, max_buckets_per_table):
@@ -647,9 +677,11 @@ def plan_tables(inventory, config, db):
         key_kind, key_columns = choose_key(t)
         columns = [c['name'] for c in t['columns'] if not c.get('generation_expression')]
         concurrency = override.concurrency if override.concurrency is not None else (1 if config.copy.table_concurrency == 1 else None)
+        # a reference table is one bucket through the staging path, whatever its count: one staging table, two inserts
+        n_buckets = 1 if is_reference(t['definition']) else buckets_for(
+            t['est_rows'], chunk_rows, config.copy.min_rows_for_chunking, config.copy.max_buckets_per_table)
         plans.append(TablePlan(
-            t['name'], columns, t['est_rows'], key_kind, key_columns, t['definition'],
-            buckets_for(t['est_rows'], chunk_rows, config.copy.min_rows_for_chunking, config.copy.max_buckets_per_table),
+            t['name'], columns, t['est_rows'], key_kind, key_columns, t['definition'], n_buckets,
             time_column=time_column_for(t, db.time_column_candidates), unique_key_lock_risk=lock_risk(t, key_columns),
             concurrency=concurrency, size_gib=t.get('size_gib'), chunk_rows=chunk_rows,
             computed_columns=t.get('computed_columns') or []))
@@ -663,10 +695,11 @@ def plan_tables(inventory, config, db):
 def plan_summary(plans):
     """Totals: tables, buckets, estimated rows and the statement counts the copy will issue."""
     buckets = sum(p.n_buckets for p in plans)
+    reference = sum(1 for p in plans if p.reference)
     return {'tables': len(plans), 'buckets': buckets, 'estimated_rows': sum(p.est_rows for p in plans),
-            'size_gib': round(sum(p.size_gib or 0.0 for p in plans), 3),
+            'size_gib': round(sum(p.size_gib or 0.0 for p in plans), 3), 'reference_tables': reference,
             'statements': {'create_database': 1, 'create_table_like': len(plans), 'show_create_table': len(plans),
-                           'insert_select': buckets}}
+                           'insert_select': buckets, 'staging_tables': reference}}
 
 
 # ---------------------------------------------------------------------------

@@ -953,7 +953,9 @@ class FakeCursor:
                                       'INDEX_TYPE': 'HASH'})
             return True
         if s.startswith('SELECT TABLE_NAME, SUM(ROWS) AS estimated_rows FROM information_schema.TABLE_STATISTICS'):
-            self.rows = [{'TABLE_NAME': t, 'estimated_rows': len(spec['rows'])} for t, spec in sorted((d['tables'] if d else {}).items())]
+            # Helios fact 36: TABLE_STATISTICS reports no rows for a reference table; the capture counts it with COUNT(*)
+            self.rows = [{'TABLE_NAME': t, 'estimated_rows': len(spec['rows'])} for t, spec in sorted((d['tables'] if d else {}).items())
+                         if not REFERENCE_CREATE.match(spec['create'])]
             return True
         if s.startswith('SELECT f.TABLE_NAME, SUM(f.SIZE)'):
             self.rows = []

@@ -106,6 +106,7 @@ After a run the workspace holds two databases: the live database under the live 
 
 - [docs/STEPS.md](docs/STEPS.md): every step in full.
 - [docs/CONFIG.md](docs/CONFIG.md): every key, flag, variable and exit code.
+- [docs/COVERAGE.md](docs/COVERAGE.md): the coverage grid, what the kit migrates and what it does not.
 - [docs/CODE-GUIDE.md](docs/CODE-GUIDE.md): modules, data flow, decisions you can change.
 - [docs/LESSONS.md](docs/LESSONS.md): Helios facts and run lessons.
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): the design.

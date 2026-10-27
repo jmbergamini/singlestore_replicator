@@ -145,6 +145,37 @@ class WorkbookTests(unittest.TestCase):
             self.assertEqual(wb['Pipelines'].cell(row=2, column=1).value, 'pipelines not captured: no owner profile')
             self.assertEqual(wb['Pipeline offsets'].cell(row=2, column=1).value, 'none captured')
 
+    def test_w4_the_table_tab_of_a_reference_table_says_staging_and_the_summary_lists_it(self):
+        """A reference table in the capture: the table tab's Copy path row and callout say it is copied through a staging table, the
+        profile Summary names it, its estimate is above zero, and a direct table says INSERT ... SELECT."""
+        cfg = config_from()
+        db = cfg.databases[0]
+        inv = I.load(FIXTURE_INVENTORY)
+        inv['tables'].append({
+            'name': 'regions', 'columns': [{'name': 'code', 'ordinal': 1, 'data_type': 'varchar', 'column_type': 'varchar(8)', 'nullable': False,
+                                           'default': None, 'extra': '', 'generation_expression': ''}],
+            'keys': [{'name': 'PRIMARY', 'unique': True, 'type': 'COLUMNSTORE HASH', 'columns': ['code']}],
+            'definition': 'CREATE REFERENCE TABLE `regions` (\n  `code` varchar(8) NOT NULL,\n  PRIMARY KEY (`code`),\n  SORT KEY (`code`)\n)',
+            'storage_type': 'columnstore', 'reference': True, 'auto_increment': None, 'est_rows': 6_000_000, 'exact_rows': 6_000_000,
+            'size_gib': 0.4, 'computed_columns': []})
+        plans = I.plan_tables(inv, cfg, db)
+        est = E.estimate(plans, cfg, E.DEFAULT_BASELINE)
+        self.assertGreater(est.schedule.per_table['regions'][2], 0.0)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = R.write_profile_workbook(Path(tmp) / 'p.xlsx', inv, plans, est, None, cfg, db, 'r', E.DEFAULT_BASELINE)
+            wb = load_workbook(str(path))
+            regions = {r[0].value: r[1].value for r in wb['regions'].iter_rows(min_col=1, max_col=2) if r[0].value}
+            self.assertEqual(regions['Copy path'], 'reference table, copied through a staging table')
+            self.assertEqual((regions['Buckets'], regions['Rows exact']), (1, 6_000_000), 'one bucket although 6 M rows would chunk')
+            self.assertGreater(regions['Minutes expected'], 0.0)
+            callouts = ' '.join(str(c.value) for c in wb['regions']['B'] if c.value)
+            self.assertIn('reference table, copied through a staging table: the row count is an exact COUNT(*)', callouts)
+            orders = {r[0].value: r[1].value for r in wb['orders'].iter_rows(min_col=1, max_col=2) if r[0].value}
+            self.assertEqual(orders['Copy path'], 'INSERT ... SELECT by hash bucket')
+            summary = {str(r[0].value): r[1].value for r in wb['Summary'].iter_rows(min_col=1, max_col=2) if r[0].value}
+            self.assertEqual(summary['Reference tables (copied through a staging table, counted exactly)'], 'regions')
+            self.assertEqual(summary['Tables'], 7)
+
     def test_final_summary_without_a_window(self):
         """A run whose O1 recorded no window shows 'none configured' and no deadline in the final workbook."""
         from s2rebuild.journal import MEMORY, Journal

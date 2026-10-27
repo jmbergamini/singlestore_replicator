@@ -93,6 +93,29 @@ def canned_answers():
     }
 
 
+REF_DEFINITION = 'CREATE REFERENCE TABLE `t_ref` (\n  `code` varchar(8) NOT NULL,\n  `label` varchar(40) DEFAULT NULL,\n  PRIMARY KEY (`code`),\n  SORT KEY (`code`)\n)'
+
+
+def reference_answers(count_rows):
+    """The canned answers plus the reference table t_ref: no TABLE_STATISTICS row (fact 36), COUNT(*) answering count_rows."""
+    answers = canned_answers()
+    answers['SELECT TABLE_NAME, TABLE_TYPE'] = answers['SELECT TABLE_NAME, TABLE_TYPE'] + [{'TABLE_NAME': 't_ref', 'TABLE_TYPE': 'BASE TABLE'}]
+    answers['SELECT TABLE_NAME, COLUMN_NAME, ORDINAL_POSITION'] = answers['SELECT TABLE_NAME, COLUMN_NAME, ORDINAL_POSITION'] + [
+        {'TABLE_NAME': 't_ref', 'COLUMN_NAME': 'code', 'ORDINAL_POSITION': 1, 'COLUMN_DEFAULT': None, 'IS_NULLABLE': 'NO', 'DATA_TYPE': 'varchar',
+         'COLUMN_TYPE': 'varchar(8)', 'EXTRA': '', 'GENERATION_EXPRESSION': ''},
+        {'TABLE_NAME': 't_ref', 'COLUMN_NAME': 'label', 'ORDINAL_POSITION': 2, 'COLUMN_DEFAULT': None, 'IS_NULLABLE': 'YES', 'DATA_TYPE': 'varchar',
+         'COLUMN_TYPE': 'varchar(40)', 'EXTRA': '', 'GENERATION_EXPRESSION': ''}]
+    answers['SELECT TABLE_NAME, NON_UNIQUE'] = answers['SELECT TABLE_NAME, NON_UNIQUE'] + [
+        {'TABLE_NAME': 't_ref', 'NON_UNIQUE': 0, 'INDEX_NAME': 'PRIMARY', 'SEQ_IN_INDEX': 1, 'COLUMN_NAME': 'code', 'INDEX_TYPE': 'COLUMNSTORE HASH'}]
+    show_create = answers['SHOW CREATE']
+    answers['SHOW CREATE'] = lambda norm, args: ([{'Table': 't_ref', 'Create Table': REF_DEFINITION}] if norm.startswith('SHOW CREATE TABLE')
+                                                 and '`t_ref`' in norm else show_create(norm, args))
+    generic = answers.pop('SELECT COUNT(*) AS n')
+    answers['SELECT COUNT(*) AS n FROM `example_orders_db`.`t_ref`'] = count_rows
+    answers['SELECT COUNT(*) AS n'] = generic
+    return answers
+
+
 class CaptureTests(unittest.TestCase):
     def setUp(self):
         self.cfg = config_from(lambda d: d['connections'].update(owner={'user': 'admin', 'password_keychain': 's2rebuild-owner'}))
@@ -170,6 +193,42 @@ class CaptureTests(unittest.TestCase):
         with self.assertRaisesRegex(KitError, 'not reported'):
             I.capture(FakeSession(answers), self.db, self.cfg, None, sleep=lambda s: None)
 
+    def test_w4_a_reference_table_is_counted_exactly_marked_and_planned_as_one_bucket(self):
+        """TABLE_STATISTICS has no row for a reference table (fact 36): the capture takes COUNT(*) without --exact-counts, the row
+        count is the exact one, the plan is one bucket on the staging path, and tables.csv carries the reference and copy_path columns."""
+        runner = FakeSession(reference_answers([{'n': 30_000_000}]))
+        lines = []
+        inv = I.capture(runner, self.db, self.cfg, None, log=lines.append, sleep=lambda s: None)
+        by_name = {t['name']: t for t in inv['tables']}
+        ref = by_name['t_ref']
+        self.assertEqual((ref['reference'], ref['storage_type'], ref['exact_rows'], ref['est_rows']), (True, 'columnstore', 30_000_000, 30_000_000))
+        self.assertEqual((by_name['t_keyed']['reference'], by_name['t_keyed']['exact_rows'], by_name['t_keyed']['est_rows']), (False, None, 25_000_000),
+                         'the other tables keep their estimates and are not counted')
+        counted = [sql for sql, _ in runner.statements if sql.startswith('SELECT COUNT(*)')]
+        self.assertEqual(counted, ['SELECT COUNT(*) AS n FROM `example_orders_db`.`t_ref`'])
+        self.assertIn('4 tables (1 reference, counted exactly)', lines[0])
+        plans = {p.name: p for p in I.plan_tables(inv, self.cfg, self.db)}
+        self.assertEqual((plans['t_ref'].reference, plans['t_ref'].n_buckets, plans['t_ref'].copy_path), (True, 1, 'staging'),
+                         'one bucket although 30 M rows would take 3 on the direct path')
+        self.assertEqual((plans['t_keyed'].reference, plans['t_keyed'].n_buckets, plans['t_keyed'].copy_path), (False, 3, 'direct'))
+        self.assertEqual((plans['t_ref'].describe()['reference'], plans['t_ref'].describe()['copy_path']), (True, 'staging'))
+        summary = I.plan_summary(list(plans.values()))
+        self.assertEqual((summary['reference_tables'], summary['statements']['staging_tables']), (1, 1))
+        with tempfile.TemporaryDirectory() as tmp:
+            out = I.write(inv, Path(tmp) / 'inv', list(plans.values()))
+            csv_text = (out / 'tables.csv').read_text()
+            self.assertIn('storage_type,reference,copy_path,key_kind', csv_text.splitlines()[0])
+            self.assertIn('t_ref,30000000,30000000,,columnstore,1,staging,key,code,1,', csv_text)
+            self.assertIn('t_keyed,25000000,,10.5,columnstore,0,direct,key,id,3,', csv_text)
+        self.assertEqual(I.storage_type('CREATE ROWSTORE REFERENCE TABLE `r` (`a` int, PRIMARY KEY (`a`))'), 'rowstore')
+        self.assertTrue(I.is_reference('CREATE ROWSTORE REFERENCE TABLE `r` (`a` int)'))
+        self.assertFalse(I.is_reference('CREATE ROWSTORE TABLE `r` (`a` int)'))
+
+    def test_w4_a_reference_table_whose_count_returns_no_row_refuses_the_capture(self):
+        """Without a count the plan of a reference table would have no row count, so the capture refuses by name."""
+        with self.assertRaisesRegex(KitError, 'Reference table t_ref: COUNT\\(\\*\\) returned no row'):
+            I.capture(FakeSession(reference_answers([])), self.db, self.cfg, None, sleep=lambda s: None)
+
     def test_write_and_load_round_trip_with_private_files(self):
         inv = I.capture(FakeSession(canned_answers()), self.db, self.cfg, FakeSession(canned_answers()), sleep=lambda s: None)
         plans = I.plan_tables(inv, self.cfg, self.db)
@@ -188,8 +247,8 @@ class CaptureTests(unittest.TestCase):
             again = I.load(out)
             self.assertEqual(again['tables'][1]['name'], 't_keyed')
             csv_text = (out / 'tables.csv').read_text()
-            self.assertIn('t_keyed,25000000,,10.5,columnstore,key,id,3,updated_at,0,id,', csv_text)
-            self.assertIn('t_nokey,12000000,,2.25,rowstore,row,,2,,0,,z', csv_text)
+            self.assertIn('t_keyed,25000000,,10.5,columnstore,0,direct,key,id,3,updated_at,0,id,', csv_text)
+            self.assertIn('t_nokey,12000000,,2.25,rowstore,0,direct,row,,2,,0,,z', csv_text)
             with self.assertRaisesRegex(KitError, 'No inventory'):
                 I.load(Path(tmp) / 'nowhere')
             (out / 'inventory.json').write_text('{"kit": "other"}')
