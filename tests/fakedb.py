@@ -30,19 +30,121 @@ form without ALL syncs only the aggregator of the session, so it changes neither
 N spreads the connections over N aggregators (connection id modulo N); a processlist row with an
 AGGREGATOR value is listed and killed only from a connection on that aggregator, since thread
 ids are per aggregator.
+
+Engine capture: the fake is built from tests/engine/helios-<version>.json (s2rebuild
+engine-capture writes it; the 10.8.0 file is seeded by hand). The column list of every
+information_schema view comes from the file: a query naming a column the capture does not list
+fails with error 1054 as the server would, and a view the capture does not list with 1146. Error
+texts come from its error table (FakeDB.error). The Helios flags default on: refuse_other_definer
+(1227), refuse_sharded_counter (1749), branch_keeps_storage_id (ATTACH ... AS keeps the parent's
+STORAGE_ID) and reference tables answering 1777 to an INSERT from a READ ONLY source.
+
+Branch records (MV_CLOUD_BRANCHES, Helios 10.8.0, October 27, 2026): one row per record with
+DATABASE_NAME, STORAGE_ID, ATTACH_TYPE (create, resume, pitr), LATEST_COMPUTE_ID (the COMPUTE_ID of
+its attachment), PREV_DATABASE_NAME, IS_DETACHED, IS_DROPPED, END_VERSION and ATTACH_SYNTAX in the
+three forms (attached: STORAGEID and COMPUTEID; detached: AT MILESTONE before the ids; dropped:
+ATTACH DROPPED DATABASE). ROW_NUMBER is present and renumbered on every listing, so nothing can key
+on it. ATTACH ... AS from a detached record adds a resume row and keeps the old row detached; from
+an attached database it adds a pitr row with a new COMPUTE_ID and keeps the old row attached; each
+record carries its own rows, so writes are not shared. A detached record's own ATTACH_SYNTAX (READ
+ONLY allowed before AT MILESTONE) re-attaches that record. DROP of an attached record marks it
+IS_DROPPED with the ATTACH DROPPED form and leaves its branches whole; DROP of a READ ONLY
+attachment fails with 2720; DROP of a detached record is refused with 1008. portal_entries() is the
+Portal's list: the rows with IS_DROPPED = 0. The seeded source carries COMPUTE_ID cid-1, a fixture
+value the tests record; every id the fake makes has the digits:digits shape of the capture.
 """
 import datetime as dt
+import json
 import re
 import threading
 import time
 import zlib
 from collections import Counter
+from pathlib import Path
 
 GOOD_LAYOUT = {'NUM_PARTITIONS': 16, 'NUM_SUB_PARTITIONS': 0, 'IS_SYNC': 1, 'IS_SYNC_DURABILITY': 0,
                'IS_SYNC_DURABILITY_ON_REF_DB_ONLY': 1}
 
 
 REFERENCE_CREATE = re.compile(r'\s*CREATE\s+(?:ROWSTORE\s+)?REFERENCE\s+TABLE\b', re.I)
+
+ENGINE_DIR = Path(__file__).resolve().parent / 'engine'
+DEFAULT_CAPTURE = ENGINE_DIR / 'helios-10.8.0.json'
+
+
+def load_capture(path=DEFAULT_CAPTURE):
+    """The engine capture file as a mapping (engine_version, views, errors, attach, ...)."""
+    with open(path, encoding='utf8') as f:
+        return json.load(f)
+
+
+CAPTURE = load_capture()
+
+# words of the kit's information_schema queries that are not column names: keywords and functions (columns are upper case too)
+SQL_WORDS = frozenset('''SELECT FROM WHERE AND OR NOT IN IS NULL LIKE ORDER BY GROUP AS ON JOIN DISTINCT LIMIT ASC DESC COUNT SUM MAX
+    MIN LEFT RIGHT SUBSTRING_INDEX UNIX_TIMESTAMP POW BETWEEN HAVING CASE WHEN THEN ELSE END IF IFNULL COALESCE CAST UNION ALL
+    EXISTS TRUE FALSE INNER OUTER USING AVG CRC32 CONCAT_WS ROUND FLOOR CEIL ABS LENGTH UPPER LOWER NOW CURRENT_USER INTERVAL
+    SIGNED UNSIGNED CHAR DATE DATETIME REGEXP RLIKE'''.split())
+_VIEW_REF = re.compile(r'information_schema\.(\w+)(?:\s+([a-z]\w*))?')
+_COLUMN_REF = re.compile(r'\b(?:([A-Za-z_]\w*)\.)?([A-Z][A-Z0-9_]*)\b')
+
+
+def check_columns(sql, capture=CAPTURE):
+    """Raise error 1054 when an information_schema query names a column the capture does not list for its view (1146 for an unlisted view).
+
+    The views named in the statement are found with their aliases; string literals are dropped;
+    every upper-case word that is not a keyword or a function is a column: with an alias it must
+    be in that view, without one in one of the views the statement reads.
+    """
+    views = capture['views']
+    text = re.sub(r"'(?:[^'\\]|\\.|'')*'", "''", sql)
+    aliases, named = {}, []
+    for m in _VIEW_REF.finditer(text):
+        view = m.group(1).upper()
+        if view not in views:
+            raise FakeDisconnect(1146, "Table 'information_schema.%s' doesn't exist" % m.group(1))
+        named.append(view)
+        if m.group(2):
+            aliases[m.group(2)] = view
+    if not named:
+        return
+    body = _VIEW_REF.sub(' ', text)
+    for alias, column in _COLUMN_REF.findall(body):
+        if column in SQL_WORDS or len(column) < 2:
+            continue
+        allowed = [aliases[alias]] if alias in aliases else named
+        if alias and alias not in aliases:
+            continue
+        if not any(column in views[v] for v in allowed):
+            raise FakeDisconnect(1054, "Unknown column '%s' in 'field list'" % ((alias + '.' if alias else '') + column))
+
+
+def attached_syntax(name, sid, cid):
+    """ATTACH_SYNTAX of an attached record."""
+    return 'ATTACH DATABASE `%s` STORAGEID %s COMPUTEID %s' % (name, sid, cid)
+
+
+def detached_syntax(name, sid, cid, milestone):
+    """ATTACH_SYNTAX of a detached record: AT MILESTONE before the ids."""
+    return "ATTACH DATABASE `%s` AT MILESTONE '%s' STORAGEID %s COMPUTEID %s" % (name, milestone, sid, cid)
+
+
+def dropped_syntax(name, sid, cid):
+    """ATTACH_SYNTAX of a dropped record."""
+    return 'ATTACH DROPPED DATABASE `%s` STORAGEID %s COMPUTEID %s' % (name, sid, cid)
+
+
+def public_row(record):
+    """A branch record as the view shows it: without the fake's private keys."""
+    return {k: v for k, v in record.items() if not k.startswith('_')}
+
+
+def copy_content(content):
+    """A record's own copy of a database content (layout, tables with rows, views)."""
+    return {'layout': dict(content['layout']),
+            'tables': {k: {'create': v['create'], 'rows': [dict(r) for r in v['rows']], 'auto_increment': v.get('auto_increment')}
+                       for k, v in content['tables'].items()},
+            'views': dict(content['views'])}
 
 
 class FakeDisconnect(Exception):
@@ -200,6 +302,8 @@ class FakeCursor:
             raise FakeDisconnect(1317, 'Query execution was interrupted')
         with self.db.lock:
             self.db.statements.append((s, args))
+            if 'information_schema.' in s:
+                check_columns(s, self.db.capture)
             self._execute(s, args)
         self.db.fault(s, 'after')
 
@@ -264,6 +368,22 @@ class FakeCursor:
         if s == 'SELECT CURRENT_USER() AS u, @@memsql_version AS v':
             self.rows = [{'u': '%s@%%' % (self.conn.user or db.current_user), 'v': db.engine_version}]
             return
+        if s == 'SELECT @@memsql_version AS v':
+            self.rows = [{'v': db.engine_version}]
+            return
+        if s == ("SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = 'information_schema' AND TABLE_NAME = %s "
+                 'ORDER BY ORDINAL_POSITION'):
+            self.rows = [{'COLUMN_NAME': c} for c in db.capture['views'].get(str(args[0]).upper(), [])]
+            return
+        if s == "SELECT VARIABLE_NAME, VARIABLE_VALUE FROM information_schema.GLOBAL_VARIABLES WHERE VARIABLE_NAME LIKE 'PASSWORD_%'":
+            self.rows = [{'VARIABLE_NAME': k, 'VARIABLE_VALUE': v} for k, v in sorted(db.globals.items()) if k.startswith('PASSWORD_')]
+            return
+        if s == 'SHOW AGGREGATES':
+            self.rows = [{'Aggregates_in_%s' % (self.conn.current_db or db.source): name, 'Type': 'aggregate'} for name in db.aggregates_defined]
+            return
+        if s == 'SELECT COUNT(*) AS n FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA = %s':
+            self.rows = [{'n': sum(1 for r in db.routines if r.get('ROUTINE_SCHEMA', db.source) == args[0]) if self.conn.is_admin else 0}]
+            return
         if s == 'SELECT PRIVILEGE_TYPE FROM information_schema.USER_PRIVILEGES WHERE GRANTEE = %s':
             self.rows = [{'PRIVILEGE_TYPE': r['PRIVILEGE_TYPE']} for r in db.privileges if r['GRANTEE'] == args[0] and self._sees_grantee(r['GRANTEE'])]
             return
@@ -313,11 +433,11 @@ class FakeCursor:
             layout['NUM_SUB_PARTITIONS'] = int(m.group(3))
             layout.update(db.target_layout_override)
             db.databases[name] = {'layout': layout, 'tables': {}, 'views': {}}
-            sid = db.new_sid()
+            sid, cid = db.new_sid(), db.new_cid()
             db.storage[sid] = name
-            db.attachments.append({'DATABASE_NAME': name, 'ATTACH_TYPE': 'READWRITE', 'STORAGE_ID': sid, 'COMPUTE_ID': 'cid-1', 'ATTACH_SYNTAX': None})
-            db.branches.append({'STORAGE_ID': sid, 'DATABASE_NAME': name, 'IS_DETACHED': 0, 'IS_ATTACHED_TO_THIS_COMPUTE': 1, 'IS_ATTACHABLE': 1,
-                                'IS_DROPPED': 0, 'PREV_DATABASE_NAME': None, 'LATEST_ATTACH_TIME': 'now'})
+            db.branches.append(db.record(name, sid, cid, 'create', None))
+            db.attachments.append({'DATABASE_NAME': name, 'ATTACH_TYPE': 'READWRITE', 'STORAGE_ID': sid, 'COMPUTE_ID': cid,
+                                   'ATTACH_SYNTAX': attached_syntax(name, sid, cid)})
             return
         m = re.match(r'CREATE TABLE `([^`]+)`\.`([^`]+)` LIKE `([^`]+)`\.`([^`]+)`$', s)
         if m:
@@ -408,8 +528,7 @@ class FakeCursor:
             if REFERENCE_CREATE.match(dst['create']) and src_att is not None and src_att['ATTACH_TYPE'] == 'READONLY':
                 # Helios 10.8.0, October 27, 2026: an INSERT into a reference table runs on the master aggregator,
                 # where a READ ONLY source has no master instance to read from
-                raise FakeDisconnect(1777, 'Forwarding Error (node-master-0:3306): Partitions of %s has no master instance. This is likely '
-                                           'because the node or nodes that hold a copy of the partition are down.' % sdb)
+                raise db.error(1777, db=sdb)
             if src['rows']:
                 assert list(src['rows'][0].keys()) == cols, 'the copy must name every saved column in ordinal order'
             moved = [{c: r[c] for c in cols} for r in src['rows'] if pred is None or evaluate_predicate(pred, r)]
@@ -429,7 +548,7 @@ class FakeCursor:
             db.writes.append(s)
             att = db.attachment(m.group(1))
             if att is not None and att['ATTACH_TYPE'] == 'READONLY':
-                raise FakeDisconnect(1290, 'The database is attached read only')
+                raise db.error(1290)
             if (m.group(1), m.group(2)) in db.lock_tables:
                 db.lock_hits += 1
                 raise LockWait()
@@ -458,8 +577,7 @@ class FakeCursor:
         m = re.match(r'ALTER TABLE `([^`]+)`\.`([^`]+)` AUTO_INCREMENT = (\d+)$', s)
         if m:
             if db.refuse_sharded_counter and not REFERENCE_CREATE.match(db.databases[m.group(1)]['tables'][m.group(2)]['create']):
-                raise FakeDisconnect(1749, "Forwarding Error (node-master-0:3306): Feature 'ALTER TABLE...AUTO_INCREMENT=X for sharded tables' "
-                                           "is not supported by SingleStore Distributed.")
+                raise db.error(1749)
             db.writes.append(s)
             db.databases[m.group(1)]['tables'][m.group(2)]['auto_increment'] = int(m.group(3))
             return
@@ -477,7 +595,7 @@ class FakeCursor:
             db.writes.append(s)
             user, host, vdb, name, body = m.groups()
             if user and db.refuse_other_definer and user.strip("`'") != (self.conn.user or db.current_user):
-                raise FakeDisconnect(1227, 'Access denied; you need (at least one of) the SUPER privilege(s) for this operation')
+                raise db.error(1227)
             if self.conn.current_db != vdb:
                 raise FakeDisconnect('view body resolves against the current database; USE the replacement first')
             for qual, ref in re.findall(r'\b(?:FROM|JOIN)\s+(?:`([^`]+)`\.)?`([^`]+)`', body, re.I):
@@ -532,15 +650,9 @@ class FakeCursor:
             self.rows = [{'n': sum(1 for a in db.attachments if a['STORAGE_ID'] == args[0] and self._sees_storage(a)
                                    and (not m.group(1) or a['DATABASE_NAME'] != args[1]))}]
             return
-        m = re.match(r'SELECT COUNT\(\*\) AS n FROM information_schema\.MV_CLOUD_BRANCHES WHERE DATABASE_NAME = %s AND STORAGE_ID = %s '
-                     r'AND PREV_DATABASE_NAME = %s AND IS_DROPPED = 0 AND IS_DETACHED = 0$', s)
+        m = re.match(r'SELECT (.+?) FROM information_schema\.MV_CLOUD_BRANCHES(?: WHERE (.+?))?(?: ORDER BY .+)?$', s)
         if m:
-            self.rows = [{'n': sum(1 for b in db.branches if b['DATABASE_NAME'] == args[0] and b['STORAGE_ID'] == args[1]
-                                   and b.get('PREV_DATABASE_NAME') == args[2] and not b['IS_DROPPED'] and not b['IS_DETACHED'])}]
-            return
-        m = re.match(r'SELECT STORAGE_ID, DATABASE_NAME, IS_DETACHED, .* FROM information_schema\.MV_CLOUD_BRANCHES WHERE STORAGE_ID = %s$', s)
-        if m:
-            self.rows = [dict(b) for b in db.branches if b['STORAGE_ID'] == args[0] and self._sees_storage(b)]
+            self.rows = self._branch_listing(m.group(1), m.group(2), args)
             return
         m = re.match(r'DETACH DATABASE `([^`]+)`( KILL)?$', s)
         if m:
@@ -556,78 +668,54 @@ class FakeCursor:
             for p in db.pipelines + db.pipeline_offsets:
                 if p.get('DATABASE_NAME', db.source) == m.group(1):
                     p['_storage'] = att['STORAGE_ID']
+                    p['_compute'] = att.get('COMPUTE_ID')
                     p['DATABASE_NAME'] = None
             db.attachments.remove(att)
-            for b in db.branches:
-                if b['STORAGE_ID'] == att['STORAGE_ID'] and (not db.branch_keeps_storage_id or b['DATABASE_NAME'] == m.group(1)):
-                    b['IS_DETACHED'] = 1
-                    b['IS_ATTACHED_TO_THIS_COMPUTE'] = 0
+            record = db.record_for(att)
             content = db.databases.pop(m.group(1), None)
+            if record is not None:
+                record['IS_DETACHED'] = 1
+                record['IS_ATTACHED_TO_THIS_COMPUTE'] = 0
+                record['END_VERSION'] = db.next_version()
+                record['ATTACH_SYNTAX'] = detached_syntax(record['DATABASE_NAME'], record['STORAGE_ID'], record['LATEST_COMPUTE_ID'], db.milestone())
+                record['_content'] = content
+            else:  # a row a test appended without a compute id: the storage's rows of that name
+                for b in db.branches:
+                    if b['STORAGE_ID'] == att['STORAGE_ID'] and b['DATABASE_NAME'] == m.group(1):
+                        b['IS_DETACHED'] = 1
+                        b['IS_ATTACHED_TO_THIS_COMPUTE'] = 0
             if content is not None:
-                if not hasattr(db, 'storage_content'):
-                    db.storage_content = {}
                 db.storage_content[att['STORAGE_ID']] = content
             return
-        if re.match(r"ATTACH DATABASE .* STORAGEID '", s):
-            raise FakeDisconnect(1064, "You have an error in your SQL syntax; check the manual that corresponds to your MySQL "
-                                         "server version for the right syntax to use near the quoted STORAGEID")
-        if re.match(r'ATTACH DATABASE .* STORAGEID \S+ READ ONLY$', s):
-            raise FakeDisconnect(1064, "You have an error in your SQL syntax; check the manual that corresponds to your MySQL "
-                                         "server version for the right syntax to use near 'READ ONLY' at line 1")
-        m = re.match(r"ATTACH DATABASE `([^`]+)`(?: AS `([^`]+)`)?( READ ONLY)?(?: STORAGEID ([A-Za-z0-9_:-]+))?$", s)
+        if re.match(r"ATTACH (?:DROPPED )?DATABASE .* STORAGEID '", s):
+            raise db.error(1064, near='the quoted STORAGEID')
+        if re.match(r'ATTACH (?:DROPPED )?DATABASE .* STORAGEID \S+ READ ONLY$', s):
+            raise db.error(1064)
+        m = re.match(r"ATTACH (DROPPED )?DATABASE `([^`]+)`(?: AS `([^`]+)`)?( READ ONLY)?(?: AT MILESTONE '([^']*)')?"
+                     r"(?: STORAGEID ([A-Za-z0-9_:-]+))?(?: COMPUTEID ([A-Za-z0-9_:-]+))?$", s)
         if m:
             db.writes.append(s)
-            parent, alias, ro, sid = m.group(1), m.group(2), bool(m.group(3)), m.group(4)
-            name = alias or parent
-            if db.attachment(name) is not None:
-                raise FakeDisconnect('a database named %s is already attached' % name)
-            source_sid = sid or next((b['STORAGE_ID'] for b in db.branches if b['DATABASE_NAME'] == parent), None)
-            if source_sid is None or source_sid not in db.storage:
-                raise FakeDisconnect('unknown storage for ' + parent)
-            if alias:
-                new_sid = source_sid if db.branch_keeps_storage_id else db.new_sid()
-                db.storage.setdefault(new_sid, name)
-                db.branches.append({'STORAGE_ID': new_sid, 'DATABASE_NAME': name, 'IS_DETACHED': 0, 'IS_ATTACHED_TO_THIS_COMPUTE': 1, 'IS_ATTACHABLE': 1,
-                                    'IS_DROPPED': 0, 'PREV_DATABASE_NAME': parent, 'LATEST_ATTACH_TIME': 'now'})
-                use_sid = new_sid
-            else:
-                for b in db.branches:
-                    if b['STORAGE_ID'] == source_sid:
-                        b['IS_DETACHED'] = 0
-                        b['IS_ATTACHED_TO_THIS_COMPUTE'] = 1
-                use_sid = source_sid
-            parent_att = db.attachment(parent)
-            if alias:
-                carried = [p for p in db.pipelines + db.pipeline_offsets
-                           if p.get('_storage') == source_sid and p.get('DATABASE_NAME') is None
-                           or (parent_att is not None and parent_att['STORAGE_ID'] == source_sid and p.get('DATABASE_NAME', db.source) == parent)]
-                for p in carried:
-                    copy_ = dict(p, DATABASE_NAME=name, _storage=use_sid)
-                    if 'STATE' in copy_:
-                        copy_['STATE'] = 'Stopped'
-                    (db.pipelines if 'STATE' in p else db.pipeline_offsets).append(copy_)
-            else:
-                for p in db.pipelines + db.pipeline_offsets:
-                    if p.get('_storage') == source_sid and p.get('DATABASE_NAME') is None:
-                        p['DATABASE_NAME'] = name
-            compute = 'cid-%d' % (len(db.attachments) + len(db.branches)) if db.branch_keeps_storage_id and alias else 'cid-1'
-            db.attachments.append({'DATABASE_NAME': name, 'ATTACH_TYPE': 'READONLY' if ro else 'READWRITE', 'STORAGE_ID': use_sid, 'COMPUTE_ID': compute, 'ATTACH_SYNTAX': s})
-            content = db.storage_content.get(source_sid) if hasattr(db, 'storage_content') else None
-            if content is None and alias and parent in db.databases:
-                content = db.databases[parent]
-            if content is not None:
-                db.databases[name] = {'layout': dict(content['layout']), 'tables': {k: {'create': v['create'], 'rows': [dict(r) for r in v['rows']], 'auto_increment': v.get('auto_increment')} for k, v in content['tables'].items()},
-                                      'views': dict(content['views']), 'readonly': ro}
+            self._attach(s, *m.groups())
             return
         m = re.match(r'DROP DATABASE `([^`]+)`$', s)
         if m:
             db.writes.append(s)
             att = db.attachment(m.group(1))
             if att is None and m.group(1) not in db.databases:
+                # a detached record is not a database the server can drop: it answers 1008
                 raise FakeDisconnect(1008, "Can't drop database '%s'; database doesn't exist" % m.group(1))
+            if att is not None and att['ATTACH_TYPE'] == 'READONLY' and db.refuse_read_only_drop:
+                # Helios 10.8.0 (October 27, 2026): a READ ONLY attachment cannot be dropped
+                raise db.error(2720)
+            record = db.record_for(att) if att is not None else None
             if att is not None:
                 db.attachments.remove(att)
-            db.databases.pop(m.group(1), None)
+            content = db.databases.pop(m.group(1), None)
+            if record is not None:
+                record['IS_DROPPED'] = 1
+                record['IS_ATTACHED_TO_THIS_COMPUTE'] = 0
+                record['ATTACH_SYNTAX'] = dropped_syntax(record['DATABASE_NAME'], record['STORAGE_ID'], record['LATEST_COMPUTE_ID'])
+                record['_content'] = content
             db.pipelines = [p for p in db.pipelines if p.get('DATABASE_NAME', db.source) != m.group(1)]
             db.pipeline_offsets = [o for o in db.pipeline_offsets if o.get('DATABASE_NAME', db.source) != m.group(1)]
             return
@@ -873,6 +961,104 @@ class FakeCursor:
             return True
         return False
 
+    def _branch_listing(self, select, where, args):
+        """Rows of MV_CLOUD_BRANCHES for a select list and an AND-joined WHERE of COL = %s, COL <> %s or COL = literal.
+
+        ROW_NUMBER is renumbered on every listing (Helios fact: it is not stable), the rows of
+        admin_only_storage are hidden from every account but the admin, and COUNT(*) AS n counts.
+        """
+        db = self.db
+        rows = [b for b in db.branches if self._sees_storage(b)]
+        params = list(args)
+        for cond in (re.split(r' AND ', where) if where else []):
+            m = re.fullmatch(r'(\w+) (=|<>) (%s|-?\d+|\'[^\']*\')', cond)
+            if not m:
+                raise AssertionError('fake database does not understand the branch condition: ' + cond)
+            column, op, literal = m.groups()
+            value = params.pop(0) if literal == '%s' else literal.strip("'")
+            rows = [b for b in rows if (str(b.get(column)) == str(value)) == (op == '=')]
+        db.listing_counter += 1
+        base = db.listing_counter * 100
+        if re.fullmatch(r'COUNT\(\*\) AS n', select):
+            return [{'n': len(rows)}]
+        out = []
+        for i, b in enumerate(rows, 1):
+            row = dict(public_row(b), ROW_NUMBER=base + i)
+            if select.strip() == '*':
+                out.append(row)
+                continue
+            projected = {}
+            for item in _split_top(select):
+                m = re.fullmatch(r'(\w+)(?: AS (\w+))?', item)
+                if not m:
+                    raise AssertionError('fake database does not understand the branch column: ' + item)
+                projected[m.group(2) or m.group(1)] = row.get(m.group(1))
+            out.append(projected)
+        return out
+
+    def _attach(self, s, dropped_form, parent, alias, ro, milestone, sid, cid):
+        """ATTACH [DROPPED] DATABASE parent [AS alias] [READ ONLY] [AT MILESTONE 'm'] [STORAGEID sid] [COMPUTEID cid].
+
+        The parent record is the branch row of that name on the storage (and compute id) given,
+        the attached one first. With AS a new record branches from it (resume from a detached
+        record, pitr from an attached one) with the parent's STORAGE_ID (branch_keeps_storage_id)
+        and its own COMPUTE_ID; without AS the detached (or, in the DROPPED form, dropped) record
+        itself comes back. The record's pipelines come with it, Stopped on a branch.
+        """
+        db = self.db
+        ro = bool(ro)
+        name = alias or parent
+        if db.attachment(name) is not None:
+            raise FakeDisconnect('a database named %s is already attached' % name)
+        candidates = [b for b in db.branches if b['DATABASE_NAME'] == parent and (sid is None or b['STORAGE_ID'] == sid)
+                      and (cid is None or b.get('LATEST_COMPUTE_ID') == cid) and bool(b.get('IS_DROPPED')) == bool(dropped_form)]
+        record = next((b for b in candidates if not b['IS_DETACHED'] and not b.get('IS_DROPPED')), None) or next(iter(candidates), None)
+        source_sid = record['STORAGE_ID'] if record is not None else sid
+        if source_sid is None or source_sid not in db.storage:
+            raise FakeDisconnect('unknown storage for ' + parent)
+        parent_att = db.attachment(parent)
+        if alias:
+            new_sid = source_sid if db.branch_keeps_storage_id else db.new_sid()
+            db.storage.setdefault(new_sid, name)
+            new_cid = db.new_cid()
+            detached_parent = record is None or bool(record['IS_DETACHED']) or bool(record.get('IS_DROPPED'))
+            db.branches.append(db.record(name, new_sid, new_cid, 'resume' if detached_parent else 'pitr', parent))
+            use_sid, compute = new_sid, new_cid
+            if detached_parent:
+                content = (record or {}).get('_content') or db.storage_content.get(source_sid)
+                carried = [p for p in db.pipelines + db.pipeline_offsets if p.get('_storage') == source_sid and p.get('DATABASE_NAME') is None
+                           and (record is None or p.get('_compute') in (None, record.get('LATEST_COMPUTE_ID')))]
+            else:
+                content = db.databases.get(parent)
+                carried = [p for p in db.pipelines + db.pipeline_offsets
+                           if parent_att is not None and parent_att['STORAGE_ID'] == source_sid and p.get('DATABASE_NAME', db.source) == parent]
+            for p in carried:
+                copy_ = dict(p, DATABASE_NAME=name, _storage=use_sid, _compute=compute)
+                if 'STATE' in copy_:
+                    copy_['STATE'] = 'Stopped'
+                (db.pipelines if 'STATE' in p else db.pipeline_offsets).append(copy_)
+        else:
+            if record is not None:
+                record.update(IS_DETACHED=0, IS_DROPPED=0, IS_ATTACHED_TO_THIS_COMPUTE=1,
+                              ATTACH_SYNTAX=attached_syntax(record['DATABASE_NAME'], record['STORAGE_ID'], record['LATEST_COMPUTE_ID']))
+                compute = record['LATEST_COMPUTE_ID']
+                content = record.pop('_content', None) or db.storage_content.get(source_sid)
+            else:  # rows a test appended without a compute id
+                for b in db.branches:
+                    if b['STORAGE_ID'] == source_sid and b['DATABASE_NAME'] == parent:
+                        b['IS_DETACHED'] = 0
+                        b['IS_ATTACHED_TO_THIS_COMPUTE'] = 1
+                compute = 'cid-1'
+                content = db.storage_content.get(source_sid)
+            use_sid = source_sid
+            for p in db.pipelines + db.pipeline_offsets:
+                if p.get('_storage') == source_sid and p.get('DATABASE_NAME') is None and p.get('_compute') in (None, compute):
+                    p['DATABASE_NAME'] = name
+        db.attachments.append({'DATABASE_NAME': name, 'ATTACH_TYPE': 'READONLY' if ro else 'READWRITE', 'STORAGE_ID': use_sid, 'COMPUTE_ID': compute,
+                               'ATTACH_SYNTAX': attached_syntax(name, use_sid, compute)})
+        if content is not None:
+            db.databases[name] = dict(copy_content(content), readonly=ro)
+
 
 class FakeConn:
     def __init__(self, db, user=None):
@@ -896,15 +1082,19 @@ class FakeConn:
 class FakeDB:
     """The fake workspace: one source database with tables and rows, plus whatever the kit creates."""
 
-    def __init__(self, source, tables, layout=GOOD_LAYOUT, views=None, current_user='s2rebuild_runner'):
+    def __init__(self, source, tables, layout=GOOD_LAYOUT, views=None, current_user='s2rebuild_runner', capture=None):
         self.source = source
+        self.capture = capture or CAPTURE
         self.statements = []
         self.writes = []
         self.fail_insert = {}
         self.fail_drop = set()
-        self.refuse_other_definer = False  # Helios: another account as DEFINER needs SUPER (error 1227)
-        self.refuse_sharded_counter = False
-        self.branch_keeps_storage_id = False  # Helios 10.8.0: ATTACH x AS y keeps x's STORAGE_ID; y gets its own COMPUTE_ID  # Helios: ALTER TABLE ... AUTO_INCREMENT on a sharded table is error 1749
+        # the Helios flags, on by default since the engine capture: a test turns one off to exercise the path an engine
+        # without the restriction would take
+        self.refuse_other_definer = True  # another account as DEFINER needs SUPER (error 1227)
+        self.refuse_sharded_counter = True  # ALTER TABLE ... AUTO_INCREMENT on a sharded table is error 1749
+        self.branch_keeps_storage_id = True  # ATTACH x AS y keeps x's STORAGE_ID; y gets its own COMPUTE_ID and branch record
+        self.refuse_read_only_drop = True  # DROP DATABASE of a READ ONLY attachment is error 2720
         self.lock_tables = set()
         self.lock_hits = 0
         self.lock_wait_settings = []
@@ -923,7 +1113,7 @@ class FakeDB:
         self.detach_blocks = set()
         self.insert_delay = 0
         self.leaf_cores = 16
-        self.engine_version = '8.9.0'
+        self.engine_version = self.capture['engine_version']
         self.waiting_detach = threading.Event()
         self.connection_counter = 1000
         self.pipelines = []
@@ -931,14 +1121,20 @@ class FakeDB:
         self.pipeline_errors = []
         self.pipeline_batches = []
         self.routines = []  # {'ROUTINE_NAME', 'ROUTINE_TYPE', optional 'ROUTINE_SCHEMA' (default the source)}
+        self.aggregates_defined = []  # names SHOW AGGREGATES lists in the current database
         self.killed = []
         self.users = set()
         self.globals = {}
         self.sid_counter = 100
-        self.attachments = [{'DATABASE_NAME': source, 'ATTACH_TYPE': 'READWRITE', 'STORAGE_ID': '1028600672070281646:7367158985892520834', 'COMPUTE_ID': 'cid-1', 'ATTACH_SYNTAX': None}]
-        self.branches = [{'STORAGE_ID': '1028600672070281646:7367158985892520834', 'DATABASE_NAME': source, 'IS_DETACHED': 0, 'IS_ATTACHED_TO_THIS_COMPUTE': 1, 'IS_ATTACHABLE': 1,
-                          'IS_DROPPED': 0, 'PREV_DATABASE_NAME': None, 'LATEST_ATTACH_TIME': '2026-01-01 00:00:00'}]
-        self.storage = {'1028600672070281646:7367158985892520834': source}
+        self.cid_counter = 100
+        self.version_counter = 1000
+        self.listing_counter = 0
+        self.storage_content = {}
+        sid = '1028600672070281646:7367158985892520834'
+        self.attachments = [{'DATABASE_NAME': source, 'ATTACH_TYPE': 'READWRITE', 'STORAGE_ID': sid, 'COMPUTE_ID': 'cid-1',
+                             'ATTACH_SYNTAX': attached_syntax(source, sid, 'cid-1')}]
+        self.branches = [dict(self.record(source, sid, 'cid-1', 'create', None), LATEST_ATTACH_TIME='2026-01-01 00:00:00')]
+        self.storage = {sid: source}
         self.databases = {source: {'layout': dict(layout), 'tables': {
             name: {'create': spec['create'], 'rows': [dict(r) for r in spec.get('rows', [])], 'auto_increment': spec.get('auto_increment')}
             for name, spec in tables.items()}, 'views': dict(views or {})}}
@@ -1026,6 +1222,45 @@ class FakeDB:
         self.sid_counter += 1
         # Helios STORAGE_IDs are two numbers joined by a colon
         return '%d:%d' % (1000000000000000000 + self.sid_counter, 7000000000000000000 + self.sid_counter)
+
+    def new_cid(self):
+        """A fresh COMPUTE_ID in the digits:digits shape of the capture."""
+        self.cid_counter += 1
+        return '%d:%d' % (2000000000000000000 + self.cid_counter, 8000000000000000000 + self.cid_counter)
+
+    def next_version(self):
+        """The END_VERSION a record takes when it detaches."""
+        self.version_counter += 1
+        return self.version_counter
+
+    def milestone(self):
+        """The AT MILESTONE text of a detached record, in the server's YYYY-MM-DD HH_MM_SS.ffffff form, from the fake clock."""
+        return '2026-10-27 06_%02d_%02d.000000' % divmod(self.version_counter % 3600, 60)
+
+    def record(self, name, sid, cid, attach_type, prev_name):
+        """A new attached branch record (MV_CLOUD_BRANCHES row) of attach_type create, resume or pitr."""
+        return {'STORAGE_ID': sid, 'DATABASE_NAME': name, 'ATTACH_TYPE': attach_type, 'LATEST_COMPUTE_ID': cid, 'PREV_DATABASE_NAME': prev_name,
+                'IS_DETACHED': 0, 'IS_ATTACHED_TO_THIS_COMPUTE': 1, 'IS_ATTACHABLE': 1, 'IS_DROPPED': 0, 'END_VERSION': None,
+                'ATTACH_SYNTAX': attached_syntax(name, sid, cid), 'LATEST_ATTACH_TIME': 'now'}
+
+    def record_for(self, attachment):
+        """The branch record of an attachment row (same STORAGE_ID and COMPUTE_ID, not dropped), or None."""
+        return next((b for b in self.branches if b['STORAGE_ID'] == attachment['STORAGE_ID'] and b.get('LATEST_COMPUTE_ID') == attachment.get('COMPUTE_ID')
+                     and not b.get('IS_DROPPED')), None)
+
+    def portal_entries(self):
+        """The Portal's database list: every record with IS_DROPPED = 0, attached or detached, as public rows."""
+        return [public_row(b) for b in self.branches if not b.get('IS_DROPPED')]
+
+    def error(self, code, **subs):
+        """The server error of the capture's error table as the driver raises it; <key> tokens of the message take subs."""
+        entry = self.capture['errors'][str(code)]
+        message = entry['message']
+        for key, value in subs.items():
+            message = message.replace('<%s>' % key, str(value))
+        if code == 1064 and 'near' in subs:
+            message = message.split(' near ')[0] + ' near ' + str(subs['near'])
+        return FakeDisconnect(int(code), message)
 
     def rows(self, db, table):
         return self.databases[db]['tables'][table]['rows']

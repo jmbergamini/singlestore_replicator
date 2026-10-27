@@ -56,6 +56,8 @@ def run_fake_rehearsal(test, h, kill_test='inprocess', rows=300, keep=False):
     captured the way inventory.capture reads it (information_schema.TABLES, SHOW CREATE VIEW).
     """
     specs = rehearsal_specs()
+    # the cleanup drops the retained rehearsal copy while it is attached READ ONLY, which Helios 10.8.0 refuses with 2720 (W12)
+    h.fake.refuse_read_only_drop = False
 
     def filled_source(session, names_, layout, rows_, log):
         taken = [n for n in names_.values() if n in h.fake.databases]

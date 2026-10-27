@@ -264,6 +264,7 @@ class StaleCheckAndHandlersTests(unittest.TestCase):
                 if t['name'] == 't_comp':
                     t['auto_increment'] = {'column': 'c', 'counter': 500}
         h = copied(self, mutate_inventory=counter)
+        h.fake.refuse_sharded_counter = False  # the ALTER path of the counter logic: Helios 10.8.0 refuses it on a sharded table (1749, covered by its own test)
         h.fake.rows(SRC, 't_comp').append({'a': 'late', 'b': '2026-03-03 00:00:00.000000', 'c': 777, 'note': 'arrived after the copy'})
         out7 = h.step('O7')
         self.assertEqual(out7.status, steps.PASSED, h.text())
@@ -324,6 +325,7 @@ class StaleCheckAndHandlersTests(unittest.TestCase):
         for where, point in cases:
             with self.subTest(where=where, point=point):
                 h = copied(self, mutate_inventory=auto_increment_on_t_comp)
+                h.fake.refuse_sharded_counter = False  # the ALTER path of the counter logic: Helios 10.8.0 refuses it on a sharded table (1749, covered by its own test)
                 h.fake.rows(SRC, 't_comp').append(dict(LATE_ROW))
                 start = len(h.fake.writes)
                 if where == 'O6 passed':

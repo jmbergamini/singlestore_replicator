@@ -378,6 +378,7 @@ ALLOWANCES = {
     'journal.py': {'pipeline', 'grant', 'attach', 'revoke'},  # pipelines, grants_snapshot (never overwritten by a revoked state) and attachments tables
     'connect.py': set(),
     'bundle.py': set(),
+    'enginecapture.py': {'pipeline', 'attach', 'detach', 'drop'},  # the PIPELINES views, the ATTACH forms and the 2720 row of the error table
     'common.py': set(),
     '__init__.py': set(),
     '__main__.py': set(),

@@ -926,6 +926,7 @@ class ReleaseBoundaryTests(unittest.TestCase):
         for case in EARLY_STOPS:
             with self.subTest(case=case):
                 h = self.stop_o11_before_its_first_statement(case)
+                h.fake.refuse_read_only_drop = False  # R3 drops the retained copy attached READ ONLY, which Helios 10.8.0 refuses with 2720 (W3 replaces R3 with the cleanup flow)
                 before = list(h.fake.writes)
                 machine_for(h)[0].zero_change_proof()
                 self.assertEqual(h.fake.writes, before, 'the proof reads only')
@@ -958,6 +959,7 @@ class ReleaseBoundaryTests(unittest.TestCase):
         for point in FAULT_POINTS:
             with self.subTest(point=point):
                 h = switched_for_release(self)
+                h.fake.refuse_read_only_drop = False  # R3 drops the retained copy attached READ ONLY, which Helios 10.8.0 refuses with 2720 (W3 replaces R3 with the cleanup flow)
                 stale = block_now(h, 'O10', rollback=True)
                 h.fake.fail_statement(r'^START PIPELINE', 'after' if point == 'journal' else point, crash=(point == 'journal'))
                 if point == 'journal':

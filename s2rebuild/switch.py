@@ -216,8 +216,11 @@ def forward_block(names, counts=None, s0_problems=None, withheld=None):
                     'S3: attach the replacement as a branch under the live name')
     block.check('S3 after: an attached READWRITE database named source', ATTACHED_SQL, (names['source'],),
                 ownersql.Expect('column_equals', 'ATTACH_TYPE', 'READWRITE'), record='live')
-    block.check('S3 after: the live STORAGE_ID is a new branch', ATTACHED_SQL, (names['source'],),
-                ownersql.Expect('column_not_in', 'STORAGE_ID', [names['source_sid'], names['replacement_sid']]))
+    # Helios 10.8.0 keeps the replacement's STORAGE_ID for the live branch: the proof of a new branch is its own record, not a new id
+    block.check('S3 after: the live STORAGE_ID is not the original storage', ATTACHED_SQL, (names['source'],),
+                ownersql.Expect('column_not_in', 'STORAGE_ID', [names['source_sid']]))
+    block.check('S3 after: the live name is its own branch record of the replacement', BRANCH_OF_SQL,
+                (names['source'], names['replacement_sid'], names['replacement']), ownersql.Expect('column_at_least', 'n', 1))
     block.check('S3 after: the live database reports the target layout', LAYOUT_SQL, (names['source'],),
                 ownersql.Expect('columns_equal', value={'NUM_PARTITIONS': names['partitions'], 'NUM_SUB_PARTITIONS': names['sub_partitions']}))
     for label, sql, key in (('tables', TABLE_COUNT_SQL, 'tables'), ('views', VIEW_COUNT_SQL, 'views'), ('pipelines', PIPELINE_COUNT_SQL, 'pipelines')):

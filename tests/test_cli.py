@@ -36,7 +36,7 @@ class HelpTests(unittest.TestCase):
         self.assertEqual(code, 0)
         expected = ['check', 'account-sql', 'profile', 'plan', 'rehearse', 'run', 'step', 'gate', 'status', 'watch',
                     'quiet-proof', 'lockout', 'owner-sql', 'owner-notebook', 'mark-recopy', 'pause', 'resume', 'abandon', 'report',
-                    'calibrate', 'bundle', 'docs-flags']
+                    'calibrate', 'bundle', 'engine-capture', 'docs-flags']
         self.assertEqual(cli.COMMAND_NAMES, expected)
         for name in expected:
             self.assertRegex(text, r'\n\s+%s\s' % re.escape(name), name)

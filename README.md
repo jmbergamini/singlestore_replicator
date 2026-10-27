@@ -107,3 +107,4 @@ s2rebuild run
 - [docs/LESSONS.md](docs/LESSONS.md): Helios facts and run lessons.
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): the design.
 - `docs/s2rebuild-guide.pdf`: this README and STEPS with the flow diagram, built by `docs/build_pdf.py`.
+- `tests/engine/helios-<version>.json`: the record of the engine the test fake is built from, written by `s2rebuild engine-capture --fixture-database NAME` with the owner profile (reads only); refresh it per engine version as docs/CODE-GUIDE.md says.

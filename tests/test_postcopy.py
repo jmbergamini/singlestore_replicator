@@ -88,6 +88,7 @@ class CounterTests(unittest.TestCase):
         """(harness, inventory tables) after O5 and O6; t_comp (MAX(c) 299) and the empty t_empty carry the given source counters."""
         tables = dict(FIXTURE_TABLES)
         h = Harness(self, tables=tables)
+        h.fake.refuse_sharded_counter = False  # the ALTER path of the counter logic: Helios 10.8.0 refuses it on a sharded table (1749, covered by its own test)
         inv = fixture_inventory(tables)
         for t in inv['tables']:
             if t['name'] == 't_comp':
@@ -161,6 +162,7 @@ class CounterTests(unittest.TestCase):
             for statement in (('ALTER', 'SYNC') if point != 'journal' else ('counter event',)):
                 with self.subTest(point=point, statement=statement):
                     h = copied(self, mutate_inventory=auto_increment_on_t_comp)
+                    h.fake.refuse_sharded_counter = False  # the ALTER path of the counter logic: Helios 10.8.0 refuses it on a sharded table (1749, covered by its own test)
                     if point == 'journal':
                         fired = crash_journal(self, h.journal, 'event', match=lambda kind, detail: kind == 'counter')
                         with self.assertRaises(SimulatedCrash):
@@ -194,6 +196,7 @@ class ViewDefinerTests(unittest.TestCase):
         """The owner session creates v_base (definer kept), then a_top in round 2 (definer gone: owner); the runner definer is replaced too."""
         from openpyxl import load_workbook
         h = view_harness(self, [V_BASE, V_TOP, V_RUN])
+        h.fake.refuse_other_definer = False  # the kept-definer choice: Helios 10.8.0 refuses another DEFINER (1227, covered by its own test)
         self.assertEqual(h.step('O7', dry_run=True).status, steps.PASSED)
         self.assertIn('DRY RUN: USE `%s`' % TGT, h.text(), 'the dry run prints what the owner session issues')
         self.assertIn('DRY RUN: SELECT COUNT(*) AS n FROM information_schema.USER_PRIVILEGES', h.text())
@@ -302,6 +305,7 @@ class ViewDefinerTests(unittest.TestCase):
         for point in FAULT_POINTS:
             with self.subTest(point=point):
                 h = view_harness(self, [V_BASE])
+                h.fake.refuse_other_definer = False  # the kept-definer choice: Helios 10.8.0 refuses another DEFINER (1227, covered by its own test)
                 if point == 'journal':
                     crash_journal(self, h.journal, 'event', match=lambda kind, detail: kind == 'view')
                     with self.assertRaises(SimulatedCrash):

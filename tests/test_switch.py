@@ -71,9 +71,19 @@ def ready_for_s0(h):
 FROZE_BEFORE_THE_COPY = '2026-01-01T00:00:00Z'
 
 
-def verified_harness(test, mutate_inventory=None, owner=True, mutate=None):
-    """A switched harness after real O7 and O8 runs, O9 passed and freeze_time before the copy, so S0 accepts."""
+def counters_settable(h):
+    """The ALTER path of the counter logic: Helios 10.8.0 refuses it on a sharded table (1749, covered by its own test)."""
+    h.fake.refuse_sharded_counter = False
+
+
+def verified_harness(test, mutate_inventory=None, owner=True, mutate=None, prepare=None):
+    """A switched harness after real O7 and O8 runs, O9 passed and freeze_time before the copy, so S0 accepts.
+
+    prepare(h), when given, runs before O7 (a test sets a fake flag the first O7 must see).
+    """
     h = switched_harness(test, mutate=mutate, mutate_inventory=mutate_inventory, owner=owner)
+    if prepare is not None:
+        prepare(h)
     h.journal.set_meta('freeze_time', FROZE_BEFORE_THE_COPY)
     for step_id in ('O7', 'O8'):
         out = h.step(step_id, redo=False)
@@ -240,6 +250,12 @@ DROP_LABELS = {RET: 'drop the retained read-only branch', TGT: 'drop the replace
 def cleanup_harness(test):
     """A harness after the switch, O11 to C2 passed and released_utc far enough in the past that C3 is due."""
     h = switched_harness(test)
+    # C3 drops the retained copy while it is attached READ ONLY, which Helios 10.8.0 refuses with 2720 (W3 replaces this flow
+    # with the detach, re-attach read write by syntax, drop sequence), and its identity checks go by STORAGE_ID alone, which
+    # the shared STORAGE_ID of the live branch defeats (W2 moves them to the branch record); these tests cover the identity
+    # checks of the DROPs on a storage model without both facts
+    h.fake.refuse_read_only_drop = False
+    h.fake.branch_keeps_storage_id = False
     machine, _ = machine_for(h)
     assert machine.forward() == switch.SWITCHED, h.text()
     for step_id in ('O7', 'O8', 'O9', 'O10', 'O11', 'C1', 'C2'):
@@ -330,7 +346,8 @@ class ExpectAndBlockTests(unittest.TestCase):
         self.assertLess(text.index('S1 before (for S3): replacement attached READWRITE with the recorded STORAGE_ID'), detach_at)
         self.assertLess(text.index('S1 before (for S2): no attached database named retained'), detach_at)
         self.assertIn("expect STORAGE_ID = %s, ATTACH_TYPE = READWRITE" % names['replacement_sid'], text)
-        self.assertIn('S3 after: the live STORAGE_ID is a new branch; expect STORAGE_ID not in (1028600672070281646:7367158985892520834, %s)' % names['replacement_sid'], text)
+        self.assertIn('S3 after: the live STORAGE_ID is not the original storage; expect STORAGE_ID not in (1028600672070281646:7367158985892520834)', text)
+        self.assertIn('S3 after: the live name is its own branch record of the replacement; expect n >= 1', text)
         self.assertIn('expect NUM_PARTITIONS = 32, NUM_SUB_PARTITIONS = 512', text)
         self.assertIn('S3 after: tables count equals the capture; expect n = 4', text)
         self.assertIn('S3 after: pipelines count equals the capture; expect n = 2', text)
@@ -372,7 +389,8 @@ class MachineTests(unittest.TestCase):
         self.assertEqual(machine.forward(), switch.SWITCHED)
         live = h.fake.attachment(SRC)
         self.assertEqual(live['ATTACH_TYPE'], 'READWRITE')
-        self.assertNotIn(live['STORAGE_ID'], ('1028600672070281646:7367158985892520834', names['replacement_sid']), 'the live name is a new branch')
+        self.assertEqual(live['STORAGE_ID'], names['replacement_sid'], 'Helios keeps the replacement STORAGE_ID for the live branch')
+        self.assertNotEqual(live['COMPUTE_ID'], h.fake.attachment(TGT)['COMPUTE_ID'], 'the live name is its own branch record')
         self.assertEqual(h.fake.attachment(RET)['ATTACH_TYPE'], 'READONLY')
         self.assertEqual(h.journal.attachment('live')['storage_id'], live['STORAGE_ID'])
         self.assertEqual(h.journal.attachment('retained')['database_name'], RET)
@@ -511,6 +529,7 @@ class MachineTests(unittest.TestCase):
 
     def test_rollback_from_every_position_and_its_refusals(self):
         h = switched_harness(self)
+        h.fake.refuse_read_only_drop = False  # R3 drops the retained copy attached READ ONLY, which Helios 10.8.0 refuses with 2720 (W3 replaces R3 with the cleanup flow)
         machine, _ = machine_for(h)
         machine.forward()
         self.assertEqual(machine.rollback(drop_retained=True), switch.NOT_STARTED)
@@ -852,6 +871,7 @@ class RollbackBoundaryTests(unittest.TestCase):
 
     def test_f1_rollback_block_carries_the_zero_change_proof_before_r1(self):
         h = switched_harness(self)
+        h.fake.refuse_read_only_drop = False  # R3 drops the retained copy attached READ ONLY, which Helios 10.8.0 refuses with 2720 (W3 replaces R3 with the cleanup flow)
         machine, _ = machine_for(h)
         machine.forward()
         ctx = h.ctx()
@@ -882,6 +902,7 @@ class RollbackBoundaryTests(unittest.TestCase):
         for point in FAULT_POINTS:
             with self.subTest(point=point):
                 h = switched_harness(self)
+                h.fake.refuse_read_only_drop = False  # R3 drops the retained copy attached READ ONLY, which Helios 10.8.0 refuses with 2720 (W3 replaces R3 with the cleanup flow)
                 machine, _ = machine_for(h)
                 machine.forward()
                 if point == 'journal':
@@ -911,6 +932,7 @@ class RollbackBoundaryTests(unittest.TestCase):
         for point in FAULT_POINTS:
             with self.subTest(point=point):
                 h = switched_harness(self)
+                h.fake.refuse_read_only_drop = False  # R3 drops the retained copy attached READ ONLY, which Helios 10.8.0 refuses with 2720 (W3 replaces R3 with the cleanup flow)
                 machine, _ = machine_for(h)
                 if point == 'before':
                     h.fake.fail_statement(S3_PATTERN, 'before')
@@ -1386,7 +1408,7 @@ class RecopyEvidenceTests(unittest.TestCase):
     def test_f4_mark_recopy_after_o8_reruns_o7_and_o8_and_s0_refuses_until_they_pass(self):
         """The reproduction: after O8 passed, mark-recopy then run --from O6 skipped O7 and O8 and S0 accepted. Now both run and S0 waits,
         and the rerun of O7 sets the AUTO_INCREMENT counters again after the re-copy (t_comp carries one in this fixture)."""
-        h = verified_harness(self, mutate_inventory=auto_increment_on_t_comp)
+        h = verified_harness(self, mutate_inventory=auto_increment_on_t_comp, prepare=counters_settable)
         self.assertTrue(s0(h)[0].startswith('S0: O8 and O9 passed'))
         self.assertEqual(len(counter_writes(h, 't_comp')), 2, 'the first O7 set the counter')
         code, text = mark_recopy_cli(h)
@@ -1598,7 +1620,7 @@ class RecopyEvidenceTests(unittest.TestCase):
     def test_f4_fresh_table_after_o8_reruns_o7_and_o8_and_sets_the_counter_again(self):
         """A fresh-table load after O8 replaces the whole table: it reopens O7 and O8 and clears the table's verification, S0 refuses
         with the run --from O6 hint, and the rerun sets the counter of the new table, which CREATE TABLE LIKE left at the default."""
-        h = verified_harness(self, mutate_inventory=auto_increment_on_t_comp)
+        h = verified_harness(self, mutate_inventory=auto_increment_on_t_comp, prepare=counters_settable)
         self.assertIsNotNone(h.fake.databases[TGT]['tables']['t_comp']['auto_increment'], 'O7 set the counter')
         out = h.step('O6', options={'fresh_table': 't_comp'})
         self.assertEqual(out.status, steps.PASSED, h.text())
@@ -1625,6 +1647,7 @@ class RecopyEvidenceTests(unittest.TestCase):
         for point in FAULT_POINTS + ('reopen',):
             with self.subTest(point=point):
                 h = verified_harness(self, mutate_inventory=auto_increment_on_t_comp)
+                h.fake.refuse_sharded_counter = False  # the ALTER path of the counter logic: Helios 10.8.0 refuses it on a sharded table (1749, covered by its own test)
                 if point in ('journal', 'reopen'):
                     if point == 'journal':
                         crash_journal(self, h.journal, 'mark_started', match=lambda table, bucket: table == 't_comp')
@@ -1862,6 +1885,7 @@ class RecopyEvidenceTests(unittest.TestCase):
         for point in FAULT_POINTS:
             with self.subTest(point=point):
                 h = verified_harness(self, mutate_inventory=auto_increment_on_t_comp, owner=False)
+                h.fake.refuse_sharded_counter = False  # the ALTER path of the counter logic: Helios 10.8.0 refuses it on a sharded table (1749, covered by its own test)
                 base = ['--config', str(h.config_path), '--run', h.run_id]
                 if point == 'journal':
                     fired = crash_journal(self, h.journal, 'event', match=lambda kind, detail: kind == 'counter')

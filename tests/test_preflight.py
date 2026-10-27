@@ -43,14 +43,14 @@ class PreflightTests(unittest.TestCase):
         out = p2(h)
         self.assertEqual(out.status, steps.PASSED, h.text())
         text = h.text()
-        self.assertIn('connection: runner <redacted>@%, engine 8.9.0', text, 'log lines mask the SQL user names')
+        self.assertIn('connection: runner <redacted>@%, engine 10.8.0', text, 'log lines mask the SQL user names')
         self.assertIn('privileges: all 11 runner privileges of section 5 present', text)
         self.assertIn('source STORAGE_ID: 1028600672070281646:7367158985892520834 (READWRITE), recorded', text)
         self.assertIn('replacement name: %s is free' % TGT, text)
         self.assertIn('compute size: 16 leaf cores x 8 = 128 covers the 32 target partitions', text)
         self.assertIn('owner: no owner profile configured', text)
         self.assertEqual(h.journal.attachment('source')['storage_id'], '1028600672070281646:7367158985892520834')
-        self.assertEqual(h.journal.get_meta('engine_version'), '8.9.0')
+        self.assertEqual(h.journal.get_meta('engine_version'), '10.8.0', 'the fake reports the engine of the capture')
 
     def test_each_failure_is_named(self):
         h = Harness(self)

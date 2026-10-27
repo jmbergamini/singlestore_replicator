@@ -29,8 +29,21 @@ The package is `s2rebuild/`. Every module starts with `s2rebuild <module>: <purp
 - `notebook.py`: fills `notebooks/owner-steps.template.ipynb` with the run, the blocks and ownerlib.
 - `rehearse.py`: P5 on throwaway databases with the SIGKILL test.
 - `bundle.py`: MANIFEST.json, the static-tree scan, the zip and `--verify`.
+- `enginecapture.py`: the `engine-capture` command: the engine version, the column list of every `information_schema` view the kit reads, SHOW AGGREGATES, the PASSWORD_ variables, the ATTACH forms and id shapes as patterns, the runner-versus-owner row counts on a fixture database, and the hand-maintained error table, written to `tests/engine/helios-<version>.json` for the test fake. Reads only.
 
-`tests/fakedb.py` is an in-memory stand-in for the workspace (attachments and branches, pipelines that move with their storage, grants by scope, identity rules, read-only refusals, lock waits, blocking DETACH, the capture reads of P3 and O4). `tests.helpers.fake_driver` puts it behind the driver, so a test can run a live command on the command line. Tests never open a network connection.
+`tests/fakedb.py` is an in-memory stand-in for the workspace built from the engine capture (attachments and branch records, pipelines that move with their record, grants by scope, identity rules, read-only refusals, lock waits, blocking DETACH, the capture reads of P3 and O4). `tests.helpers.fake_driver` puts it behind the driver, so a test can run a live command on the command line. Tests never open a network connection.
+
+## The engine capture
+
+The fake agrees with the engine through `tests/engine/helios-<version>.json`. Column lists come from the file: a query that names a column the capture does not list fails with error 1054, as the server would, and `tests/test_engine.py` checks every `information_schema` query the kit holds against it. Error texts come from its error table (`FakeDB.error`). The four Helios flags of the fake default on (`refuse_other_definer`, `refuse_sharded_counter`, `branch_keeps_storage_id`, `refuse_read_only_drop`); a test turns one off only to exercise the path an engine without that restriction would take, and says so in a comment. Branch records follow `MV_CLOUD_BRANCHES`: one row per record with DATABASE_NAME, STORAGE_ID, ATTACH_TYPE (create, resume, pitr), LATEST_COMPUTE_ID, IS_DETACHED, IS_DROPPED, END_VERSION and ATTACH_SYNTAX in its three forms; ROW_NUMBER is renumbered on every listing, so no kit code can key on it; `portal_entries()` is the Portal's list (IS_DROPPED = 0).
+
+Refresh the capture per engine version:
+
+1. On a workspace with the owner profile configured, run `s2rebuild engine-capture --fixture-database NAME`, where NAME is a database with at least one routine and one pipeline. It writes `tests/engine/helios-<version>.json` and prints the view count and the runner-versus-owner counts. Pass: every view has columns and no warning line. Fail: a warning names a view without columns; add them by hand from `SELECT * ... LIMIT 1` and keep the `seeded` note.
+2. The error table (`enginecapture.ERROR_TABLE`) is kept by hand and carried over from the existing file; add a row when a live run shows a new error number, with the text the server gave.
+3. Point the fake at the new file (`DEFAULT_CAPTURE` in `tests/fakedb.py`) and run the suite. Pass: `test_engine` and the suite pass. Fail: a 1054 names the column a view lost or renamed; fix the query, then the docs (a Helios fact in `docs/LESSONS.md` and section 11 of the architecture).
+
+The 10.8.0 file is seeded by hand from the kit's queries (its `seeded` field says so and `captured` is null); the first live `engine-capture` replaces it.
 
 ## Data flow
 

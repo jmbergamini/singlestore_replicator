@@ -621,6 +621,8 @@ Verified on the reference run or in the documentation. `docs/LESSONS.md` carries
 25. Engine 10.8.0: even the workspace admin cannot name another account as DEFINER of a view (CREATE VIEW fails with error 1227, SUPER needed); O7 falls back to the owner as definer and records why.
 26. Engine 10.8.0: `ALTER TABLE ... AUTO_INCREMENT = X` on a sharded table is error 1749 (not supported); O7 then runs only `AGGREGATOR SYNC AUTO_INCREMENT ON <table> ALL`, which moves every aggregator past MAX, and records why.
 27. Engine 10.8.0: `ATTACH x AS y` keeps x's STORAGE_ID for the branch y, which is still independent (own COMPUTE_ID, ATTACH_TYPE pitr, PREV_DATABASE_NAME x; writes not shared; a DROP of x leaves y). O10 accepts the live name on the replacement's STORAGE_ID only with that branch row and a COMPUTE_ID other than the replacement's (`switch.live_is_branch_of_replacement`). C3's identity checks by STORAGE_ID alone refuse in this state; they must use the branch row too.
+28. Engine 10.8.0: a database attached READ ONLY cannot be dropped (error 2720), and a detached record cannot be dropped either: detach, re-attach read write, then drop. The test fake (`tests/fakedb.py`, built from `tests/engine/helios-<version>.json`) refuses the same way, so the R3 and C3 DROPs of the retained copy are replaced by the cleanup flow of the release 1.0 work order.
+29. Engine 10.8.0: a detached record re-attaches by its own `MV_CLOUD_BRANCHES.ATTACH_SYNTAX` (`ATTACH DATABASE <name> AT MILESTONE '...' STORAGEID <id> COMPUTEID <id>`, READ ONLY allowed before AT MILESTONE); a dropped record shows the `ATTACH DROPPED DATABASE` form. `sqlutil.classify` treats all three forms as ATTACH DATABASE, so the owner allowances cover them.
 
 ## 12. Documentation and branding
 

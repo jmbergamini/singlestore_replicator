@@ -181,8 +181,11 @@ def classify(sql):
     m = _match(r'DETACH DATABASE ' + _BT + r'(?: (KILL|FORCE))?$', text)
     if m:
         return Statement('DETACH DATABASE', (m.group(1),), (m.group(2) or '').upper(), text)
-    m = _match(r'ATTACH DATABASE ' + _BT + r'(?: AS ' + _BT + r')?( READ ONLY)?(?: STORAGEID ' + _ID_VALUE +
-               r')?(?: COMPUTEID ' + _ID_VALUE + r')?$', text)
+    # the three ATTACH_SYNTAX forms of MV_CLOUD_BRANCHES (engine 10.8.0) are all ATTACH DATABASE: the attached record's form
+    # (STORAGEID and COMPUTEID), the detached record's form (AT MILESTONE 'YYYY-MM-DD HH_MM_SS.ffffff' before the ids) and the
+    # dropped record's form (ATTACH DROPPED DATABASE); READ ONLY comes right after the names
+    m = _match(r'ATTACH (?:DROPPED )?DATABASE ' + _BT + r'(?: AS ' + _BT + r')?( READ ONLY)?(?: AT MILESTONE \'[0-9 _.:-]+\')?'
+               r'(?: STORAGEID ' + _ID_VALUE + r')?(?: COMPUTEID ' + _ID_VALUE + r')?$', text)
     if m:
         names = (m.group(1),) if m.group(2) is None else (m.group(1), m.group(2))
         return Statement('ATTACH DATABASE', names, 'READ ONLY' if m.group(3) else '', text)

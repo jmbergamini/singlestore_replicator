@@ -18,9 +18,9 @@ import sys
 import traceback
 from pathlib import Path
 
-from . import __title__, __version__, abandon, bundle, copy as copy_module, estimate, freeze, grants, inventory, lockout, notebook, ownersql, pipelines, postcopy, rehearse, report_md, report_xlsx, steps, switch, watch
+from . import __title__, __version__, abandon, bundle, copy as copy_module, enginecapture, estimate, freeze, grants, inventory, lockout, notebook, ownersql, pipelines, postcopy, rehearse, report_md, report_xlsx, steps, switch, watch
 from .common import EXIT_DONE, EXIT_GATE, EXIT_MISMATCH, EXIT_REFUSED, KitError, check_run_id, parse_utc, run_date, unique_run_id, utc_now
-from .sqlutil import secret_forms, sql_literal
+from .sqlutil import ident, secret_forms, sql_literal
 from .config import load_config
 from .connect import Log, Redactor, Secrets, Session, SessionFactory
 from .journal import Journal, read_only_uri
@@ -61,6 +61,9 @@ COMMANDS = [
     ('report', 'C2', 'Final Excel and Markdown for a run', None),
     ('calibrate', 'C2', 'Fit the throughput model from a journal and write customer/baseline.json', None),
     ('bundle', 'packaging', 'Write MANIFEST.json, check the denylist, zip the static tree to dist/; --verify ZIP checks a zip', None),
+    ('engine-capture', 'tests', 'Read the engine version, the column list of every information_schema view the kit reads, SHOW '
+                                'AGGREGATES, the PASSWORD_ variables and, with --fixture-database, the runner-versus-owner row counts, '
+                                'with the owner profile; writes tests/engine/helios-<version>.json for the test fake', None),
     ('docs-flags', 'docs', 'Print the flag table as Markdown for docs/CONFIG.md', None),
 ]
 COMMAND_NAMES = [c[0] for c in COMMANDS]
@@ -173,6 +176,9 @@ def build_parser():
     p['calibrate'].add_argument('--all-attempts', action='store_true', help='include re-copied chunks (default: first-pass chunks only)')
     p['bundle'].add_argument('--verify', metavar='ZIP', help='unzip to a temporary folder and compare hashes with the manifest')
     p['bundle'].add_argument('--include-customer', action='store_true', help='add customer/ to the zip')
+    p['engine-capture'].add_argument('--fixture-database', metavar='NAME',
+                                     help='a database to read SHOW AGGREGATES in and to count ROUTINES and PIPELINES rows as the owner and as the runner')
+    p['engine-capture'].add_argument('--out', metavar='FILE', help='write the capture here instead of tests/engine/helios-<version>.json')
     return parser
 
 
@@ -1360,6 +1366,38 @@ def cmd_bundle(args, env, out, state):
     return EXIT_DONE
 
 
+def cmd_engine_capture(args, env, out, state):
+    """engine-capture: read the engine with the owner profile and write tests/engine/helios-<version>.json (reads only; no run is opened).
+
+    The owner session reads the version, the view columns, the PASSWORD_ variables and, with
+    --fixture-database, SHOW AGGREGATES and the ROUTINES and PIPELINES counts; the runner session
+    counts the same two views, so the file records what the runner sees against the owner. A dry
+    run prints the statements and writes nothing.
+    """
+    config = load_config(args.config, env=env)
+    if config.owner is None and not args.dry_run:
+        raise KitError('engine-capture needs connections.owner in the configuration: the view columns and SHOW AGGREGATES are read with the owner profile')
+    fixture = args.fixture_database
+    if fixture is not None:
+        ident(fixture)  # the shape check before any connection opens; the name itself never reaches the file
+    log = Log(state['redactor'], stream=out, verbose=state['verbose'])
+    sessions = SessionFactory(config, env, log, args.dry_run)
+    try:
+        owner = sessions.owner(read_guard('owner engine-capture'))
+        runner = sessions.runner(read_guard('runner engine-capture')) if fixture else None
+        data = enginecapture.capture(owner, fixture, runner)
+    finally:
+        sessions.close()
+    if args.dry_run:
+        print('DRY RUN: engine-capture issued the reads above and writes nothing', file=out)
+        return EXIT_DONE
+    path = Path(args.out) if args.out else enginecapture.default_path(bundle.kit_root(), data['engine_version'])
+    written = enginecapture.write_capture(data, path)
+    for line in enginecapture.summary_lines(data, written):
+        print(state['redactor'](line), file=out)
+    return EXIT_DONE
+
+
 def not_implemented(name, milestone):
     """A handler that refuses a command whose module lands in a later milestone."""
     def _handler(args, env, out, state):
@@ -1372,7 +1410,7 @@ DISPATCH = {'run': cmd_run, 'step': cmd_step, 'gate': cmd_gate, 'status': cmd_st
             'profile': cmd_profile, 'plan': cmd_plan, 'calibrate': cmd_calibrate, 'mark-recopy': cmd_mark_recopy, 'pause': cmd_pause,
             'resume': cmd_resume, 'watch': cmd_watch, 'quiet-proof': cmd_quiet_proof, 'report': cmd_report, 'owner-sql': cmd_owner_sql,
             'owner-notebook': cmd_owner_notebook, 'account-sql': cmd_account_sql, 'lockout': cmd_lockout, 'rehearse': cmd_rehearse,
-            'check': cmd_check, 'bundle': cmd_bundle, 'abandon': cmd_abandon}
+            'check': cmd_check, 'bundle': cmd_bundle, 'abandon': cmd_abandon, 'engine-capture': cmd_engine_capture}
 for _name, _label, _help, _milestone in COMMANDS:
     if _milestone is not None:
         DISPATCH[_name] = not_implemented(_name, _milestone)
