@@ -55,7 +55,7 @@ def _source_back(b, names, position):
         b.statement('DETACH DATABASE %s' % ident(source), 'detach the read-only source',
                     detach={'wait': names['detach_wait_seconds'], 'kill': bool(names['detach_kill'])})
     if position in ('frozen', 'detached'):
-        b.check('source storage detached', switch.BRANCH_SQL, (sid,), ownersql.Expect('column_equals', 'IS_DETACHED', 1))
+        b.check('source storage detached', switch.RECORD_STATE_SQL, (source, sid, names['source_cid']), ownersql.Expect('column_equals', 'IS_DETACHED', 1))
         b.check('source record detached', switch.DETACHED_RECORD_SQL, (source, sid), ownersql.Expect('columns_equal', value=ownersql.record_expect(names, 'source')))
         b.check('no attached database named source', switch.ATTACHED_SQL, (source,), ownersql.Expect('no_rows'))
         b.statement('ATTACH DATABASE %s STORAGEID %s' % (ident(source), sid), 'attach the same storage read write')
@@ -141,7 +141,7 @@ def position(ctx, names):
     try:
         att = freeze.source_attachment(reader, ctx.db.source)
         if att is None:
-            return 'detached' if freeze.storage_detached(reader, names['source_sid'], ctx.log, 'owner') else 'frozen'
+            return 'detached' if freeze.storage_detached(reader, names, ctx.log, 'owner') else 'frozen'
         if str(att.get('STORAGE_ID')) == str(names['source_sid']) and str(att.get('ATTACH_TYPE')).upper() == 'READWRITE':
             return 'writable'
         return 'frozen'

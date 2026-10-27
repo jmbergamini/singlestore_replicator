@@ -400,7 +400,8 @@ def place(ctx, inventory, kinds, step):
     verified. A refusal (a body naming the source) or a missing owner profile with routines to
     create returns the Outcome the step ends with. A dry run prints the statements and records
     nothing. The ROUTINES row count of the replacement after the O7 gate is recorded in the
-    journal (routine_count) for the S3 check of the switch.
+    journal (routine_count) for the S3 check of the switch; at O7 with no procedure to create
+    (none captured, or all ignored) record_count records it instead.
     """
     refusal = refuse_source_names(inventory, ctx.config, ctx.db, kinds)
     if refusal:
@@ -412,6 +413,8 @@ def place(ctx, inventory, kinds, step):
     if left:
         ctx.log('routines ignored by %s at %s: %s' % (IGNORE_KEY, step, ', '.join(left)))
     if not keep:
+        if step == 'O7':
+            record_count(ctx)
         return None
     if not ctx.owner_configured and not ctx.dry_run:
         return steps.Outcome(steps.PENDING, '%d routine(s) to create at %s (%s) need the owner profile; configure connections.owner, then rerun %s'
@@ -427,6 +430,26 @@ def place(ctx, inventory, kinds, step):
     finally:
         owner.close()
     return None
+
+
+def record_count(ctx):
+    """O7 with no procedure to create: the ROUTINES row count of the replacement, recorded for the S3 check as the O7 gate records it.
+
+    The functions, TVFs and aggregates O5 created count too, so S3 counts the routines on the
+    live name whether or not a procedure was captured. Read through the O7 owner guard; without
+    the owner profile, or in a dry run, nothing is read, since the runner sees no row in ROUTINES
+    (fact 21).
+    """
+    if ctx.dry_run or not ctx.owner_configured:
+        return None
+    owner = ctx.owner_session(steps.guard_for('O7', ctx.db, steps.OWNER))
+    try:
+        count = _count(owner.query(ROUTINE_COUNT_SQL, (ctx.db.replacement,)))
+    finally:
+        owner.close()
+    ctx.journal.set_meta(ROUTINE_COUNT_META, str(count))
+    ctx.log('routines: no procedure to create at O7; %d routine(s) in %s recorded for the S3 count' % (count, ctx.db.replacement))
+    return count
 
 
 def expected_count(journal):

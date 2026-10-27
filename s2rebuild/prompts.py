@@ -7,8 +7,9 @@ answer is read with getpass and is never echoed, logged or written to a file. Ev
 write goes through write_keychain (security add-generic-password -U; tests replace it with a
 fake store) and every read of an item the kit may fill through read_item. The pipeline
 credentials are asked by field per source type (S3, Kafka; other types by the CONFIG keys
-the pipeline uses), assembled as the CREDENTIALS JSON and stored in the Keychain item named
-in pipelines.credentials_keychain; a blank answer skips the source type and the journal
+the pipeline uses), assembled as the CREDENTIALS JSON and stored in the Keychain item each
+pipeline is read from (pipelines.per_pipeline_keychain, else credentials_keychain by source
+type; keychain_item_for); a blank answer skips the source type and the journal
 records it (pipelines.record_skip). The runner password is generated from the workspace
 policy (the PASSWORD_ variables read through the owner session at P1) and stored the same
 way. Statements issued by this module: the SELECT of the PASSWORD_ variables (read_policy).
@@ -293,10 +294,14 @@ def pipeline_credentials(items, config, journal, log, env, redactor=None, step='
 
     Only expected pipelines whose definition carries the credentials placeholder count. A type
     whose every pipeline already resolves (pipelines.credential_for: the Keychain item, else the
-    variable) is not asked; a type with no Keychain item configured cannot be stored and is
-    named with the variable to export instead; a skipped type is recorded with
+    variable) is not asked; the missing pipelines are asked once per Keychain item they are read
+    from (keychain_item_for: the per-pipeline item, else the type item) and each answer is
+    stored in that item, so credential_for finds it; a pipeline with no Keychain item configured
+    cannot be stored and the type is named with the variable to export instead; a blank first
+    answer skips the whole type and asks no further item of it; a skipped type is recorded with
     pipelines.record_skip, so the O9 count gate, the plan sheet and the final report list its
-    pipelines. Returns {source_type: status}. Nothing of a value reaches the log.
+    pipelines. Returns {source_type: status}, the status SKIPPED, else NO_TERMINAL when any item
+    of the type got it, else GIVEN. Nothing of a value reaches the log.
     """
     from . import pipelines
     from .sqlutil import secret_forms
@@ -316,27 +321,34 @@ def pipeline_credentials(items, config, journal, log, env, redactor=None, step='
                 missing.append(item)
         if not missing:
             continue
-        service = config.pipelines.credentials_keychain.get(source_type)
-        if not service:
+        # each missing pipeline is filled in the item credential_for reads for it: its per-pipeline item, else the type item
+        by_service = {}
+        for item in missing:
+            by_service.setdefault(keychain_item_for(item, config), []).append(item)
+        statuses = []
+        if None in by_service:
             var = config.pipelines.credentials_env.get(source_type)
             log('pipeline credentials for %s: no Keychain item is configured (pipelines.credentials_keychain), so nothing is asked; '
                 '%s for O9 only' % (source_type, ('export %s' % var) if var else 'set pipelines.credentials_env or credentials_keychain'))
-            outcome[source_type] = NO_TERMINAL
-            continue
-        status, text, values = ask_credentials(source_type, missing, say=log.plain)
-        outcome[source_type] = status
-        if status == GIVEN:
-            if redactor is not None:
-                for value in values:
-                    redactor.extend(secret_forms(value))
-            write_keychain(service, text)
-            log('pipeline credentials for %s stored in Keychain item %s (%d pipelines)' % (source_type, service, len(missing)))
-            journal.event('credentials_stored', '%s: %s credentials stored in Keychain item %s' % (step, source_type, service))
-        elif status == SKIPPED:
-            names = pipelines.record_skip(journal, source_type, [i['name'] for i in group], step)
-            log('pipeline credentials for %s: none given, so these pipelines will not be recreated at O9: %s' % (source_type, ', '.join(names)))
-        else:
-            log('pipeline credentials for %s: no terminal to ask at; O9 asks again, or reads Keychain item %s or the variable' % (source_type, service))
+            statuses.append(NO_TERMINAL)
+        for service in sorted(s for s in by_service if s):
+            members = by_service[service]
+            status, text, values = ask_credentials(source_type, members, say=log.plain)
+            statuses.append(status)
+            if status == GIVEN:
+                if redactor is not None:
+                    for value in values:
+                        redactor.extend(secret_forms(value))
+                write_keychain(service, text)
+                log('pipeline credentials for %s stored in Keychain item %s (%d pipelines)' % (source_type, service, len(members)))
+                journal.event('credentials_stored', '%s: %s credentials stored in Keychain item %s' % (step, source_type, service))
+            elif status == SKIPPED:
+                names = pipelines.record_skip(journal, source_type, [i['name'] for i in group], step)
+                log('pipeline credentials for %s: none given, so these pipelines will not be recreated at O9: %s' % (source_type, ', '.join(names)))
+                break
+            else:
+                log('pipeline credentials for %s: no terminal to ask at; O9 asks again, or reads Keychain item %s or the variable' % (source_type, service))
+        outcome[source_type] = next((s for s in (SKIPPED, NO_TERMINAL) if s in statuses), GIVEN)
     return outcome
 
 

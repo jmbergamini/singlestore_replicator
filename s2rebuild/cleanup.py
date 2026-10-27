@@ -15,6 +15,7 @@ a comparison with the record the run recorded (name, STORAGE_ID, ATTACH_TYPE, CO
 the live name must still resolve to the live record. Any other outcome issues nothing and
 records the event. Statements issued: DETACH DATABASE, ATTACH DATABASE and DROP DATABASE on the
 retained name only, through the cleanup owner guard; SELECT on the attachment and branch views.
+Every session is an owner session: C4 dropped the runner account before C5 runs.
 """
 import sys
 
@@ -115,9 +116,9 @@ def delete(ctx, name):
         return 'kept by customer: the typed name did not match %s; nothing was issued' % name
     guard = steps.guard_for(COMMAND, ctx.db, steps.OWNER)
     owner = ctx.owner_session(guard)
-    runner = ctx.runner_session(steps.guard_for('O8', ctx.db))
     try:
-        machine = switch.SwitchMachine(owner, names, ctx.journal, ctx.log, runner, open_session=ctx.owner_session, guard=guard)
+        # no runner session: C4 dropped the runner account before C5, and no check of this flow counts rows
+        machine = switch.SwitchMachine(owner, names, ctx.journal, ctx.log, None, open_session=ctx.owner_session, guard=guard)
         ctx.journal.event('cleanup_started', 'the customer typed the retained name %s' % name)
         machine._identify('cleanup: the retained name holds the recorded record READONLY', name, recorded, ACCESS='READONLY')
         machine._run('DETACH DATABASE %s' % ident(name), 'cleanup DETACH retained')
@@ -135,7 +136,6 @@ def delete(ctx, name):
         machine._identify('cleanup: the live name still resolves to the live record', ctx.db.source, ctx.journal.attachment('live'), ACCESS='READWRITE')
     finally:
         owner.close()
-        runner.close()
     when = iso(utc_now())
     ctx.journal.set_meta('retained_deleted_utc', when)
     ctx.journal.event('retained_deleted', 'the customer deleted the retained copy %s (%s) at %s' % (name, switch.record_text(recorded), when))

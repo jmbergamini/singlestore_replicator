@@ -848,7 +848,9 @@ def record_gate(journals, step_id, passed, note, evidence_path=None, override=No
     """Record a gate decision for every selected database journal. Returns the Step.
 
     A gate for C1 or C2 needs override, the reason a person records it instead of the kit; it is
-    journaled as a gate_override event just before the gate.
+    journaled as a gate_override event just before the gate. A passed O10 gate (a switch made by
+    hand or by the notebook) records switched_utc when the kit's S3 did not, so C2 can record
+    retain_until_utc: the gate time is never before the switch, so the retention is never short.
     """
     step = gate_step(step_id, override)
     if not note or not str(note).strip():
@@ -860,6 +862,9 @@ def record_gate(journals, step_id, passed, note, evidence_path=None, override=No
         if passed and step.id == 'O11' and not journal.get_meta('released_utc'):
             # the release recorded by hand starts the C1 error window too
             journal.set_meta('released_utc', iso(utc_now()))
+        if passed and step.id == 'O10' and not journal.get_meta('switched_utc'):
+            # the switch recorded by hand: the gate time stands for the switch time C2 adds closeout.retain_days to
+            journal.set_meta('switched_utc', iso(utc_now()))
     return step
 
 

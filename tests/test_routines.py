@@ -2,9 +2,10 @@
 
 Author: John Bergamini
 
-Eight tests: the capture of each kind, the creation order (an aggregate before its functions
-fails, after passes), a procedure that reads a view, a load target INTO PROCEDURE at O9, the
-ignore list, the source-name refusal, the definer fallback and the runner's invisibility.
+Nine tests: the capture of each kind, the creation order (an aggregate before its functions
+fails, after passes), a procedure that reads a view, the S3 routine count without a procedure,
+a load target INTO PROCEDURE at O9, the ignore list, the source-name refusal, the definer
+fallback and the runner's invisibility.
 """
 import functools
 import json
@@ -176,6 +177,20 @@ class RoutineTests(unittest.TestCase):
         with self.assertRaisesRegex(KitError, r'O7 stopped: round 1 created none of the procedures still missing: p_read \(server error 1146'):
             R.create(owner_session(early, 'O7'), TGT, [dict(P_READ)], early.journal, early.log, step='O7')
         self.assertEqual(created_in(early), [])
+
+    def test_o7_without_a_procedure_still_records_the_routine_count_for_s3(self):
+        """Functions only: O7 has no procedure to create, yet it records the ROUTINES count of the replacement (the function O5
+        created), so S3 still counts the routines on the live name."""
+        h = owner_harness(self, mutate_inventory=with_routines([F_ADD]))
+        self.assertEqual(h.o5_o6().status, steps.PASSED, h.text())
+        out = h.step('O7')
+        self.assertEqual(out.status, steps.PASSED, h.text())
+        self.assertEqual(h.journal.get_meta(R.ROUTINE_COUNT_META), '1')
+        self.assertIn('routines: no procedure to create at O7; 1 routine(s) in %s recorded for the S3 count' % TGT, h.text())
+        counts = ownersql.expected_counts(h.ctx())
+        self.assertEqual(counts['routines'], 1)
+        block = switch.forward_block(ownersql.names_for(h.ctx()), counts)
+        self.assertIn('S3 after: routines count equals the capture', [i.label for i in block.items])
 
     def test_o9_creates_a_load_target_into_a_procedure_once_o7_made_it(self):
         """A pipeline INTO PROCEDURE needs its procedure: O9 before O7 created it fails on the CREATE PIPELINE with 1305 and leaves no

@@ -6,13 +6,15 @@ Release 1.0 W3. The fake's branch records are on (its defaults); refuse_read_onl
 off until the live test I0b decides whether a branch of a READ ONLY attachment is refused, and
 one test turns it on to exercise R2c.
 """
+import datetime as dt
+import re
 import unittest
 from unittest import mock
 
-from s2rebuild import cleanup, ownersql, steps, switch
-from s2rebuild.common import EXIT_DONE, KitError
+from s2rebuild import cleanup, ownersql, report_xlsx, steps, switch
+from s2rebuild.common import EXIT_DONE, KitError, iso, parse_utc
 from tests.helpers import run_cli
-from tests.test_copy import SRC, TGT
+from tests.test_copy import SRC, TGT, Harness
 from tests.test_identity import attach_writes
 from tests.test_switch import RET, SID, machine_for, old_kit_switch, switched_harness, verified_harness
 
@@ -64,6 +66,32 @@ class TwoEntrySwitchTests(unittest.TestCase):
         self.assertEqual([i.sql for i in block.statements][3], 'DROP DATABASE `%s`' % SRC)
         self.assertLess(block.render().index('S2b proof'), block.render().index('DROP DATABASE `%s`;' % SRC))
         self.assertIn('gate: the original storage holds one entry', block.render())
+
+    def test_a_branch_of_the_source_made_before_the_run_fails_p2_and_refuses_s1_with_nothing_issued(self):
+        """A customer branch of the source shares its STORAGE_ID (fact 27) and would be a third entry found only after the DROP of S2b:
+        P2 fails naming it, and the S1 before-checks refuse with the listing before any statement."""
+        branch = 'ATTACH DATABASE `%s` AS `%s_dev` STORAGEID %s' % (SRC, SRC, SID)
+        fresh = Harness(self)
+        fresh.journal.record_gate('P1', True, 'test')
+        self.assertEqual(fresh.step('P2').status, steps.PASSED, fresh.text())
+        self.assertIn('source storage: STORAGE_ID %s holds the source record only (as the runner sees it' % SID, fresh.text())
+        fresh.fake.connect('admin').cursor().execute(branch)
+        out = fresh.step('P2')
+        self.assertEqual((out.status, out.exit_code), (steps.FAILED, 4), fresh.text())
+        self.assertIn('source storage: FAILED, STORAGE_ID %s holds 1 record(s) besides the source: name %s_dev, STORAGE_ID %s, ATTACH_TYPE pitr'
+                      % (SID, SRC, SID), out.note)
+        h = switched_harness(self)
+        machine, _ = machine_for(h)
+        h.fake.connect('admin').cursor().execute(branch)
+        before = attach_writes(h)
+        with self.assertRaisesRegex(KitError, r'Switch refused at "S1 before \(for S2b\): the original storage holds one entry, the original '
+                                    r'record".*Extra: name %s_dev, STORAGE_ID %s, ATTACH_TYPE pitr.*nothing was issued' % (SRC, SID)):
+            machine.forward()
+        self.assertEqual(attach_writes(h), before, 'the source was not detached')
+        self.assertEqual(machine.position(), switch.NOT_STARTED)
+        block = switch.forward_block(ownersql.names_for(h.ctx()))
+        labels = [i.label for i in block.items]
+        self.assertLess(labels.index(switch.STORAGE_ONLY_LABELS['source']), labels.index(block.statements[0].label), 'the printed block checks it before S1')
 
     def test_s2b_refuses_the_drop_when_the_zero_change_proof_fails_and_leaves_the_original_attached(self):
         """A foreign session on the original attached under the live name: no DROP, the original stays attached read write (the rollback state),
@@ -131,6 +159,22 @@ class TwoEntrySwitchTests(unittest.TestCase):
         self.assertIn('the retained name %s is gone' % RET, h2.journal.events('rollback')[-1])
         self.assertNotIn('DROP DATABASE `%s`' % RET, h2.fake.writes)
 
+    def test_a_second_record_listed_first_on_the_original_storage_strands_neither_s1_nor_r2a(self):
+        """A dropped record of an earlier attempt listed first on the original storage (facts 35, 33): S1 reaches the detached position, and
+        after S2 with the retained record listed first R2a still re-attaches the original; both read the original by its record."""
+        h = switched_harness(self)
+        machine, _ = machine_for(h)
+        earlier = h.fake.record(SRC, SID, 'cid-0', 'pitr', SRC)
+        earlier.update(IS_DETACHED=0, IS_DROPPED=1)
+        h.fake.branches.insert(0, earlier)
+        machine.s1()
+        self.assertEqual(machine.position(), switch.DETACHED)
+        machine.s2()
+        h.fake.branches.reverse()
+        self.assertEqual([b['DATABASE_NAME'] for b in h.fake.branches if b['STORAGE_ID'] == SID][0], RET, 'the retained record comes first')
+        self.assertEqual(machine.rollback(), switch.ORIGINAL_ATTACHED)
+        self.assertEqual(h.fake.attachment(SRC)['COMPUTE_ID'], 'cid-1')
+
     def test_a_default_run_issues_no_drop_of_the_retained_name_from_o1_through_c4(self):
         """O10 with the owner profile, then C3 and C4: the retained copy is attached read only at the end and no DROP of its name was issued."""
         h = verified_harness(self)
@@ -195,6 +239,68 @@ class EndStateTests(unittest.TestCase):
         self.assertEqual(len(h.journal.events('endstate_probe')), 1)
         self.assertEqual(h.step('C3').status, steps.PASSED, 'a rerun passes the gate without the repair')
 
+    def test_a_repair_stopped_after_its_drop_of_the_original_resumes_on_rerun(self):
+        """The connection drops before the live record is re-attached: the live name is left detached, and the rerun of C3 resumes the
+        repair (its own DROP is not S2b) with the re-attach and the replacement DROP, issuing no statement twice."""
+        h = repair_ready(self)
+        live_cid = h.journal.attachment('live')['compute_id']
+        h.fake.fail_statement(r"^ATTACH DATABASE `%s` AT MILESTONE .* COMPUTEID %s$" % (SRC, re.escape(live_cid)))
+        before = attach_writes(h)
+        self.assertEqual(h.step('C3', yes=True).status, steps.REFUSED, h.text())
+        self.assertIsNone(h.fake.attachment(SRC), 'the live name is detached')
+        self.assertIn('repair DROP original record', h.journal.events('switch_statement'))
+        self.assertEqual(h.step('C3', yes=True).status, steps.PASSED, h.text())
+        writes = attach_writes(h)[len(before):]
+        self.assertEqual(len(writes), 5, writes)
+        self.assertEqual((writes[0], writes[2], writes[4]), ('DETACH DATABASE `%s`' % SRC, 'DROP DATABASE `%s`' % SRC, 'DROP DATABASE `%s`' % TGT))
+        self.assertTrue(writes[1].endswith('COMPUTEID cid-1') and writes[3].endswith('COMPUTEID ' + live_cid), writes)
+        self.assertEqual(entries(h), [(SRC, 'pitr'), (RET, 'resume')])
+
+    def test_a_repair_stopped_at_the_proof_continues_there_on_rerun(self):
+        """A foreign session on the original attached under the live name stops the repair before its DROP; once it is gone the rerun of C3
+        continues at the proof with the original attached, not at the live record check, and ends at two entries."""
+        h = repair_ready(self)
+        session = {'ID': 9, 'USER': 'app', 'HOST': 'h', 'DB': SRC, 'COMMAND': 'Query', 'TIME': 1, 'INFO': 'INSERT INTO t VALUES (1)'}
+        h.fake.change_before(r"^ATTACH DATABASE `%s` AT MILESTONE .* COMPUTEID cid-1$" % SRC, lambda db: db.processlist.append(session))
+        before = attach_writes(h)
+        out = h.step('C3', yes=True)
+        self.assertEqual(out.status, steps.REFUSED, h.text())
+        self.assertIn('rerun s2rebuild step C3, which continues at the proof', out.note)
+        self.assertEqual(h.fake.attachment(SRC)['COMPUTE_ID'], 'cid-1', 'the original is attached under the live name')
+        h.fake.processlist = []
+        self.assertEqual(h.step('C3', yes=True).status, steps.PASSED, h.text())
+        writes = attach_writes(h)[len(before):]
+        self.assertEqual([w.split(' AT MILESTONE ')[0] for w in writes], ['DETACH DATABASE `%s`' % SRC, 'ATTACH DATABASE `%s`' % SRC,
+                                                                           'DROP DATABASE `%s`' % SRC, 'ATTACH DATABASE `%s`' % SRC,
+                                                                           'DROP DATABASE `%s`' % TGT])
+        self.assertEqual(entries(h), [(SRC, 'pitr'), (RET, 'resume')])
+
+    def test_the_repair_refuses_before_any_detach_when_nothing_is_left_to_repair(self):
+        """A two-entry switch that left no switch_statement event (a hand or notebook O10) and a third entry: C3 offers the repair, which reads
+        the original dropped and the replacement name free and refuses with the listing; the live name is never detached."""
+        h = switched_harness(self)
+        machine, names = machine_for(h)
+        self.assertEqual(machine.forward(), switch.COMPLETE, h.text())
+        h.journal.conn.execute("DELETE FROM events WHERE kind = 'switch_statement'")
+        for step_id in ('O7', 'O8', 'O9', 'O10', 'O11', 'C1', 'C2'):
+            h.journal.step_end(step_id, 'passed', 'test')
+        h.fake.connect('admin').cursor().execute('ATTACH DATABASE `%s` AS `%s_extra` STORAGEID %s' % (SRC, SRC, names['replacement_sid']))
+        before = attach_writes(h)
+        out = h.step('C3', yes=True)
+        self.assertEqual(out.status, steps.REFUSED, h.text())
+        self.assertIn('nothing to repair, so nothing was issued', out.note)
+        self.assertEqual(attach_writes(h), before, 'the live name was not detached')
+        self.assertEqual(h.fake.attachment(SRC)['COMPUTE_ID'], h.journal.attachment('live')['compute_id'])
+
+
+def repair_ready(test):
+    """A harness after a switch by an older kit (four entries) with O7 to C2 passed, ready for the C3 repair."""
+    h = switched_harness(test)
+    old_kit_switch(h)
+    for step_id in ('O7', 'O8', 'O9', 'O10', 'O11', 'C1', 'C2'):
+        h.journal.step_end(step_id, 'passed', 'test')
+    return h
+
 
 class CleanupTests(unittest.TestCase):
     def test_cleanup_before_the_date_refuses_and_the_listing_prints(self):
@@ -226,11 +332,15 @@ class CleanupTests(unittest.TestCase):
         self.assertEqual(h.fake.writes, before)
 
     def test_the_typed_name_runs_detach_reattach_by_syntax_and_drop_by_record(self):
+        """After C4 the runner account is gone, so the delete opens owner sessions only."""
         h = complete_run(self)
+        h.journal.step_end('C4', 'passed', 'test')
+        h.fake.fail_connect('s2rebuild_runner', times=5)
         before = attach_writes(h)
         with mock.patch.object(cleanup, 'ask', lambda prompt: RET):
             note = cleanup.delete(h.ctx(), RET)
         self.assertIn('deleted', note)
+        self.assertNotIn(('connect', 's2rebuild_runner'), h.fake.faults_fired, 'no runner connection was tried')
         writes = attach_writes(h)[len(before):]
         self.assertEqual(writes[0], 'DETACH DATABASE `%s`' % RET)
         self.assertTrue(writes[1].startswith("ATTACH DATABASE `%s` AT MILESTONE '" % RET) and writes[1].endswith('COMPUTEID ' + h.journal.attachment('retained')['compute_id']))
@@ -241,6 +351,19 @@ class CleanupTests(unittest.TestCase):
         self.assertEqual(h.fake.attachment(SRC)['COMPUTE_ID'], h.journal.attachment('live')['compute_id'], 'the live name is untouched')
         self.assertEqual(len(h.journal.events('retained_deleted')), 1)
         self.assertIsNotNone(h.journal.get_meta('retained_deleted_utc'))
+
+    def test_a_switch_recorded_by_hand_gets_its_retain_until_date_at_c2(self):
+        """The hand route (no owner profile) has no kit S3 to record the switch time: gate O10 --pass records it, so C2 records
+        retain_until_utc, the date C5 waits for, instead of leaving it unrecorded for the life of the run."""
+        h = verified_harness(self, owner=False)
+        code, text = run_cli(['gate', 'O10', '--pass', '--note', 'switched by hand', '--config', str(h.config_path), '--run', h.run_id], env=h.env)
+        self.assertEqual(code, EXIT_DONE, text)
+        switched = h.journal.get_meta('switched_utc')
+        self.assertIsNotNone(switched, 'the gate time stands for the switch time')
+        until = report_xlsx.record_retain_until(h.ctx())
+        self.assertEqual(until, iso(parse_utc(switched, 'switched_utc') + dt.timedelta(days=90)))
+        self.assertEqual(h.journal.get_meta('retain_until_utc'), until)
+        self.assertIn('retained copy %s kept until %s (closeout.retain_days 90)' % (RET, until), h.text())
 
 
 if __name__ == '__main__':

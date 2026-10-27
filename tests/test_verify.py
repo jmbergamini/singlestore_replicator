@@ -4,6 +4,7 @@ deadline, the rerun flags, acceptance without a rerun, verified_at rule.
 Author: John Bergamini
 """
 import functools
+import threading
 import unittest
 from unittest import mock
 
@@ -15,7 +16,7 @@ from s2rebuild import verify as V
 from s2rebuild.common import EXIT_DONE, KitError
 from s2rebuild.connect import DryRunSession, Log
 from s2rebuild.sqlutil import read_guard, runner_guard
-from tests.fakedb import SimulatedCrash, crc32, key_text, multiset
+from tests.fakedb import FakeDisconnect, SimulatedCrash, crc32, key_text, multiset
 from tests.helpers import FAULT_POINTS, crash_journal
 from tests.test_copy import FIXTURE_TABLES, SRC, TGT, Harness
 
@@ -460,6 +461,26 @@ class ReworkTests(unittest.TestCase):
             self.assertIsNotNone(r.seconds)
             self.assertIn('tier 3 %s: match in ' % r.table, h.text(), 'one log line per table with the elapsed seconds')
         self.assertIn('tier 3: 4 tables on 3 sessions, largest first', h.text())
+
+    def test_a_fingerprint_session_that_cannot_open_fails_o8_and_nothing_escapes_its_thread(self):
+        """Every tier 3 session fails to open (error 2003, as while the workspace resumes): the error is raised after the join, so O8 is
+        recorded failed, not pending with an instruction to run what was just run, and no exception reaches the thread hook."""
+        h = copied(self, mutate=lambda d: d.update(verify={'sessions': 2}))
+        self.assertEqual(h.step('O7').status, steps.PASSED, h.text())
+        # armed by the first tier 1 count, so the O8 step session is open and both fingerprint sessions after it fail
+        h.fake.change_before(r'^SELECT COUNT\(\*\) AS n FROM `', lambda db: db.fail_connect('s2rebuild_runner', times=2))
+        escaped = []
+        old = threading.excepthook
+        threading.excepthook = escaped.append
+        try:
+            with self.assertRaises(FakeDisconnect):
+                h.step('O8')
+        finally:
+            threading.excepthook = old
+        self.assertEqual(escaped, [], 'no exception escaped a fingerprint thread')
+        self.assertEqual([f for f in h.fake.faults_fired if f[0] == 'connect'], [('connect', 's2rebuild_runner')] * 2)
+        self.assertEqual(h.journal.step_status('O8'), 'failed')
+        self.assertIn('result: failed: interrupted by FakeDisconnect (error 2003)', h.text())
 
     def test_threshold_samples_the_time_range_and_notes_a_table_without_an_orderable_column(self):
         """Over the threshold: t_comp (300 rows, time column b) gets a 5 percent range of b on both sides; t_single and t_nokey have no

@@ -385,8 +385,11 @@ class Verifier:
             return None
 
         def _work(worker):
-            session = self._open_session()
+            # the open sits inside the try: a session that cannot open (2003 while the workspace resumes) is raised after the join, so O8
+            # records failed with the driver line, and nothing escapes the thread unredacted
+            session = None
             try:
+                session = self._open_session()
                 while not errors:
                     item = _take(worker)
                     if item is None:
@@ -403,7 +406,7 @@ class Verifier:
                 with lock:
                     errors.append(exc)
             finally:
-                if session is not self.session:
+                if session is not None and session is not self.session:
                     session.close()
 
         if self.sessions == 1 and self.connector is None:

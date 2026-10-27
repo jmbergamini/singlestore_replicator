@@ -865,11 +865,12 @@ def preflight(runner, db, config, owner=None):
 
     Connection and engine version; the runner's privileges against section 5, each missing one by
     name; whether the runner may create branches (recorded, not assumed); the source layout and
-    STORAGE_ID; the replacement and retained names free; leaf cores times 8 against the target
-    partition count when MV_NODES is readable; with the owner profile, its connection, the
-    pipelines it can see and the routines by kind with the ones objects.routines.ignore lists
-    (the runner sees none, so without the owner profile the line says so and never "none").
-    Statements issued: SELECT, USE and SHOW only.
+    STORAGE_ID, and that storage holding the source record only (switch.source_storage_extras,
+    read as the owner when configured, since the owner sees every record); the replacement and
+    retained names free; leaf cores times 8 against the target partition count when MV_NODES is
+    readable; with the owner profile, its connection, the pipelines it can see and the routines
+    by kind with the ones objects.routines.ignore lists (the runner sees none, so without the
+    owner profile the line says so and never "none"). Statements issued: SELECT, USE and SHOW only.
     """
     from .ownersql import RUNNER_PRIVILEGES
     ok, lines, facts = True, [], {}
@@ -903,6 +904,18 @@ def preflight(runner, db, config, owner=None):
     else:
         facts['source_attachment'] = dict(attached[0])
         lines.append('source STORAGE_ID: %s (%s), recorded' % (attached[0].get('STORAGE_ID'), attached[0].get('ATTACH_TYPE')))
+        from . import switch
+        extra = switch.source_storage_extras(owner if owner is not None else runner, attached[0])
+        facts['source_storage_extra'] = extra
+        if extra:
+            ok = False
+            lines.append('source storage: FAILED, STORAGE_ID %s holds %d record(s) besides the source: %s. The run ends with two entries, the '
+                         'live database and the retained copy, so the original storage must hold the source record only; a branch of the '
+                         'source shares its STORAGE_ID (fact 27). Remove each extra record with the customer, or leave this database out '
+                         'of the run, then run check again' % (attached[0].get('STORAGE_ID'), len(extra), '; '.join(extra)))
+        else:
+            lines.append('source storage: STORAGE_ID %s holds the source record only%s' % (
+                attached[0].get('STORAGE_ID'), '' if owner is not None else ' (as the runner sees it; O10 checks again as the owner before S1)'))
     for role, name in (('replacement', db.replacement), ('retained', db.retained)):
         if runner.query(LAYOUT_SQL, (name,)) or runner.query(ATTACHMENT_SQL, (name,)):
             ok = False
@@ -990,6 +1003,8 @@ def handle_p2(step, ctx):
                               (ATTACHMENT_SQL, (ctx.db.source,)), (LAYOUT_SQL, (ctx.db.replacement,)),
                               (LAYOUT_SQL, (ctx.db.retained,)), (LEAF_CORES_SQL, ())):
                 runner.query(sql, args)
+            from . import switch
+            (owner if owner is not None else runner).query(switch.STORAGE_ENTRIES_SQL, ('<source STORAGE_ID>',))
             if owner is not None:
                 owner.query(routines.ROUTINES_SQL, (ctx.db.source,))
                 owner.query(routines.AGGREGATES_SQL)

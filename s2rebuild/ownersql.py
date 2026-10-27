@@ -682,7 +682,9 @@ def endstate_block(names):
 def repair_block(names):
     """C3 repair for a switch made without S2b and S4: the post-switch sequence proven on October 27, 2026, each statement behind a record check.
 
-    Detach the live name; the original record's own ATTACH_SYNTAX; record and row check; DROP
+    The original record detached (checked before anything else, so an original already
+    dropped stops the block before the live name is detached); detach the live name; the
+    original record's own ATTACH_SYNTAX; record and row check; DROP
     the original record; the live record's own ATTACH_SYNTAX (a milestone placeholder, since
     the AT MILESTONE form exists only after the DETACH; the note says where to copy it from);
     DROP the replacement record by its record; the gate. The kit route runs the same sequence
@@ -692,13 +694,16 @@ def repair_block(names):
     block = Block('C3', 'End state repair (a switch made without S2b and S4)')
     block.refuse('run this block only when the end state gate failed and the journal shows no S2b or S4; remove this line by hand once decided')
     block.note(REPAIR_OUTAGE_NOTE)
+    block.note('repair: the first check reads the original record before the live name is detached. When it finds no row, the original is '
+               'attached or already dropped, so this block stops with nothing issued: s2rebuild step C3 with the owner profile resumes a '
+               'repair that stopped part way from the live state, and refuses when nothing is left to repair.')
+    block.check('repair: the original record is detached with its ATTACH_SYNTAX', switch.DETACHED_RECORD_SQL, (names['source'], names['source_sid']),
+                Expect('columns_equal', value=record_expect(names, 'source')))
     block.check('repair: the live name holds the recorded live record', switch.ATTACHED_RECORD_SQL, (names['source'], names['live_sid']),
                 Expect('columns_equal', value=record_expect(names, 'live')))
     block.statement('DETACH DATABASE %s' % ident(names['source']), 'repair: detach the live name',
                     detach={'wait': names['detach_wait_seconds'], 'kill': bool(names['detach_kill'])})
     block.check('repair: no attached database named source', inventory_attachment_sql(), (names['source'],), Expect('no_rows'))
-    block.check('repair: the original record is detached with its ATTACH_SYNTAX', switch.DETACHED_RECORD_SQL, (names['source'], names['source_sid']),
-                Expect('columns_equal', value=record_expect(names, 'source')))
     block.statement(switch.original_syntax(names), 'repair: attach the original record read write by its own ATTACH_SYNTAX')
     block.check('repair: the original record is attached READWRITE under the live name', inventory_attachment_sql(), (names['source'],),
                 Expect('columns_equal', value={'STORAGE_ID': names['source_sid'], 'ATTACH_TYPE': 'READWRITE', 'COMPUTE_ID': names['source_cid']}))
@@ -951,8 +956,11 @@ def handle_c3(step, ctx):
     With the owner profile, when the gate fails and the journal holds no S2b or S4 (a switch by
     an older kit), the repair block is printed with its outage note and runs after the operator
     types proceed (ownersql.ask), or at once with --yes; the gate then runs again. A failed gate
-    with S2b and S4 in the journal refuses with the listing and no repair. Without the owner
-    profile the block is printed and the gate waits for a person.
+    with S2b and S4 in the journal refuses with the listing and no repair. The repair's own
+    statements do not count as S2b or S4, so a repair that stopped part way is offered again and
+    resumes from the live state (switch.SwitchMachine.repair_end_state), which refuses before any
+    statement when nothing is left to repair. Without the owner profile the block is printed and
+    the gate waits for a person.
     """
     from . import switch
     names = names_for(ctx)
@@ -972,7 +980,8 @@ def handle_c3(step, ctx):
             record_endstate_listing(ctx, 'after')
         return out
     entries = record_endstate_listing(ctx, 'before repair')
-    switched_here = names['source_dropped'] or any(d.startswith('S4 DROP') for d in ctx.journal.events('switch_statement'))
+    # S2b and S4 of the kit's switch only: the repair's own DROP of the original marks a repair to resume from the live state, not a switch made with S2b
+    switched_here = any(d.startswith('S2b DROP') or d.startswith('S4 DROP') for d in ctx.journal.events('switch_statement'))
     if switched_here:
         return steps.Outcome(steps.REFUSED, '%s. The journal shows S2b and S4, so no repair applies; entries: %s' % (out.note, switch.listing_text(entries)),
                              EXIT_REFUSED)

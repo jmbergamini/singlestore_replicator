@@ -8,8 +8,8 @@ at most freeze.detach_wait_seconds; then the kit cancels it on its own connectio
 DETACH ... KILL when freeze.detach_kill is set (ownersql.detach_with_escalation). O3 is
 resumable: when the source is already attached READONLY on the recorded STORAGE_ID (a rerun,
 a notebook run or a block run by hand), the kit only checks the attachment, runs the write probe
-and records freeze_time. When no database carries the source name and the recorded storage is
-detached (a stop between DETACH and ATTACH), the kit prints and runs the re-entry block, which
+and records freeze_time. When no database carries the source name and the recorded source record
+is detached (a stop between DETACH and ATTACH), the kit prints and runs the re-entry block, which
 starts at the ATTACH and never detaches again (owner-sql/O3-reentry.sql; owner-sql O3 writes it
 too). The kit reads the position with the owner session when the owner profile is configured,
 else as the runner. The write probe is the one runner statement that
@@ -82,8 +82,14 @@ def reentry_block(names):
 
 
 def _detached_check(b, names):
-    """The gate ahead of every ATTACH: MV_CLOUD_BRANCHES shows the recorded source storage IS_DETACHED = 1."""
-    b.check('source storage detached', switch.BRANCH_SQL, (names['source_sid'],), ownersql.Expect('column_equals', 'IS_DETACHED', 1))
+    """The gate ahead of every ATTACH: MV_CLOUD_BRANCHES shows the recorded source record (name, STORAGE_ID, COMPUTE_ID) IS_DETACHED = 1.
+
+    The source's own record, never the first row of its storage: a branch of the source and a
+    record of an earlier attempt that left the Portal list share the STORAGE_ID (facts 27 and
+    35), in no fixed order (fact 33).
+    """
+    b.check('source storage detached', switch.RECORD_STATE_SQL, (names['source'], names['source_sid'], names['source_cid']),
+            ownersql.Expect('column_equals', 'IS_DETACHED', 1))
 
 
 def _attach(b, names):
@@ -184,15 +190,18 @@ def source_attachment(session, source):
     return dict(rows[0]) if rows else None
 
 
-def storage_detached(session, storage_id, log=None, identity='runner'):
-    """True when MV_CLOUD_BRANCHES shows the storage with IS_DETACHED = 1 (a SELECT; issues nothing else).
+def storage_detached(session, names, log=None, identity='runner'):
+    """True when MV_CLOUD_BRANCHES shows the recorded source record (name, STORAGE_ID, COMPUTE_ID) with IS_DETACHED = 1 (a SELECT; issues nothing else).
+
+    The source's own record, never the first row of its storage (see _detached_check).
 
     A read error (a lost connection, or an account without access to the view) returns False
     and is logged with the identity, the error type and the error number only. The caller then
     gives the whole block, whose first check stops with the observed state.
     """
+    storage_id = names['source_sid']
     try:
-        rows = session.query(switch.BRANCH_SQL, (storage_id,))
+        rows = session.query(switch.RECORD_STATE_SQL, (names['source'], storage_id, names['source_cid']))
     except Exception as exc:  # noqa: BLE001 - the whole block's first check reports the state instead
         args = getattr(exc, 'args', ())
         number = args[0] if args and isinstance(args[0], int) else 'unknown'
@@ -237,7 +246,7 @@ def handle_o3(step, ctx):
     The position comes from the attachment views, read with the owner session when the owner
     profile is configured (as O10 does), else as the runner: the source READONLY on the
     recorded STORAGE_ID resumes at the probe; no database under the source name with the
-    recorded storage detached resumes at the ATTACH through the normal admin flow (printed to
+    recorded source record detached resumes at the ATTACH through the normal admin flow (printed to
     owner-sql/O3-reentry.sql, executed with the owner profile or left for the gate). Anything
     else gets the whole block, whose first checks refuse a source name held by another storage.
     A read error on the branch view, and a dry run (it opens no connection), also get the whole
@@ -260,7 +269,7 @@ def handle_o3(step, ctx):
                 ctx.log('source %s is already READONLY on STORAGE_ID %s; resuming at the probe' % (ctx.db.source, names['source_sid']))
                 results = ownersql.execute_block(b, reader, ctx.log, ctx.journal)
             elif att is None:
-                detached = storage_detached(reader, names['source_sid'], ctx.log, identity)
+                detached = storage_detached(reader, names, ctx.log, identity)
         finally:
             reader.close()
         if results is not None:

@@ -114,7 +114,7 @@ Each table below lists a key with its type, default, range, the steps that read 
 |---|---|---|---|---|---|
 | `pipelines.route` | enum | `kit` | `kit`, `customer` | P3, O9 | who replays the definitions: the kit from the capture, or the customer from the placeholder file |
 | `pipelines.credentials_keychain` | mapping | `{}` | source type to Keychain item (`S3: s2rebuild-pipelines-s3`) | P3, O9 | the item the credential prompt fills (by field per source type) and O9 reads before the variables; a type without an entry is not asked and keeps its variable |
-| `pipelines.per_pipeline_keychain` | mapping | `{}` | pipeline to Keychain item | O9 | read before the source-type item |
+| `pipelines.per_pipeline_keychain` | mapping | `{}` | pipeline to Keychain item | P3, O9 | read before the source-type item; when it is missing the credential prompt asks for that pipeline alone and fills this item |
 | `pipelines.credentials_env` | mapping | `{KAFKA: S2REBUILD_KAFKA_CREDENTIALS, S3: S2REBUILD_S3_CREDENTIALS}` | source type to variable name | O9, owner-notebook | the fallback when no Keychain item holds the value; exported for O9 only |
 | `pipelines.per_pipeline_env` | mapping | `{}` | pipeline to variable name | O9, owner-notebook | overrides the source-type entry |
 | `pipelines.retention_hours` | mapping | `{}` | source type to hours | P4 plan sheet, O11 | the customer's stated retention, for the gap check |

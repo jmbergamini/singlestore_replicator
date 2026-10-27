@@ -188,6 +188,27 @@ class CredentialPromptTests(unittest.TestCase):
         self.assertFalse(any(w.startswith(('CREATE PIPELINE', 'USE')) for w in failing.fake.writes), 'nothing was issued')
         self.assertNotIn('kpass', failing.text())
 
+    def test_a_missing_per_pipeline_item_is_filled_in_that_item_and_the_type_item_is_kept(self):
+        """A pipeline with a per-pipeline Keychain item configured and absent is asked for alone and its answer goes to that item, the
+        item credential_for reads; the type item that serves the other pipeline of the type stays as it was; the next call asks nothing."""
+        cfg = config_from(lambda d: d.update(pipelines={'credentials_keychain': {'KAFKA': KAFKA_ITEM}, 'per_pipeline_keychain': {'p1': 'p1-item'}}))
+        p2 = dict(ITEM, name='p2', definition=ITEM['definition'].replace('p1', 'p2'))
+        store = fake_store(self, {KAFKA_ITEM: 'type-value'})
+        journal = Journal(MEMORY)
+        self.addCleanup(journal.close)
+        out = io.StringIO()
+        log = Log(redactor=Redactor(), stream=out)
+        scripted(self, ['kuser', 'kpass'])
+        self.assertEqual(prompts.pipeline_credentials([ITEM, p2], cfg, journal, log, {}, step='P3'), {'KAFKA': prompts.GIVEN})
+        self.assertEqual(json.loads(store['p1-item']), {'sasl.username': 'kuser', 'sasl.password': 'kpass'})
+        self.assertEqual(store[KAFKA_ITEM], 'type-value')
+        self.assertIn('credentials for the KAFKA pipelines p1 (', out.getvalue())
+        self.assertEqual(journal.events('credentials_stored'), ['P3: KAFKA credentials stored in Keychain item p1-item'])
+        self.assertEqual(P.credential_for(ITEM, cfg, {}), (store['p1-item'], 'p1-item'))
+        never_asks(self)
+        self.assertEqual(prompts.pipeline_credentials([ITEM, p2], cfg, journal, log, {}, step='O9'), {})
+        P.check_credentials([ITEM, p2], cfg, {})
+
 
 class PasswordTests(unittest.TestCase):
     def test_generator_meets_a_fixture_policy_and_the_checker_names_each_miss(self):
