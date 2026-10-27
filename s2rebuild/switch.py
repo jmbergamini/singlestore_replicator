@@ -73,6 +73,10 @@ SESSIONS_SQL = ('SELECT COUNT(*) AS n FROM information_schema.PROCESSLIST WHERE 
 TABLE_COUNT_SQL = "SELECT COUNT(*) AS n FROM information_schema.TABLES WHERE TABLE_SCHEMA = %s AND TABLE_TYPE = 'BASE TABLE'"
 VIEW_COUNT_SQL = 'SELECT COUNT(*) AS n FROM information_schema.VIEWS WHERE TABLE_SCHEMA = %s'
 PIPELINE_COUNT_SQL = 'SELECT COUNT(*) AS n FROM information_schema.PIPELINES WHERE DATABASE_NAME = %s'
+ROUTINE_COUNT_SQL = 'SELECT COUNT(*) AS n FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA = %s'
+# the S3 after-checks of the capture counts: (label, query, counts key); the routine count is the one the O7 gate recorded
+COUNT_CHECKS = (('tables', TABLE_COUNT_SQL, 'tables'), ('views', VIEW_COUNT_SQL, 'views'), ('pipelines', PIPELINE_COUNT_SQL, 'pipelines'),
+                ('routines', ROUTINE_COUNT_SQL, 'routines'))
 RUNNING_PIPELINES_SQL = "SELECT COUNT(*) AS n FROM information_schema.PIPELINES WHERE DATABASE_NAME = %s AND STATE = 'Running'"
 SWITCH_ALLOWANCE_SECONDS = 10 * 60
 
@@ -456,11 +460,11 @@ def forward_block(names, counts=None, s0_problems=None, withheld=None):
                 ownersql.Expect('columns_equal', value={'ATTACH_TYPE': 'pitr', 'PREV_DATABASE_NAME': names['replacement']}), record='live')
     block.check('S3 after: the live database reports the target layout', LAYOUT_SQL, (names['source'],),
                 ownersql.Expect('columns_equal', value={'NUM_PARTITIONS': names['partitions'], 'NUM_SUB_PARTITIONS': names['sub_partitions']}))
-    for label, sql, key in (('tables', TABLE_COUNT_SQL, 'tables'), ('views', VIEW_COUNT_SQL, 'views'), ('pipelines', PIPELINE_COUNT_SQL, 'pipelines')):
+    for label, sql, key in COUNT_CHECKS:
         if counts and counts.get(key) is not None:
             block.check('S3 after: %s count equals the capture' % label, sql, (names['source'],), ownersql.Expect('column_equals', 'n', counts[key]))
     if not counts:
-        block.note('S3 after: no capture is available, so the table, view and pipeline counts are not checked here; the kit refuses O10 without one.')
+        block.note('S3 after: no capture is available, so the table, view, pipeline and routine counts are not checked here; the kit refuses O10 without one.')
     block.note('S3 after: the three smallest non-empty tables match the journal counts (the kit checks these and records the live record).')
     s4_block(block, names)
     gate_block(block, names, 'gate')
@@ -969,7 +973,7 @@ class SwitchMachine:
         if self.layout is not None:
             self._expect('S3 after: the live database reports the target layout', LAYOUT_SQL, (n['source'],),
                          ownersql.Expect('columns_equal', value={'NUM_PARTITIONS': self.layout.partitions, 'NUM_SUB_PARTITIONS': self.layout.sub_partitions}))
-        for label, sql, key in (('tables', TABLE_COUNT_SQL, 'tables'), ('views', VIEW_COUNT_SQL, 'views'), ('pipelines', PIPELINE_COUNT_SQL, 'pipelines')):
+        for label, sql, key in COUNT_CHECKS:
             if self.counts.get(key) is not None:
                 self._expect('S3 after: %s count equals the capture' % label, sql, (n['source'],), ownersql.Expect('column_equals', 'n', self.counts[key]))
         self._small_table_check(n['source'], 3)
@@ -1486,7 +1490,7 @@ def _o10(step, ctx):
             lines.append('the block holds a STOP: ' + '; '.join(block.refusals))
         return steps.gate_pending(step, ctx, lines)
     if counts is None:
-        return steps.Outcome(steps.REFUSED, 'O10 needs the capture (O4 or P3) for the S3 table, view and pipeline counts; none was found', 1)
+        return steps.Outcome(steps.REFUSED, 'O10 needs the capture (O4 or P3) for the S3 table, view, pipeline and routine counts; none was found', 1)
     guard = steps.guard_for('O10', ctx.db, steps.OWNER)
     owner = ctx.owner_session(guard)
     runner = ctx.runner_session(steps.guard_for('O8', ctx.db))

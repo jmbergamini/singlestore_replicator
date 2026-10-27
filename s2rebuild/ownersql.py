@@ -472,18 +472,21 @@ def placeholders(text):
 
 
 def expected_counts(ctx):
-    """{'tables', 'views', 'pipelines'} the live name must show after S3, from the newest capture; None without one.
+    """{'tables', 'views', 'pipelines', 'routines'} the live name must show after S3, from the newest capture; None without one.
 
-    The pipeline count is None when no pipeline capture exists (no owner profile yet).
+    The pipeline count is None when no pipeline capture exists (no owner profile yet); the
+    routine count is the ROUTINES row count the O7 gate recorded for the replacement
+    (routines.expected_count), None when no gate recorded one.
     """
-    from . import copy as copy_module, pipelines
+    from . import copy as copy_module, pipelines, routines
     try:
         data = copy_module.load_plans(ctx)[0]
     except KitError:
         return None
     cap = pipelines.capture_for(ctx)
     return {'tables': len(data.get('tables') or []), 'views': len(data.get('views') or []),
-            'pipelines': len(pipelines.expected_items(cap['items'])) if cap['exists'] else None}
+            'pipelines': len(pipelines.expected_items(cap['items'])) if cap['exists'] else None,
+            'routines': routines.expected_count(ctx.journal)}
 
 
 def block_inputs(ctx):
@@ -1001,11 +1004,17 @@ def handle_c3(step, ctx):
     return steps.Outcome(steps.PASSED, 'C3 repaired the end state with the owner profile: two entries, the live record and the retained record')
 
 
+def definer_routines_sql():
+    """COUNT of the routines of a database whose DEFINER user is the given account (parameters: schema, user)."""
+    return "SELECT COUNT(*) AS n FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA = %s AND SUBSTRING_INDEX(DEFINER, '@', 1) = %s"
+
+
 def runner_definer_checks(block, names):
-    """C4 preconditions: no view (and, once W5 lands routines, no routine) in the live database has the runner as its definer."""
+    """C4 preconditions: no view and no routine in the live database has the runner as its definer (the admin sees every routine)."""
     block.check('no view in the live database has the runner as its definer', definer_views_sql(), (names['source'], names['runner_user']),
                 Expect('column_equals', 'n', 0))
-    # hook for W5: a routines definer check of the same shape goes here once the capture lists routines with their DEFINER
+    block.check('no routine in the live database has the runner as its definer', definer_routines_sql(), (names['source'], names['runner_user']),
+                Expect('column_equals', 'n', 0))
 
 
 def handle_c4(step, ctx):

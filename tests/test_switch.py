@@ -1832,7 +1832,7 @@ class ExecuteBlockTests(unittest.TestCase):
         h.fake.privileges.append({'GRANTEE': "'s2rebuild_runner'@'%'", 'PRIVILEGE_TYPE': 'SELECT'})
         results = ownersql.execute_block(block, owner, h.log, h.journal)
         self.assertEqual([label for label, _ in results], ['runner account still has privileges', 'no view in the live database has the runner as its definer',
-                                                          'zero privileges remain'])
+                                                          'no routine in the live database has the runner as its definer', 'zero privileges remain'])
         self.assertTrue(any(w.startswith("DROP USER 's2rebuild_runner'") for w in h.fake.writes))
 
     def test_stop_items_skip_checks_and_withheld_secret_errors(self):

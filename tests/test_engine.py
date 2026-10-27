@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from s2rebuild import abandon, copy as copy_module, enginecapture, freeze, grants, inventory, lockout, ownersql, pipelines, postcopy, steps, switch, verify
+from s2rebuild import abandon, copy as copy_module, enginecapture, freeze, grants, inventory, lockout, ownersql, pipelines, postcopy, routines, steps, switch, verify
 from s2rebuild.sqlutil import GuardError, classify
 from tests.fakedb import CAPTURE, FakeDB, FakeDisconnect, check_columns
 from tests.helpers import config_from, fake_driver, run_cli, write_config
@@ -18,7 +18,7 @@ from tests.test_switch import OWNER
 ENV = {'S2REBUILD_RUNNER_PASSWORD': 'fixture-password', 'S2REBUILD_OWNER_PASSWORD': 'owner-fixture'}
 SID = '1028600672070281646:7367158985892520834'
 T_COMP_ROWS = len(fixture_rows()['t_comp'])
-MODULES = (inventory, pipelines, switch, freeze, ownersql, postcopy, grants, lockout, abandon, copy_module, verify, enginecapture)
+MODULES = (inventory, pipelines, switch, freeze, ownersql, postcopy, grants, lockout, abandon, copy_module, verify, enginecapture, routines)
 
 
 def kit_queries():

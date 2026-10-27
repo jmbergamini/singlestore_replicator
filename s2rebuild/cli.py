@@ -18,7 +18,7 @@ import sys
 import traceback
 from pathlib import Path
 
-from . import __title__, __version__, abandon, bundle, cleanup, copy as copy_module, enginecapture, estimate, freeze, grants, inventory, lockout, notebook, ownersql, pipelines, postcopy, rehearse, report_md, report_xlsx, steps, switch, watch
+from . import __title__, __version__, abandon, bundle, cleanup, copy as copy_module, enginecapture, estimate, freeze, grants, inventory, lockout, notebook, ownersql, pipelines, postcopy, rehearse, report_md, report_xlsx, routines, steps, switch, watch
 from .common import EXIT_DONE, EXIT_GATE, EXIT_MISMATCH, EXIT_REFUSED, KitError, check_run_id, parse_utc, run_date, unique_run_id, utc_now
 from .sqlutil import ident, secret_forms, sql_literal
 from .config import load_config
@@ -714,9 +714,10 @@ def cmd_profile(args, env, out, state):
     captured again only with --redo, which logs what it rewrites. The journal records the step
     running just before the first file of the capture is written and passed after the last
     journal write, so a stop part way leaves it not passed and a plain rerun captures again. A
-    capture refused for a routine objects.routines.ignore does not list (F8) is recorded failed
-    before its files are written for review, so a stop between the two never leaves an earlier
-    pass (a --redo) standing on the rewritten capture. A dry run checks the same, writes nothing
+    capture refused for a load target INTO PROCEDURE the replacement will not hold (a procedure
+    objects.routines.ignore lists, or one the capture lacks) is recorded failed before its files
+    are written for review, so a stop between the two never leaves an earlier pass (a --redo)
+    standing on the rewritten capture. A dry run checks the same, writes nothing
     under inventory/, and writes only the workbook under its -dry-run name or --out.
     """
     step_id = args.step
@@ -754,13 +755,13 @@ def cmd_profile(args, env, out, state):
                     runner_session, owner_session = _open_sessions(inv, env)
                     data = inventory.capture(runner_session, db, inv.config, owner_session, exact_counts=args.exact_counts, log=log, step=step_id)
                 plans = inventory.plan_tables(data, inv.config, db)
-                if inventory.unmigrated(inv.config, db, data.get('routines') or [], (data.get('pipelines') or {}).get('items') or [])[1]:
+                if routines.pipeline_target_refusals(inv.config, db, data):
                     if inv.dry_run:
-                        inventory.refuse_unmigrated(data, inv.config, db, step_id)
+                        routines.refuse_pipeline_targets(data, inv.config, db, step_id)
                     try:
                         # the step is recorded failed first (running, then failed), so an earlier pass never stands on the
                         # capture written next; a stop between the two leaves it failed or running on the old files
-                        inventory.refuse_unmigrated(data, inv.config, db, step_id, journal)
+                        routines.refuse_pipeline_targets(data, inv.config, db, step_id, journal)
                     except KitError:
                         # kept for review and the plan sheet; O5 and later refuse the failed step
                         inventory.write(data, target_dir, plans)

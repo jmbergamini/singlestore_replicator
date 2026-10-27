@@ -143,7 +143,10 @@ OWNER_ALLOWANCES = {
     'P1': (('CREATE USER', 'GRANT'), (), {}, {}),
     'O2': (('STOP PIPELINE',), ('source',), {}, {}),
     'O3': (('DETACH DATABASE', 'ATTACH DATABASE'), ('source',), {}, {'ATTACH DATABASE': 'READ ONLY'}),
-    'O7': (('USE', 'CREATE VIEW'), ('replacement',), {}, {}),
+    # O5: the functions, TVFs and aggregates of the capture, created in the replacement after the tables (routines.py)
+    'O5': (('USE', 'CREATE FUNCTION', 'CREATE AGGREGATE'), ('replacement',), {}, {}),
+    # O7: the views, then the procedures (a procedure may read a view)
+    'O7': (('USE', 'CREATE VIEW', 'CREATE PROCEDURE'), ('replacement',), {}, {}),
     'O9': (('USE', 'CREATE PIPELINE', 'ALTER PIPELINE'), ('replacement',), {}, {}),
     # O10: DROP DATABASE only on the original record (S2b) and the replacement (S4), never the retained copy
     'O10': (('DETACH DATABASE', 'ATTACH DATABASE'), ('source', 'replacement', 'retained'), {'DROP DATABASE': ('source', 'replacement')}, {}),

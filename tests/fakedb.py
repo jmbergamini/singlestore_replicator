@@ -52,6 +52,17 @@ IS_DROPPED with the ATTACH DROPPED form and leaves its branches whole; DROP of a
 attachment fails with 2720; DROP of a detached record is refused with 1008. portal_entries() is the
 Portal's list: the rows with IS_DROPPED = 0. The seeded source carries COMPUTE_ID cid-1, a fixture
 value the tests record; every id the fake makes has the digits:digits shape of the capture.
+
+Routines live in the content of their database (routines_of(name); FakeDB.routines is the
+source's list), so they move with a record. information_schema.ROUTINES lists functions and
+procedures to the admin only (fact 21) with DEFINER as user@host; SHOW AGGREGATES lists the
+aggregates of the current database. SHOW CREATE FUNCTION, AGGREGATE and PROCEDURE answer the
+stored text with a DEFINER clause when one is recorded. CREATE FUNCTION, AGGREGATE and
+PROCEDURE need USE of their database first; a DEFINER other than the connection's account is
+error 1227 (refuse_other_definer); an aggregate whose INITIALIZE, ITERATE, MERGE or TERMINATE
+function is missing is error 1305, as is a load target INTO PROCEDURE that does not exist; a
+body reading a table or view that does not exist is error 1146. A text that carries a
+WITH STATE RECORD(...) clause is stored as any other.
 """
 import datetime as dt
 import json
@@ -144,7 +155,26 @@ def copy_content(content):
     return {'layout': dict(content['layout']),
             'tables': {k: {'create': v['create'], 'rows': [dict(r) for r in v['rows']], 'auto_increment': v.get('auto_increment')}
                        for k, v in content['tables'].items()},
-            'views': dict(content['views'])}
+            'views': dict(content['views']), 'routines': [dict(r) for r in content.get('routines', [])]}
+
+
+ROUTINE_KINDS = ('FUNCTION', 'AGGREGATE', 'PROCEDURE')
+
+
+def routine_definition(row):
+    """The SHOW CREATE text of a stored routine: its text (or a minimal one for a row seeded by name) with the recorded DEFINER clause."""
+    text = row.get('definition')
+    if not text:
+        if row['ROUTINE_TYPE'] == 'PROCEDURE':
+            text = 'CREATE PROCEDURE `%s`() AS BEGIN ECHO SELECT 1; END' % row['ROUTINE_NAME']
+        elif row['ROUTINE_TYPE'] == 'AGGREGATE':
+            text = 'CREATE AGGREGATE `%s`(INT) RETURNS INT WITH STATE INT INITIALIZE WITH f_init ITERATE WITH f_iter MERGE WITH f_merge TERMINATE WITH f_term' % row['ROUTINE_NAME']
+        else:
+            text = 'CREATE FUNCTION `%s`(a INT) RETURNS INT AS BEGIN RETURN a; END' % row['ROUTINE_NAME']
+    definer = row.get('DEFINER')
+    if definer and '@' in definer:
+        text = re.sub(r'^CREATE ', 'CREATE DEFINER=`%s`@`%s` ' % tuple(definer.split('@', 1)), text, count=1)
+    return text
 
 
 class FakeDisconnect(Exception):
@@ -379,10 +409,39 @@ class FakeCursor:
             self.rows = [{'VARIABLE_NAME': k, 'VARIABLE_VALUE': v} for k, v in sorted(db.globals.items()) if k.startswith('PASSWORD_')]
             return
         if s == 'SHOW AGGREGATES':
-            self.rows = [{'Aggregates_in_%s' % (self.conn.current_db or db.source): name, 'Type': 'aggregate'} for name in db.aggregates_defined]
+            current = self.conn.current_db or db.source
+            names = [r['ROUTINE_NAME'] for r in db.routines_of(current) if r['ROUTINE_TYPE'] == 'AGGREGATE']
+            self.rows = [{'Aggregates_in_%s' % current: name, 'Type': 'aggregate'} for name in names + list(db.aggregates_defined)]
             return
         if s == 'SELECT COUNT(*) AS n FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA = %s':
-            self.rows = [{'n': sum(1 for r in db.routines if r.get('ROUTINE_SCHEMA', db.source) == args[0]) if self.conn.is_admin else 0}]
+            self.rows = [{'n': len(self._routines(args[0]))}]
+            return
+        if s == 'SELECT COUNT(*) AS n FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA = %s AND ROUTINE_NAME = %s':
+            self.rows = [{'n': sum(1 for r in self._routines(args[0]) if r['ROUTINE_NAME'] == args[1])}]
+            return
+        m = re.match(r"SELECT COUNT\(\*\) AS n FROM information_schema\.ROUTINES WHERE ROUTINE_SCHEMA = %s AND SUBSTRING_INDEX\(DEFINER, '@', 1\) = %s$", s)
+        if m:
+            self.rows = [{'n': sum(1 for r in self._routines(args[0]) if str(r.get('DEFINER') or '').split('@', 1)[0] == args[1])}]
+            return
+        m = re.match(r'SELECT ROUTINE_NAME, ROUTINE_TYPE(, DEFINER)? FROM information_schema\.ROUTINES WHERE ROUTINE_SCHEMA = %s(?: ORDER BY ROUTINE_NAME)?$', s)
+        if m:
+            rows = sorted(self._routines(args[0]), key=lambda r: r['ROUTINE_NAME'])
+            self.rows = [{'ROUTINE_NAME': r['ROUTINE_NAME'], 'ROUTINE_TYPE': r['ROUTINE_TYPE'], 'DEFINER': r.get('DEFINER')} if m.group(1)
+                         else {'ROUTINE_NAME': r['ROUTINE_NAME'], 'ROUTINE_TYPE': r['ROUTINE_TYPE']} for r in rows]
+            return
+        m = re.match(r'SHOW CREATE (FUNCTION|AGGREGATE|PROCEDURE) `([^`]+)`\.`([^`]+)`$', s)
+        if m:
+            kind, rdb, name = m.groups()
+            wanted = ('FUNCTION',) if kind == 'FUNCTION' else (kind,)
+            row = next((r for r in db.routines_of(rdb) if r['ROUTINE_NAME'] == name and r['ROUTINE_TYPE'] in wanted), None)
+            if row is None:
+                raise db.error(1305, kind=kind, name='%s.%s' % (rdb, name))
+            self.rows = [{kind.capitalize(): name, 'Create %s' % kind.capitalize(): routine_definition(row)}]
+            return
+        m = re.match(r"CREATE (?:OR REPLACE )?(?:DEFINER ?= ?(`[^`]*`|'[^']*')@(`[^`]*`|'[^']*') )?(FUNCTION|AGGREGATE|PROCEDURE) `([^`]+)`\.`([^`]+)` ?\((.*)$", s)
+        if m:
+            db.writes.append(s)
+            self._create_routine(s, *m.groups())
             return
         if s == 'SELECT PRIVILEGE_TYPE FROM information_schema.USER_PRIVILEGES WHERE GRANTEE = %s':
             self.rows = [{'PRIVILEGE_TYPE': r['PRIVILEGE_TYPE']} for r in db.privileges if r['GRANTEE'] == args[0] and self._sees_grantee(r['GRANTEE'])]
@@ -432,7 +491,7 @@ class FakeCursor:
             layout['NUM_PARTITIONS'] = int(m.group(2))
             layout['NUM_SUB_PARTITIONS'] = int(m.group(3))
             layout.update(db.target_layout_override)
-            db.databases[name] = {'layout': layout, 'tables': {}, 'views': {}}
+            db.databases[name] = {'layout': layout, 'tables': {}, 'views': {}, 'routines': []}
             sid, cid = db.new_sid(), db.new_cid()
             db.storage[sid] = name
             db.branches.append(db.record(name, sid, cid, 'create', None))
@@ -809,6 +868,11 @@ class FakeCursor:
             target = self.conn.current_db or db.source
             if any(p['PIPELINE_NAME'] == m.group(1) for p in self._pipes(target)):
                 raise FakeDisconnect(1, 'Pipeline %s already exists' % m.group(1))
+            proc = re.search(r'\bINTO PROCEDURE (?:`([^`]+)`\.)?`([^`]+)`', s, re.I)
+            if proc and not any(r['ROUTINE_NAME'] == proc.group(2) and r['ROUTINE_TYPE'] == 'PROCEDURE'
+                                for r in db.routines_of(proc.group(1) or target)):
+                # the load target must exist when the pipeline is created: O9 runs after the procedures of O7
+                raise db.error(1305, kind='PROCEDURE', name='%s.%s' % (proc.group(1) or target, proc.group(2)))
             db.pipelines.append({'PIPELINE_NAME': m.group(1), 'STATE': 'Stopped', 'DATABASE_NAME': target, 'definition': s})
             return
         m = re.match(r"ALTER PIPELINE `([^`]+)` SET OFFSET CURSOR (.*)$", s)
@@ -913,13 +977,41 @@ class FakeCursor:
             d = db.databases.get(args[0])
             self.rows = [{'n': len(d['views']) if d else 0}]
             return
-        if s == 'SELECT ROUTINE_NAME, ROUTINE_TYPE FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA = %s ORDER BY ROUTINE_NAME':
-            self.rows = sorted(({'ROUTINE_NAME': r['ROUTINE_NAME'], 'ROUTINE_TYPE': r['ROUTINE_TYPE']} for r in db.routines
-                                if r.get('ROUTINE_SCHEMA', db.source) == args[0]), key=lambda r: r['ROUTINE_NAME'])
-            return
         if self._capture(s, args):
             return
         raise AssertionError('fake database does not understand: ' + s)
+
+    def _routines(self, schema):
+        """The ROUTINES rows of a database: functions and procedures, to the admin only (Helios fact 21); aggregates are SHOW AGGREGATES."""
+        if not self.conn.is_admin:
+            return []
+        return [r for r in self.db.routines_of(schema) if r['ROUTINE_TYPE'] != 'AGGREGATE']
+
+    def _create_routine(self, s, user, host, kind, rdb, name, rest):
+        """CREATE FUNCTION, AGGREGATE or PROCEDURE `rdb`.`name`(rest: the DEFINER rule of the views, USE first, the dependencies present."""
+        db = self.db
+        if user and db.refuse_other_definer and user.strip("`'") != (self.conn.user or db.current_user):
+            raise db.error(1227)
+        if self.conn.current_db != rdb:
+            raise FakeDisconnect('a routine body resolves against the current database; USE the replacement first')
+        content = db.databases.get(rdb)
+        if content is None:
+            raise FakeDisconnect(1049, "Unknown database '%s'" % rdb)
+        if any(r['ROUTINE_NAME'] == name for r in content.setdefault('routines', [])):
+            raise FakeDisconnect(1304, '%s %s already exists' % (kind, name))
+        if kind == 'AGGREGATE':
+            for fn in re.findall(r'\b(?:INITIALIZE|ITERATE|MERGE|TERMINATE) WITH `?([A-Za-z0-9_]+)`?', rest, re.I):
+                if not any(r['ROUTINE_NAME'] == fn and r['ROUTINE_TYPE'] == 'FUNCTION' for r in content['routines']):
+                    raise db.error(1305, kind='FUNCTION', name='%s.%s' % (rdb, fn))
+        else:
+            for qual, ref in re.findall(r'\b(?:FROM|JOIN)\s+(?:`([^`]+)`\.)?`([^`]+)`', rest, re.I):
+                target = db.databases.get(qual or rdb) or {'tables': {}, 'views': {}}
+                if ref not in target['tables'] and ref not in target['views']:
+                    raise FakeDisconnect(1146, "Table '%s.%s' doesn't exist" % (qual or rdb, ref))
+        definer = '%s@%s' % (user.strip("`'"), host.strip("`'")) if user else '%s@%%' % (self.conn.user or db.current_user)
+        text = re.sub(r"CREATE (?:OR REPLACE )?(?:DEFINER ?= ?(?:`[^`]*`|'[^']*')@(?:`[^`]*`|'[^']*') )?", 'CREATE ', s, count=1)
+        text = text.replace('`%s`.`%s`' % (rdb, name), '`%s`' % name, 1)
+        content['routines'].append({'ROUTINE_NAME': name, 'ROUTINE_TYPE': kind, 'DEFINER': definer, 'definition': text})
 
     def _capture(self, s, args):
         """The P3 and O4 capture reads (inventory.capture): objects, routines, columns and keys parsed from each CREATE TABLE
@@ -929,9 +1021,6 @@ class FakeCursor:
         if s.startswith('SELECT TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA = %s'):
             objects = [(t, 'BASE TABLE') for t in (d['tables'] if d else {})] + [(v, 'VIEW') for v in (d['views'] if d else {})]
             self.rows = [{'TABLE_NAME': name, 'TABLE_TYPE': kind} for name, kind in sorted(objects)]
-            return True
-        if s.startswith('SELECT ROUTINE_NAME, ROUTINE_TYPE FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA = %s'):
-            self.rows = [dict(r) for r in db.routines if r.get('ROUTINE_SCHEMA', db.source) == args[0]]
             return True
         if s.startswith('SELECT TABLE_NAME, COLUMN_NAME, ORDINAL_POSITION') and 'information_schema.COLUMNS' in s:
             self.rows = []
@@ -1133,8 +1222,7 @@ class FakeDB:
         self.pipeline_offsets = []
         self.pipeline_errors = []
         self.pipeline_batches = []
-        self.routines = []  # {'ROUTINE_NAME', 'ROUTINE_TYPE', optional 'ROUTINE_SCHEMA' (default the source)}
-        self.aggregates_defined = []  # names SHOW AGGREGATES lists in the current database
+        self.aggregates_defined = []  # names SHOW AGGREGATES lists in every database besides the stored aggregates (engine-capture fixture)
         self.killed = []
         self.users = set()
         self.globals = {}
@@ -1150,7 +1238,7 @@ class FakeDB:
         self.storage = {sid: source}
         self.databases = {source: {'layout': dict(layout), 'tables': {
             name: {'create': spec['create'], 'rows': [dict(r) for r in spec.get('rows', [])], 'auto_increment': spec.get('auto_increment')}
-            for name, spec in tables.items()}, 'views': dict(views or {})}}
+            for name, spec in tables.items()}, 'views': dict(views or {}), 'routines': []}}
         self.connections = []
         self.faults = []
         self.faults_fired = []
@@ -1230,6 +1318,22 @@ class FakeDB:
 
     def attachment(self, name):
         return next((a for a in self.attachments if a['DATABASE_NAME'] == name), None)
+
+    def routines_of(self, name):
+        """The routine rows of a database's content ({'ROUTINE_NAME', 'ROUTINE_TYPE', 'DEFINER', 'definition'}); empty for an unknown name."""
+        content = self.databases.get(name)
+        if content is None:
+            return []
+        return content.setdefault('routines', [])
+
+    @property
+    def routines(self):
+        """The routine rows of the source (a test appends {'ROUTINE_NAME', 'ROUTINE_TYPE'} rows; DEFINER and definition are optional)."""
+        return self.routines_of(self.source)
+
+    @routines.setter
+    def routines(self, rows):
+        self.databases[self.source]['routines'] = list(rows)
 
     def new_sid(self):
         self.sid_counter += 1

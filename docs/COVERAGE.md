@@ -54,9 +54,11 @@ Status per item: Yes (release 1.0), New (built in the release 1.0 pass), No (an 
 
 | Item | 1.0 | How | If not migrated |
 |---|---|---|---|
-| Functions (UDF) and table-valued functions | New | Captured with the owner session; created at O5 after the tables | `objects.routines.ignore` per name |
-| Aggregates (UDAF) | New | `SHOW AGGREGATES`; created after their functions | same |
-| Stored procedures | New | Created at O7 after the views | same |
+| Functions (UDF) and table-valued functions | New | `information_schema.ROUTINES` and `SHOW CREATE FUNCTION` with the owner session (the runner sees none); created at O5 after the tables; gate: count and normalized definition equal the capture | `objects.routines.ignore` per name |
+| Aggregates (UDAF) | New | `SHOW AGGREGATES` and `SHOW CREATE AGGREGATE`; created at O5 after the functions they name; a record state passes through | same |
+| Stored procedures | New | `SHOW CREATE PROCEDURE`; created at O7 after the views; O10 S3 counts the routines on the live name | same |
+| Routine DEFINER | New | Kept while the account exists and is not the runner, else the owner; 1227 fallback recorded per routine; C4 refuses a routine with the runner as definer | |
+| Routine naming the source database | Refused | O5 or O7 refuses with the routine name before any statement | Edit the definition under `definitions/routines/` to use unqualified names |
 | External functions | No | Not captured | Recreate by hand on the live name after O10 |
 
 ## Pipelines
@@ -66,7 +68,7 @@ Status per item: Yes (release 1.0), New (built in the release 1.0 pass), No (an 
 | Kafka, S3, GCS, Azure, HDFS, filesystem pipelines | Yes | Captured with offsets at O2; created stopped at the recorded offsets at O9; started at O11 (`all` or `none`) | |
 | Pipeline CREDENTIALS | Yes | Never readable from the server; the customer supplies them, the kit asks by field and stores them in the Keychain | Route `customer`: the customer runs the placeholder file |
 | Secrets inside CONFIG | Yes | Redacted at capture, filled from the same credential at O9 | |
-| Pipeline INTO PROCEDURE | New | O9 runs after the procedures exist | |
+| Pipeline INTO PROCEDURE | New | O9 runs after O7 created the procedures; P3 and O4 refuse a load target whose procedure is ignored or not captured | |
 | Pipelines with WITH TRANSFORM | Yes | Part of the captured CREATE statement | The transform binary must be reachable from the workspace |
 | Pipelines reading a LINK | No | LINK objects hold credentials and are not captured | Create the LINK on the replacement before O9 |
 | Application-managed pipelines | Yes | Stopped at O2; listed in `app_managed_pipelines`; the application recreates them | |

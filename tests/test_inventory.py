@@ -18,6 +18,8 @@ from tests.helpers import ROOT, config_from
 
 FIXTURE_INVENTORY = ROOT / 'tests' / 'fixtures' / 'inventory'
 DB = 'example_orders_db'
+PROC1_DEFINITION = 'CREATE DEFINER=`app`@`%` PROCEDURE `proc1`(a INT) AS\nBEGIN\n  ECHO SELECT a;\nEND'
+PROC1_CAPTURED = {'name': 'proc1', 'kind': 'procedure', 'type': 'PROCEDURE', 'definer': '`app`@`%`', 'definition': PROC1_DEFINITION}
 
 
 class FakeSession:
@@ -50,6 +52,8 @@ def canned_answers():
             return [{'Table': name, 'Create Table': defs[name]}]
         if norm.startswith('SHOW CREATE VIEW'):
             return [{'View': 'v1', 'Create View': 'CREATE DEFINER=`app`@`%` VIEW `v1` AS SELECT `id` FROM `t_keyed`'}]
+        if norm.startswith('SHOW CREATE PROCEDURE'):
+            return [{'Procedure': 'proc1', 'Create Procedure': PROC1_DEFINITION}]
         if norm.startswith('SHOW CREATE PIPELINE'):
             return [{'Pipeline': 'p1', 'Create Pipeline': "CREATE PIPELINE `p1` AS LOAD DATA KAFKA 'b:9092/topic' CREDENTIALS '{\"sasl.password\": \"SECRET-VALUE\"}' BATCH_INTERVAL 1000 REPLACE INTO TABLE `t_keyed` FORMAT JSON",
                      'Alter Pipeline 1': "ALTER PIPELINE `p1` SET OFFSETS '{\"0\": 10}'"}]
@@ -139,7 +143,11 @@ class CaptureTests(unittest.TestCase):
         self.assertEqual(keyed['storage_type'], 'columnstore')
         self.assertEqual(inv['tables'][2]['computed_columns'], ['z'])
         self.assertEqual(inv['views'][0]['definer'], '`app`@`%`')
-        self.assertEqual(inv['routines'], [{'name': 'proc1', 'type': 'PROCEDURE'}])
+        self.assertEqual(inv['routines'], [PROC1_CAPTURED], 'the procedure with its definition, read through the owner session')
+        self.assertEqual((inv['routines_captured'], inv['routines_note']), (True, '1 routines captured with the owner profile'))
+        self.assertTrue(any(sql.startswith('SHOW CREATE PROCEDURE `%s`.`proc1`' % DB) for sql, _ in owner.statements))
+        self.assertFalse(any('ROUTINES' in sql or 'SHOW CREATE PROCEDURE' in sql or 'USER_PRIVILEGES' in sql for sql, _ in runner.statements),
+                         'the runner reads neither the routines nor the accounts (facts 21 and L12)')
         users = [a['user'] for a in inv['accounts']]
         self.assertEqual(users, ['app', 'retention'], 'runner excluded, read-only account excluded')
         self.assertEqual(inv['accounts'][0]['privileges'], ['INSERT'])
@@ -355,15 +363,17 @@ class PlanTests(unittest.TestCase):
 
 
 class RoutineTests(unittest.TestCase):
-    def test_f8_a_pipeline_into_an_unlisted_procedure_is_refused_at_p3(self):
-        """A pipeline that loads into a procedure is refused unless objects.routines.ignore lists it (O9 does not recreate procedures)."""
+    def test_a_load_target_the_replacement_will_not_hold_is_refused_at_p3(self):
+        """A pipeline INTO PROCEDURE is refused when objects.routines.ignore lists that procedure, or the capture lacks it (O9 would find
+        no target); a captured, migrated procedure passes and the ignored ones are returned."""
+        from s2rebuild import routines as R
         answers = canned_answers()
         show = answers['SHOW CREATE']
 
         def show_create(norm, args):
             rows = show(norm, args)
             if norm.startswith('SHOW CREATE PIPELINE'):
-                rows[0]['Create Pipeline'] = rows[0]['Create Pipeline'].replace('INTO TABLE `t_keyed`', 'INTO PROCEDURE `load_orders`')
+                rows[0]['Create Pipeline'] = rows[0]['Create Pipeline'].replace('INTO TABLE `t_keyed`', 'INTO PROCEDURE `proc1`')
             return rows
         answers['SHOW CREATE'] = show_create
 
@@ -372,27 +382,36 @@ class RoutineTests(unittest.TestCase):
                                           d.update(objects={'routines': {'ignore': names}})))
         cfg = config(['proc1'])
         inv = I.capture(FakeSession(answers), cfg.databases[0], cfg, FakeSession(answers), sleep=lambda s: None)
-        self.assertEqual(inv['pipelines']['items'][0]['target'], 'procedure load_orders')
-        with self.assertRaisesRegex(KitError, 'P3 refused for example_orders_db: routines are not migrated in this pass: pipeline p1 '
-                                              'loads into procedure load_orders, which is not listed in objects.routines.ignore'):
-            I.refuse_unmigrated(inv, cfg, cfg.databases[0], 'P3')
-        cfg = config(['proc1', 'load_orders'])
-        self.assertEqual(I.refuse_unmigrated(inv, cfg, cfg.databases[0], 'P3'), ['procedure proc1'])
+        self.assertEqual(inv['pipelines']['items'][0]['target'], 'procedure proc1')
+        with self.assertRaisesRegex(KitError, 'P3 refused for example_orders_db: p1 loads into procedure proc1, which objects.routines.ignore lists, '
+                                              'so O9 would find no target'):
+            R.refuse_pipeline_targets(inv, cfg, cfg.databases[0], 'P3')
+        cfg = config([])
+        self.assertEqual(R.refuse_pipeline_targets(inv, cfg, cfg.databases[0], 'P3'), [])
+        inv['routines'] = []
+        self.assertEqual(R.pipeline_target_refusals(cfg, cfg.databases[0], inv), ['p1 loads into procedure proc1, which the capture does not hold'])
+        inv['routines_captured'] = False
+        self.assertEqual(R.pipeline_target_refusals(cfg, cfg.databases[0], inv), [], 'without a routine capture the target cannot be checked')
 
-    def test_f8_a_qualified_name_lists_the_routine_for_its_database_only(self):
-        """database.routine lists the routine on that database only; a bare name lists it on every configured database."""
+    def test_a_qualified_name_ignores_the_routine_for_its_database_only(self):
+        """database.routine ignores the routine on that database only; a bare name ignores it on every configured database."""
+        from s2rebuild import routines as R
+
         def config(names):
             def mutate(d):
                 d['databases'].append({'source': 'second_db', 'layout': {'partitions': 8, 'sub_partitions': 64}})
                 d['objects'] = {'routines': {'ignore': names}}
             return config_from(mutate)
-        routines = [{'name': 'proc1', 'type': 'PROCEDURE'}]
+        captured = [PROC1_CAPTURED]
         cfg = config([DB + '.proc1'])
         first, second = cfg.databases
-        self.assertEqual(I.unmigrated(cfg, first, routines), (['procedure proc1'], []))
-        self.assertEqual(I.unmigrated(cfg, second, routines), ([], ['procedure proc1 is not listed in objects.routines.ignore']))
+        self.assertEqual(R.split(cfg, first, captured), ([], ['procedure proc1']))
+        self.assertEqual(R.split(cfg, second, captured), ([PROC1_CAPTURED], []))
         cfg = config(['proc1'])
-        self.assertEqual([I.unmigrated(cfg, db, routines) for db in cfg.databases], [(['procedure proc1'], [])] * 2)
+        self.assertEqual([R.split(cfg, db, captured) for db in cfg.databases], [([], ['procedure proc1'])] * 2)
+        snapshot = {'routines': captured, 'routines_captured': True}
+        self.assertEqual(R.summary(cfg, first, snapshot), '1 routines (0 functions, 0 TVFs, 0 aggregates, 1 procedures), 1 ignored by configuration: procedure proc1')
+        self.assertEqual(R.summary(cfg, first, {'routines': [], 'routines_captured': False, 'routines_note': 'no owner profile'}), 'not captured (no owner profile)')
 
 
 def answers_with_pipeline_rows(rows):
@@ -452,18 +471,18 @@ class DriftTests(unittest.TestCase):
         after['tables'][1]['est_rows'] += 5
         after['views'][0]['definition'] = after['views'][0]['definition'].replace('SUM', 'MAX')
         after['tables'].append({'name': 'brand_new', 'columns': [], 'keys': [], 'definition': 'CREATE TABLE `brand_new` (a int)', 'est_rows': 0})
-        after['routines'] = [{'name': 'new_proc', 'type': 'PROCEDURE'}]
+        after['routines'] = [{'name': 'new_proc', 'type': 'PROCEDURE'}, dict(before['routines'][1], definition='CREATE FUNCTION `tax_rate`(a INT) RETURNS INT AS BEGIN RETURN 2; END')]
         report = I.drift(before, after)
-        self.assertEqual(report['objects_added'], ['brand_new', 'routine new_proc'])
-        self.assertEqual(report['objects_removed'], ['empty_table', 'routine nightly_rollup'])
+        self.assertEqual(report['objects_added'], ['brand_new', 'procedure new_proc'])
+        self.assertEqual(report['objects_removed'], ['empty_table', 'procedure nightly_rollup'])
         self.assertEqual(report['columns_added'], ['orders.new_col'])
         self.assertEqual(report['columns_removed'], [])
-        self.assertEqual(report['definitions_changed'], ['orders', 'order_totals'])
+        self.assertEqual(report['definitions_changed'], ['orders', 'order_totals', 'function tax_rate'], 'a routine whose normalized text changed')
         self.assertEqual(report['rows_changed'][0]['table'], 'order_items')
-        self.assertEqual(report['count'], 7)
+        self.assertEqual(report['count'], 8)
         lines = I.drift_lines(report)
         self.assertEqual(lines[0], 'DRIFT: object added: brand_new')
-        self.assertIn('drift: 7 structural difference(s); row estimates changed on 1 table(s)', lines[-1])
+        self.assertIn('drift: 8 structural difference(s); row estimates changed on 1 table(s)', lines[-1])
         self.assertEqual(I.drift(before, before)['count'], 0)
         self.assertEqual(I.drift(before, json.loads(json.dumps(before)))['rows_changed'], [])
 

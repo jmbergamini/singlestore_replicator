@@ -975,11 +975,21 @@ def _no_plans(step, ctx, exc):
 
 
 def handle_o5(step, ctx):
-    """O5 handler: create the replacement and its tables from the capture, verify every definition."""
+    """O5 handler: create the replacement and its tables from the capture, verify every definition, then the routines.
+
+    After the tables the owner session creates the captured functions and TVFs, then the
+    aggregates that name them (routines.place with routines.O5_KINDS), and the routine gate
+    compares each definition with the capture; a routine body that names the source database
+    refuses the step before any statement.
+    """
+    from . import routines
     try:
         data, plans, directory = load_plans(ctx)
     except KitError as exc:
         return _no_plans(step, ctx, exc)
+    refusal = routines.refuse_source_names(data, ctx.config, ctx.db, routines.O5_KINDS)
+    if refusal:
+        return steps.Outcome(steps.REFUSED, refusal, EXIT_REFUSED)
     statements = statements_for(ctx.db)
     session = ctx.runner_session(runner_guard(ctx.db.replacement, 'runner O5'))
     try:
@@ -988,6 +998,7 @@ def handle_o5(step, ctx):
             for p in plans:
                 session.execute(statements.create_table_like(p.name))
                 session.query(statements.show_create(p.name))
+            routines.place(ctx, data, routines.O5_KINDS, 'O5')
             return steps.Outcome(steps.PASSED, 'dry run: %d statements for %d tables printed' % (1 + 2 * len(plans), len(plans)))
         create_replacement(session, statements, ctx.journal, ctx.log, plans, data.get('layout'), ctx.db.target, directory)
         ctx.journal.set_meta('plan_dir', str(directory))
@@ -997,9 +1008,12 @@ def handle_o5(step, ctx):
             ctx.log('replacement %s recorded on STORAGE_ID %s for the switch' % (ctx.db.replacement, storage_id))
         else:
             ctx.log('replacement %s has no storage row visible to the runner; O10 reads its STORAGE_ID before S1' % ctx.db.replacement)
-        return steps.Outcome(steps.PASSED, 'replacement %s verified with %d tables' % (ctx.db.replacement, len(plans)))
     finally:
         session.close()
+    outcome = routines.place(ctx, data, routines.O5_KINDS, 'O5')
+    if outcome is not None:
+        return outcome
+    return steps.Outcome(steps.PASSED, 'replacement %s verified with %d tables' % (ctx.db.replacement, len(plans)))
 
 
 def handle_o6(step, ctx):

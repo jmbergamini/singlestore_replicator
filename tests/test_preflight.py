@@ -30,9 +30,10 @@ def listing(names):
     return lambda d: d.update(objects={'routines': {'ignore': list(names)}})
 
 
-def routine_harness(test, names, routines=ROUTINES):
-    """A harness whose source reports routines and whose configuration lists names in objects.routines.ignore."""
-    h = Harness(test, mutate=listing(names))
+def routine_harness(test, names, routines=ROUTINES, owner=True):
+    """A harness whose source holds routines and whose configuration lists names in objects.routines.ignore; the owner profile by default,
+    since the runner sees no routines (fact 21)."""
+    h = owner_harness(test, mutate=listing(names)) if owner else Harness(test, mutate=listing(names))
     h.fake.routines = [dict(r) for r in routines]
     return h
 
@@ -84,33 +85,37 @@ class PreflightTests(unittest.TestCase):
 
 
 class RoutineTests(unittest.TestCase):
-    def test_f8_an_unlisted_procedure_or_function_refuses_check(self):
-        """check (the P2 handler) fails on each procedure and function objects.routines.ignore does not list, naming its type."""
+    def test_routines_are_counted_by_kind_through_the_owner_profile_at_check(self):
+        """check (the P2 handler) reads the routines with the owner session and prints them by kind; the runner sees none, so without
+        the owner profile the line says so and never 'none'."""
         h = routine_harness(self, [])
         out = p2(h)
-        self.assertEqual((out.status, out.exit_code), (steps.FAILED, 4), h.text())
-        self.assertIn('routines: FAILED, not migrated in this pass: procedure nightly_rollup is not listed in objects.routines.ignore; '
-                      'function tax_rate is not listed in objects.routines.ignore', out.note)
-        self.assertEqual(h.journal.step_status('P2'), 'failed')
-        h = routine_harness(self, ['nightly_rollup'])
+        self.assertEqual(out.status, steps.PASSED, h.text())
+        self.assertIn('routines: 2 routines (1 functions, 0 TVFs, 0 aggregates, 1 procedures), 0 ignored by configuration', h.text())
+        facts = json.loads(h.journal.get_meta('preflight'))
+        self.assertEqual(facts['routines'], [{'name': 'nightly_rollup', 'kind': 'procedure'}, {'name': 'tax_rate', 'kind': 'function'}])
+        self.assertEqual(facts['routines_ignored'], [])
+        h = routine_harness(self, [], owner=False)
         out = p2(h)
-        self.assertEqual(out.status, steps.FAILED, 'the function is still not listed')
-        self.assertIn('function tax_rate is not listed', out.note)
-        self.assertNotIn('procedure nightly_rollup', out.note)
+        self.assertEqual(out.status, steps.PASSED, h.text())
+        self.assertIn('routines: not visible to the runner; owner profile needed', h.text())
+        self.assertNotIn('routines: none', h.text())
+        self.assertIsNone(json.loads(h.journal.get_meta('preflight'))['routines'])
 
-    def test_f8_listed_routines_pass_check_as_not_migrated(self):
-        """A bare name and a database.name entry both list a routine; check passes and records them as not migrated."""
+    def test_ignored_routines_are_named_at_check(self):
+        """A bare name and a database.name entry both ignore a routine; check passes and names them as ignored by configuration."""
         h = routine_harness(self, ['nightly_rollup', SRC + '.tax_rate'])
         out = p2(h)
         self.assertEqual(out.status, steps.PASSED, h.text())
-        self.assertIn('routines: not migrated, listed in objects.routines.ignore: procedure nightly_rollup, function tax_rate', h.text())
+        self.assertIn('routines: 2 routines (1 functions, 0 TVFs, 0 aggregates, 1 procedures), 2 ignored by configuration: '
+                      'procedure nightly_rollup, function tax_rate', h.text())
         facts = json.loads(h.journal.get_meta('preflight'))
-        self.assertEqual(facts['routines_not_migrated'], ['procedure nightly_rollup', 'function tax_rate'])
+        self.assertEqual(facts['routines_ignored'], ['procedure nightly_rollup', 'function tax_rate'])
 
-    def test_f8_check_after_a_fault_at_every_point_still_refuses_or_passes(self):
+    def test_check_after_a_fault_at_every_point_still_counts_the_routines(self):
         """Failure points: the ROUTINES query fails before it runs ('before'), its reply is lost after it ran ('after'), and
         the P2 journal update (step_end) is killed after the query ('journal'). P2 is never left passed, and the rerun an
-        operator makes refuses the unlisted procedure or passes the listed one."""
+        operator makes counts the routines again, the ignored one named."""
         for point in FAULT_POINTS:
             for names in ([], ['nightly_rollup']):
                 with self.subTest(point=point, ignore=names):
@@ -127,13 +132,10 @@ class RoutineTests(unittest.TestCase):
                         self.assertEqual([when for when, _ in h.fake.faults_fired], [point])
                     self.assertNotEqual(h.journal.step_status('P2'), 'passed', 'a fault never leaves P2 passed')
                     out = p2(h)
-                    if names:
-                        self.assertEqual(out.status, steps.PASSED, h.text())
-                        self.assertIn('routines: not migrated, listed in objects.routines.ignore: procedure nightly_rollup', h.text())
-                    else:
-                        self.assertEqual((out.status, out.exit_code), (steps.FAILED, 4), h.text())
-                        self.assertIn('procedure nightly_rollup is not listed in objects.routines.ignore', out.note)
-                    self.assertEqual(h.journal.step_status('P2'), 'passed' if names else 'failed')
+                    self.assertEqual(out.status, steps.PASSED, h.text())
+                    self.assertIn('routines: 1 routines (0 functions, 0 TVFs, 0 aggregates, 1 procedures), %d ignored by configuration%s' % (
+                        len(names), ': procedure nightly_rollup' if names else ''), h.text())
+                    self.assertEqual(h.journal.step_status('P2'), 'passed')
 
 
 class ReportAndCalibrateTests(unittest.TestCase):

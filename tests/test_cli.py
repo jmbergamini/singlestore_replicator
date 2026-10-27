@@ -260,10 +260,11 @@ class ProfileCliTests(unittest.TestCase):
             self.assertIn('at least 4', text)
 
 
-    def test_f8_profile_refuses_an_unlisted_routine_and_the_plan_sheet_lists_the_listed_ones(self):
-        """P3 and O4 refuse a routine objects.routines.ignore does not list and record the step failed; listed ones pass as
-        not migrated in the plan sheet and the workbook. Failure point: the journal write of the P3 refusal is killed once
-        (the 'journal' point); P3 is not left passed and the rerun refuses again."""
+    def test_profile_refuses_a_load_target_the_replacement_will_not_hold_and_the_plan_sheet_counts_the_routines(self):
+        """P3 and O4 refuse a pipeline INTO PROCEDURE whose procedure objects.routines.ignore lists and record the step failed; without
+        the entry the capture passes and the plan sheet and the workbook count the routines by kind. Failure point: the journal write
+        of the P3 refusal is killed once (the 'journal' point); P3 is not left passed and the rerun refuses again. A routine created
+        during the window is drift, not a refusal."""
         import json
         import yaml
         from openpyxl import load_workbook
@@ -273,7 +274,7 @@ class ProfileCliTests(unittest.TestCase):
         from tests.fakedb import SimulatedCrash
         from tests.helpers import crash_journals
         with tempfile.TemporaryDirectory() as tmp:
-            path, cfg = write_config(tmp, lambda d: d.update(objects={'routines': {'ignore': []}}))
+            path, cfg = write_config(tmp, lambda d: d.update(objects={'routines': {'ignore': ['nightly_rollup']}}))
             run = '20261101-0500'
             base = ['--config', str(path), '--run', run]
             run_dir = Path(tmp) / 'runs' / run / 'example_orders_db'
@@ -281,6 +282,11 @@ class ProfileCliTests(unittest.TestCase):
             journal.record_gate('P1', True, 'test')
             journal.step_end('P2', 'passed', 'test')
             journal.close()
+            into_procedure = Path(tmp) / 'into-procedure'
+            into_procedure.mkdir()
+            capture = json.loads((FIXTURE_INVENTORY / 'inventory.json').read_text(encoding='utf8'))
+            capture['pipelines']['items'][0]['target'] = 'procedure nightly_rollup'
+            (into_procedure / 'inventory.json').write_text(json.dumps(capture), encoding='utf8')
 
             def status(step_id):
                 j = Journal(run_dir / 'journal.sqlite', read_only=True)
@@ -295,56 +301,60 @@ class ProfileCliTests(unittest.TestCase):
                 path.write_text(yaml.safe_dump(data, sort_keys=False), encoding='utf8')
             crash_journals(self, 'step_end', match=lambda step_id, state, *a, **k: step_id == 'P3' and state == 'failed')
             with self.assertRaises(SimulatedCrash):
-                run_cli(['profile', '--inventory', str(FIXTURE_INVENTORY)] + base)
+                run_cli(['profile', '--inventory', str(into_procedure)] + base)
             self.assertEqual(status('P3'), 'running', 'killed before the refusal was journaled: P3 is not passed')
-            code, text = run_cli(['profile', '--inventory', str(FIXTURE_INVENTORY)] + base)
+            code, text = run_cli(['profile', '--inventory', str(into_procedure)] + base)
             self.assertEqual(code, EXIT_REFUSED, text)
-            self.assertIn('P3 refused for example_orders_db: routines are not migrated in this pass: procedure nightly_rollup is not '
-                          'listed in objects.routines.ignore', text)
+            self.assertIn('P3 refused for example_orders_db: orders_stream loads into procedure nightly_rollup, which objects.routines.ignore lists, '
+                          'so O9 would find no target', text)
             self.assertEqual(status('P3'), 'failed')
             self.assertFalse((run_dir / 'reports' / 'profile.xlsx').exists(), 'no workbook for a refused capture')
             ctx = steps.StepContext(cfg, cfg.databases[0], None, run, None)
-            with self.assertRaisesRegex(KitError, 'procedure nightly_rollup is not listed'):
+            with self.assertRaisesRegex(KitError, 'orders_stream loads into procedure nightly_rollup, which objects.routines.ignore lists'):
                 inventory.handle_p3(steps.REGISTRY['P3'], ctx)
             code, text = run_cli(['plan'] + base)
-            self.assertIn('Routines   REFUSED: procedure nightly_rollup is not listed in objects.routines.ignore', text)
+            self.assertIn('Routines   2 routines (1 functions, 0 TVFs, 0 aggregates, 1 procedures), 1 ignored by configuration: procedure nightly_rollup; '
+                          'REFUSED: orders_stream loads into procedure nightly_rollup, which objects.routines.ignore lists', text)
 
-            listing(['nightly_rollup'])
-            code, text = run_cli(['profile', '--inventory', str(FIXTURE_INVENTORY)] + base)
+            listing([])
+            code, text = run_cli(['profile', '--inventory', str(into_procedure)] + base)
             self.assertEqual(code, EXIT_DONE, text)
             self.assertEqual(status('P3'), 'passed')
+            self.assertTrue((run_dir / 'inventory' / 'P3' / 'definitions' / 'routines' / 'nightly_rollup.procedure.sql').is_file())
             code, text = run_cli(['plan'] + base)
             self.assertEqual(code, EXIT_DONE, text)
-            self.assertIn('Routines   procedure nightly_rollup not migrated', text)
+            self.assertIn('Routines   2 routines (1 functions, 0 TVFs, 0 aggregates, 1 procedures), 0 ignored by configuration', text)
             wb = load_workbook(str(run_dir / 'reports' / 'profile.xlsx'))
             summary = {str(r[0].value): r[1].value for r in wb['Summary'].iter_rows(min_col=1, max_col=2) if r[0].value}
-            self.assertEqual(summary['Routines not migrated (objects.routines.ignore)'], 'procedure nightly_rollup')
+            self.assertEqual(summary['Routines ignored (objects.routines.ignore)'], 'none')
+            self.assertEqual(summary['Routines (captured with the owner profile; created at O5 and O7)'],
+                             '2 routines (1 functions, 0 TVFs, 0 aggregates, 1 procedures), 0 ignored by configuration')
 
             journal = Journal(run_dir / 'journal.sqlite')
             for step_id in ('O1', 'O2', 'O3'):
                 journal.record_gate(step_id, True, 'test')
             journal.close()
-            capture = json.loads((FIXTURE_INVENTORY / 'inventory.json').read_text(encoding='utf8'))
-            capture['routines'].append({'name': 'window_fix', 'type': 'FUNCTION'})
+            capture['routines'].append({'name': 'window_fix', 'kind': 'function', 'type': 'FUNCTION', 'definer': None,
+                                        'definition': 'CREATE FUNCTION `window_fix`(a INT) RETURNS INT AS BEGIN RETURN a; END'})
             (Path(tmp) / 'o4').mkdir()
             (Path(tmp) / 'o4' / 'inventory.json').write_text(json.dumps(capture), encoding='utf8')
             code, text = run_cli(['profile', '--step', 'O4', '--inventory', str(Path(tmp) / 'o4')] + base)
-            self.assertEqual(code, EXIT_REFUSED, 'a routine created during the window refuses the freeze capture')
-            self.assertIn('O4 refused for example_orders_db: routines are not migrated in this pass: function window_fix is not listed', text)
-            self.assertEqual(status('O4'), 'failed')
-            listing(['nightly_rollup', 'example_orders_db.window_fix'])
-            code, text = run_cli(['profile', '--step', 'O4', '--inventory', str(Path(tmp) / 'o4')] + base)
-            self.assertEqual(code, EXIT_DONE, text)
-            self.assertIn('DRIFT: object added: routine window_fix', text)
+            self.assertEqual(code, EXIT_DONE, 'a routine created during the window is drift, not a refusal: ' + text)
+            self.assertIn('DRIFT: object added: function window_fix', text)
             self.assertEqual(status('O4'), 'passed')
+            listing(['nightly_rollup'])
+            code, text = run_cli(['profile', '--step', 'O4', '--redo', '--inventory', str(Path(tmp) / 'o4')] + base)
+            self.assertEqual(code, EXIT_REFUSED, 'the freeze capture holds the same rule as P3')
+            self.assertIn('O4 refused for example_orders_db: orders_stream loads into procedure nightly_rollup', text)
+            self.assertEqual(status('O4'), 'failed')
 
-    def test_f8_o4_redo_refusal_is_journaled_failed_before_the_capture_is_rewritten(self):
-        """profile --step O4 --redo on a capture with an unlisted routine wrote inventory/O4 before it journaled O4 running and failed,
-        so a stop between the two left O4 passed on a rewritten capture that holds the routine, and a plain run then skipped O4 into the
-        copy plan. Now O4 is recorded failed first. The failure points of that write (inventory.write): a kill at the journal write
+    def test_o4_redo_refusal_is_journaled_failed_before_the_capture_is_rewritten(self):
+        """profile --step O4 --redo on a capture with a load target the replacement will not hold wrote inventory/O4 before it journaled
+        O4 running and failed, so a stop between the two left O4 passed on a rewritten capture, and a plain run then skipped O4 into
+        the copy plan. Now O4 is recorded failed first. The failure points of that write (inventory.write): a kill at the journal write
         that starts the step and at the one that records it failed, a kill just before the write and one just after it. In no case is
-        O4 passed on a capture that holds the routine; the rerun refuses with O4 failed, step O4 refuses it, O5 waits for O4, and once
-        the routine is listed O4 passes."""
+        O4 passed on a capture that holds the refused target; the rerun refuses with O4 failed, step O4 refuses it, O5 waits for O4, and
+        once the procedure is no longer ignored O4 passes."""
         import json
         import yaml
         from s2rebuild import inventory, steps
@@ -379,7 +389,7 @@ class ProfileCliTests(unittest.TestCase):
                         j.close()
 
                 def captured():
-                    return sorted(r['name'] for r in json.loads(o4_file.read_text(encoding='utf8'))['routines'])
+                    return json.loads(o4_file.read_text(encoding='utf8'))['pipelines']['items'][0]['target']
                 code, text = run_cli(['profile', '--inventory', str(FIXTURE_INVENTORY)] + base)
                 self.assertEqual(code, EXIT_DONE, text)
                 journal = Journal(run_dir / 'journal.sqlite')
@@ -387,9 +397,9 @@ class ProfileCliTests(unittest.TestCase):
                     journal.record_gate(step_id, True, 'test')
                 journal.close()
                 code, text = run_cli(['profile', '--step', 'O4', '--inventory', str(FIXTURE_INVENTORY)] + base)
-                self.assertEqual((code, journal_state()[0], captured()), (EXIT_DONE, 'passed', ['nightly_rollup']), text)
+                self.assertEqual((code, journal_state()[0], captured()), (EXIT_DONE, 'passed', 'table orders'), text)
                 capture = json.loads((FIXTURE_INVENTORY / 'inventory.json').read_text(encoding='utf8'))
-                capture['routines'].append({'name': 'window_fix', 'type': 'FUNCTION'})
+                capture['pipelines']['items'][0]['target'] = 'procedure nightly_rollup'
                 (Path(tmp) / 'o4').mkdir()
                 (Path(tmp) / 'o4' / 'inventory.json').write_text(json.dumps(capture), encoding='utf8')
                 redo = ['profile', '--step', 'O4', '--redo', '--inventory', str(Path(tmp) / 'o4')] + base
@@ -403,18 +413,18 @@ class ProfileCliTests(unittest.TestCase):
                     with self.assertRaises(SimulatedCrash):
                         run_cli(redo)
                 state = journal_state()[0]
-                expected = {'journal start': ('passed', ['nightly_rollup']), 'journal end': ('running', ['nightly_rollup']),
-                            'before': ('failed', ['nightly_rollup']), 'after': ('failed', ['nightly_rollup', 'window_fix'])}[point]
-                self.assertEqual((state, captured()), expected, 'O4 is never passed on a capture that holds the unlisted routine')
+                expected = {'journal start': ('passed', 'table orders'), 'journal end': ('running', 'table orders'),
+                            'before': ('failed', 'table orders'), 'after': ('failed', 'procedure nightly_rollup')}[point]
+                self.assertEqual((state, captured()), expected, 'O4 is never passed on a capture that holds the refused target')
                 code, text = run_cli(redo)
                 self.assertEqual(code, EXIT_REFUSED, text)
-                self.assertIn('O4 refused for example_orders_db: routines are not migrated in this pass: function window_fix is not listed', text)
-                self.assertEqual((journal_state(), captured()), (('failed', ['O4']), ['nightly_rollup', 'window_fix']))
+                self.assertIn('O4 refused for example_orders_db: orders_stream loads into procedure nightly_rollup, which objects.routines.ignore lists', text)
+                self.assertEqual((journal_state(), captured()), (('failed', ['O4']), 'procedure nightly_rollup'))
                 code, text = run_cli(['step', 'O4'] + base)
                 self.assertEqual(code, EXIT_REFUSED, text)
-                self.assertIn('function window_fix is not listed', text)
+                self.assertIn('orders_stream loads into procedure nightly_rollup', text)
                 data = yaml.safe_load(path.read_text(encoding='utf8'))
-                data['objects'] = {'routines': {'ignore': ['nightly_rollup', 'window_fix']}}
+                data['objects'] = {'routines': {'ignore': []}}
                 path.write_text(yaml.safe_dump(data, sort_keys=False), encoding='utf8')
                 code, text = run_cli(['profile', '--step', 'O4', '--inventory', str(Path(tmp) / 'o4')] + base)
                 self.assertEqual((code, journal_state()[0]), (EXIT_DONE, 'passed'), text)

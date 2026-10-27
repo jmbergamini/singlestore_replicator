@@ -33,22 +33,22 @@ The same rules hold for every command that runs a step: `run`, `step`, `check` (
 - Identity: runner, plus the owner when configured.
 - Inputs: the configuration; P1 recorded in the run. Until then `check` refuses and creates nothing.
 - Outputs: the source STORAGE_ID in the journal, the engine version, a preflight record.
-- Statements: SELECT only: CURRENT_USER and version, USER_PRIVILEGES for the runner, DISTRIBUTED_DATABASES, MV_CLOUD_ATTACHED_DATABASES, ROUTINES, MV_NODES leaf cores, PIPELINES count (owner).
-- Gate: every line ok: all runner privileges present, source reported with a STORAGE_ID, every procedure and function of the source listed in `objects.routines.ignore` (routines are not migrated in this pass), replacement and retained names free, leaf cores times 8 at or above the target partitions (when MV_NODES is readable; otherwise confirm in the Portal).
+- Statements: SELECT, USE and SHOW only: CURRENT_USER and version, USER_PRIVILEGES for the runner, DISTRIBUTED_DATABASES, MV_CLOUD_ATTACHED_DATABASES, MV_NODES leaf cores; with the owner profile the PIPELINES count, ROUTINES, SHOW AGGREGATES and SHOW CREATE per routine.
+- Gate: every line ok: all runner privileges present, source reported with a STORAGE_ID, replacement and retained names free, leaf cores times 8 at or above the target partitions (when MV_NODES is readable; otherwise confirm in the Portal). The routine line prints "N routines (f functions, t TVFs, a aggregates, p procedures), M ignored by configuration" with the owner profile; without it, "routines: not visible to the runner; owner profile needed", never "none", since the runner sees no routine.
 - Re-enter: `s2rebuild check` any time; a passed P2 runs again without `--redo` and records its result again. O1 needs P2 passed in the same run.
-- When it fails: each failed line says what to change (grant, rename, compute size). A routine line names each unlisted procedure and function: list it by name (every database) or as `database.name` (one database) under `objects.routines.ignore` once its owner accepts that the live database has no such routine after the switch, then run `s2rebuild check` again.
+- When it fails: each failed line says what to change (grant, rename, compute size).
 
 ## P3 Profile
 
 - Purpose: know the database: tables, keys, sizes, accounts, sessions, views, routines, pipelines; estimate the copy.
-- Identity: runner; owner for pipelines.
+- Identity: runner; owner for the pipelines, the routines and the write-capable accounts (the runner sees no routine and no other account's grants).
 - Inputs: the configuration, `customer/baseline.json` when present; P1 and P2 passed in the run.
-- Outputs: `inventory/P3/inventory.json`, `tables.csv` (with `storage_type`, `reference` and `copy_path` per table), `definitions/`, `pipelines/` (0600, CREDENTIALS replaced by `<<CREDENTIALS>>`), `reports/profile.xlsx` with the estimate, bands and window fit.
-- Statements: SELECT and SHOW only (SHOW CREATE PIPELINE ... EXTENDED with the owner profile). A reference table (`CREATE [ROWSTORE] REFERENCE TABLE`) is always counted with `SELECT COUNT(*)`, because `TABLE_STATISTICS` reports no rows for it; a count that returns no row refuses the capture by table name. Its plan is one bucket on the staging path and the estimate counts its rows at the insert rate twice (staging table, then the reference table); the table tab says "reference table, copied through a staging table".
-- Gate: every routine, and every procedure a pipeline loads into, is listed in `objects.routines.ignore`; with a window configured, the estimate at the high band fits before the abort deadline. Listed routines show as not migrated on the plan sheet and the workbook Summary.
+- Outputs: `inventory/P3/inventory.json`, `tables.csv` (with `storage_type`, `reference` and `copy_path` per table), `definitions/` with `definitions/routines/<name>.<kind>.sql` per routine (kind function, tvf, aggregate or procedure), `pipelines/` (0600, CREDENTIALS replaced by `<<CREDENTIALS>>`), `reports/profile.xlsx` with the estimate, bands and window fit.
+- Statements: SELECT, USE and SHOW only (SHOW CREATE PIPELINE ... EXTENDED, ROUTINES, SHOW AGGREGATES and SHOW CREATE FUNCTION, AGGREGATE or PROCEDURE with the owner profile). A reference table (`CREATE [ROWSTORE] REFERENCE TABLE`) is always counted with `SELECT COUNT(*)`, because `TABLE_STATISTICS` reports no rows for it; a count that returns no row refuses the capture by table name. Its plan is one bucket on the staging path and the estimate counts its rows at the insert rate twice (staging table, then the reference table); the table tab says "reference table, copied through a staging table".
+- Gate: no pipeline loads into a procedure that `objects.routines.ignore` lists or the capture lacks (O9 would find no target); with a window configured, the estimate at the high band fits before the abort deadline. The plan sheet and the workbook Summary print the routines by kind and the ones ignored by configuration; without the owner profile they print "not captured".
 - Re-enter: once P3 passed, `s2rebuild profile --redo` captures again; the log names what it rewrites. `--exact-counts` for COUNT(*) per table. `--dry-run` writes only `reports/profile-dry-run.xlsx` (or `--out`), never the capture under `inventory/`.
 - A stop part way (a lost connection, Ctrl-C) leaves P3 not passed; a plain `s2rebuild profile` captures again.
-- When it fails: `DOES NOT FIT` exits 4; widen the window, raise workers, or split the databases across nights (`--all-databases` ranks them). `P3 refused` exits 1, records P3 failed and writes no workbook; the refused capture stays under `inventory/P3/` for review and the plan sheet. It names each unlisted routine and each pipeline into an unlisted procedure; list them as for P2 and run `s2rebuild profile` again. A pipeline into a listed procedure fails at O9 unless that procedure exists in the replacement. A pipeline with an empty definition, or a CREDENTIALS clause the kit cannot replace, refuses the capture by name and nothing is written; run `s2rebuild profile` again.
+- When it fails: `DOES NOT FIT` exits 4; widen the window, raise workers, or split the databases across nights (`--all-databases` ranks them). `P3 refused` exits 1, records P3 failed and writes no workbook; the refused capture stays under `inventory/P3/` for review and the plan sheet. It names each pipeline whose load target is a procedure the replacement will not hold; remove the name from `objects.routines.ignore` (or list the pipeline as application managed) and run `s2rebuild profile` again. A pipeline with an empty definition, or a CREDENTIALS clause the kit cannot replace, refuses the capture by name and nothing is written; run `s2rebuild profile` again.
 
 ## P4 Plan
 
@@ -115,16 +115,18 @@ The same rules hold for every command that runs a step: `run`, `step`, `check` (
 - Identity: runner.
 - Inputs: `s2rebuild profile --step O4`, after O1 to O3 passed. Until then it refuses before it connects or writes.
 - Outputs: `inventory/O4/`, `drift.json` against P3, the copy plan. Reference tables are counted exactly again, as at P3, so the plan carries the frozen count.
-- Gate: drift reviewed; the routine rule of P3 holds again, so a routine created since P3 and not listed in `objects.routines.ignore` refuses O4 and records it failed; O5 and later refuse until O4 passes.
+- Gate: drift reviewed (a routine added, removed or changed since P3 is listed by kind and name); the load-target rule of P3 holds again, so a pipeline into an ignored procedure refuses O4 and records it failed; O5 and later refuse until O4 passes.
 - Re-enter: once O4 passed, `s2rebuild profile --step O4 --redo` captures again and rewrites the copy plan; the log says so. O5 and O6 refuse a plan that differs from the journal. A stop part way leaves O4 not passed; a plain rerun captures again. A dry run writes nothing under `inventory/`.
 
 ## O5 Create replacement
 
-- Purpose: the replacement database with the target layout and identical table definitions.
-- Identity: runner.
-- Statements: CREATE DATABASE ... PARTITIONS ... SUB_PARTITIONS, CREATE TABLE ... LIKE per table, SHOW CREATE TABLE.
-- Outputs: the replacement STORAGE_ID in the journal (the switch attaches it by that id).
-- Gate: layout and durability verified; every definition equals the capture (only the AUTO_INCREMENT counter may differ).
+- Purpose: the replacement database with the target layout and identical table definitions, then the functions, table-valued functions and aggregates of the capture.
+- Identity: runner for the database and the tables; owner for the routines.
+- Statements: CREATE DATABASE ... PARTITIONS ... SUB_PARTITIONS, CREATE TABLE ... LIKE per table, SHOW CREATE TABLE (runner); USE, CREATE FUNCTION and CREATE AGGREGATE naming the replacement, with the ROUTINES and SHOW AGGREGATES reads and SHOW CREATE per routine (owner).
+- Routines: after the tables, the owner session creates the functions and TVFs, then the aggregates (an aggregate names its functions), each skipped when it exists and checked after; a routine that fails is tried again after the others, in rounds, and a round that creates none refuses the step with each routine and its error number. The DEFINER rule of the views applies: the original definer is kept while that account exists and is not the runner, else the owner; on error 1227 the routine is created again without the clause and the reason is recorded per routine. A routine body that names the source database refuses the step before any statement. A routine `objects.routines.ignore` lists is left behind and named in the log.
+- Outputs: the replacement STORAGE_ID in the journal (the switch attaches it by that id); one `routine` event per routine with the definer choice.
+- Gate: layout and durability verified; every table definition equals the capture (only the AUTO_INCREMENT counter may differ); every expected function, TVF and aggregate exists in the replacement with the captured definition (normalized, DEFINER aside).
+- When it fails: `O5 stopped` names each routine still missing with its error; fix the cause (a function an aggregate names is ignored by configuration, say) and rerun O5; routines already created are skipped.
 
 ## O6 Copy
 
@@ -145,10 +147,11 @@ The same rules hold for every command that runs a step: `run`, `step`, `check` (
 
 ## O7 Post-copy
 
-- Purpose: views, counters and the stale check.
-- Identity: runner; owner for the views. A view runs under its definer and C4 removes the runner, so the runner never creates a view.
-- Statements: USE and CREATE VIEW naming the replacement (owner), ALTER TABLE ... AUTO_INCREMENT and AGGREGATOR SYNC AUTO_INCREMENT ... ALL, counts and newest values on both sides.
-- Source names: a view definition that names the source database refuses the step before any view statement. Edit the definition in the capture so it names no database, then rerun O7.
+- Purpose: views, then procedures, counters and the stale check.
+- Identity: runner; owner for the views and the procedures. A view or a procedure runs under its definer and C4 removes the runner, so the runner never creates one.
+- Statements: USE, CREATE VIEW and CREATE PROCEDURE naming the replacement (owner), ALTER TABLE ... AUTO_INCREMENT and AGGREGATOR SYNC AUTO_INCREMENT ... ALL, counts and newest values on both sides.
+- Source names: a view or procedure definition that names the source database refuses the step before any view statement. Edit the definition in the capture so it names no database, then rerun O7.
+- Procedures: once every view exists, the owner session creates the captured procedures as O5 created the functions (rounds, the DEFINER rule, the 1227 fallback recorded per procedure), so a procedure that reads a view compiles and a pipeline INTO PROCEDURE at O9 finds its target. The gate compares each definition with the capture and records the ROUTINES row count of the replacement, which the switch expects on the live name after S3. Without the owner profile the procedures wait for the views, as the step ends pending.
 - Views with the owner profile:
   1. The owner session creates each missing view. It keeps the original DEFINER when that account still exists and is not the runner. Otherwise it removes the clause and the owner account becomes the definer. When the server refuses the original DEFINER (error 1227: Helios does not let even the admin name another account), the owner creates the view again without the clause. The journal and the Views tab of the final workbook record the choice per view.
   2. A view that fails is tried again after the others, in rounds, so a view on another view is created once the other exists. Gate: every view created. A round that creates none refuses the step with each view and its error number; fix the cause and rerun O7. Views already created are skipped.
@@ -158,7 +161,7 @@ The same rules hold for every command that runs a step: `run`, `step`, `check` (
   3. Run the block as the admin, then `s2rebuild step O7`. Gate: the rerun finds every view and passes.
 - Counters: each AUTO_INCREMENT counter is set to the larger of the source counter and MAX + 1, then synced on every aggregator (ALL). A sharded table whose counter the server refuses to set (error 1749) gets the sync alone, which moves every aggregator past MAX. An empty table without a source counter keeps the default. The table tab of the final workbook shows both values and the decision. A rerun of O7 sets and syncs every counter again.
 - Re-copy: a stale mismatch marks the table for re-copy, the kit copies the marked buckets again and repeats the check, for up to three rounds. A round that ends with every chunk done and the count proof all matching marks O6 passed again. The counters are set once, after the last round.
-- Gate: views created, counters set, zero stale mismatches after re-copy.
+- Gate: views and procedures created, counters set, zero stale mismatches after re-copy.
 - When it stops: a re-copy round that does not complete leaves O6 pending; run `s2rebuild run --from O6`, which finishes the marked buckets and reruns O7.
 
 ## O8 Verify
@@ -172,7 +175,7 @@ The same rules hold for every command that runs a step: `run`, `step`, `check` (
 
 ## O9 Pipelines
 
-- Purpose: every pipeline exists in the replacement, stopped, at the offsets recorded at O2.
+- Purpose: every pipeline exists in the replacement, stopped, at the offsets recorded at O2. O9 runs after O7, so a pipeline INTO PROCEDURE finds the procedure O7 created; P3 and O4 refuse a load target whose procedure is ignored by configuration or absent from the capture.
 - Identity: owner.
 - Credentials: the server hides CREDENTIALS from every identity, so the customer supplies them. Route kit: the operator exports the variable per source type (or per pipeline) named in `pipelines.credentials_env` and `pipelines.per_pipeline_env` for this step only and unsets it afterwards; the kit injects the value as a SQL literal at execution and masks it in every log line. In the notebook the cell asks for each value with a hidden prompt. Route customer: the customer runs `pipelines/recreate-with-placeholders.sql` from the O2 capture inside the replacement, filling in CREDENTIALS; the kit runs only the checks.
 - Statements: USE replacement, CREATE PIPELINE per pipeline (skipped when it exists), its ALTER PIPELINE ... SET OFFSETS statements. Never START.
@@ -190,7 +193,7 @@ The same rules hold for every command that runs a step: `run`, `step`, `check` (
 - S1: checks (source on its recorded STORAGE_ID and its recorded record, attach type for the freeze path, no foreign active session, replacement READWRITE as its recorded record, retained name free; on Path B every write privilege the lockout took still revoked, one check per account and scope, and the last lockout pass quiet within `freeze.quiet_max_age_seconds`), DETACH (with the wait and KILL rule), checks: the storage detached, the name free, and the original's detached record with its ATTACH_SYNTAX (the AT MILESTONE form), which the kit records for the rollback. The kit runs the before-checks once before the go and again before the DETACH. The Path B pass check reads the journal, so the printed block and the notebook carry it as a note; their privilege checks stop them before the DETACH when a grant came back after the quiet proof. Revoke it again as the O3 lockout plan does, kill that account's sessions, and run the block again from the top. Generate the block or the notebook after O3 recorded the snapshot; without one the block says it has no privilege check.
 - S2: ATTACH source AS retained READ ONLY STORAGEID ..., checks (READONLY, a resume record of the original, recorded), one small table count.
 - S2b (the live name is free): the original record's own ATTACH_SYNTAX (the AT MILESTONE form S1 recorded) attaches the original read write under the live name; checks: the recorded record, attached READWRITE; the zero-change proof: the three smallest non-empty tables hold the journal's source counts and the S1 session query shows no foreign non-idle session; then DROP DATABASE of the original record; checks: the record dropped, the name free, the original storage holds one entry (the retained record), one small table count in the retained copy. A failed proof stops with the original attached read write under the live name, the rollback state: reconcile, then `s2rebuild step O10` continues at the proof, or stay on the original. For those seconds the live name resolves to the original; the O1 decision that the application is stopped and the session check cover it.
-- S3: checks, ATTACH replacement AS live STORAGEID ..., checks: READWRITE, not the original storage, a pitr record of the replacement (recorded), target layout, table, view and pipeline counts, three smallest tables against the journal.
+- S3: checks, ATTACH replacement AS live STORAGEID ..., checks: READWRITE, not the original storage, a pitr record of the replacement (recorded), target layout, table, view, pipeline and routine counts (the routine count is the ROUTINES row count the O7 gate recorded), three smallest tables against the journal.
 - S4: checks: the replacement name holds the recorded replacement record (create, the parent of the live record) and the live name is its own branch of it; DROP DATABASE of the replacement; checks: the record dropped, the name free, the live record unchanged, one small table count on the live name.
 - Gate: the entries with IS_DROPPED = 0 on both storages are exactly the live record and the retained record (two entries). The listing before S1 and after S4 goes into the journal (`switch_listing`). A failed gate names the extra or missing entries; C3 carries the repair for a switch made without S2b and S4.
 - Re-enter: the position comes from the attachment views. A rerun repeats the after-checks of the step it lands behind, so a failed check never turns into a passed switch.
@@ -244,7 +247,7 @@ The same rules hold for every command that runs a step: `run`, `step`, `check` (
 ## C4 Remove the migration account
 
 - Identity: owner.
-- Preconditions: C3 passed; no view in the live database has the runner as its definer (routines get the same check once the kit migrates them).
+- Preconditions: C3 passed; no view and no routine in the live database has the runner as its definer.
 - Statements: a check that the account still holds privileges, the definer check, DROP USER, a check that zero privileges remain.
 - When it stops at the view check: a view whose definer is gone can no longer be executed. List them with `SELECT TABLE_NAME, DEFINER FROM information_schema.VIEWS WHERE TABLE_SCHEMA = '<live database>'`, recreate each one the runner defines as a durable account (the admin or the application account), then rerun `s2rebuild step C4`.
 - Then: delete the Keychain item that held the runner password.

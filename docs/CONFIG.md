@@ -67,7 +67,7 @@ One YAML file, default `customer/config.yaml`, selected with `--config` or `S2RE
 | `closeout.retain_days` | integer | `90` (minimum 1) | C2 records `retain_until_utc`, the switch time plus this; C5 (`s2rebuild cleanup --delete`) refuses before it; a value under 90 prints a line on the plan sheet; no key makes a run delete the retained copy |
 | `closeout.flexible_parallelism` | number or null | `0.5` | O11 |
 | `paths.runs_dir` | path | `customer/runs` | every command (everything a run writes stays under its parent folder) |
-| `objects.routines.ignore` | list | `[]` | P2, P3, O4, P4 plan sheet (procedures and functions left behind, since routines are not migrated in this pass: `name` for every database, `database.name` for one; an unlisted routine, or a pipeline that loads into an unlisted procedure, refuses) |
+| `objects.routines.ignore` | list | `[]` | P2, P3, O4, P4 plan sheet, O5, O7, O10 (routines left behind on purpose, never recreated: `name` for every database, `database.name` for one; the default migrates every captured routine; a pipeline that loads into an ignored procedure refuses P3 and O4, since O9 would find no target) |
 
 ## Command line flags
 

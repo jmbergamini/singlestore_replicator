@@ -62,6 +62,9 @@ ERROR_TABLE = {
              'source': 'fake, from the live run of October 27, 2026'},
     '1290': {'when': 'a write on a READ ONLY attachment (the O3 write probe expects it)', 'message': 'The database is attached read only',
              'source': 'fake'},
+    '1305': {'when': 'CREATE AGGREGATE naming a function that does not exist yet, a load target INTO PROCEDURE that does not exist, '
+                     'or SHOW CREATE of a routine the database does not hold (routines are created in dependency order)',
+             'message': '<kind> <name> does not exist', 'source': 'kit wording from the MySQL number; confirm the number and text live'},
     '1836': {'when': 'a write on a READ ONLY attachment, the second number the server uses for it', 'message': 'Running in read-only mode',
              'source': 'kit wording; freeze.READ_ONLY_ERRNOS accepts 1290 and 1836'},
     '1749': {'when': 'ALTER TABLE ... AUTO_INCREMENT = N on a sharded table',

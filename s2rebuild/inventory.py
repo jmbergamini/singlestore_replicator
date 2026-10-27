@@ -10,8 +10,12 @@ written. The copy plan (TablePlan, hash buckets) built here is what copy.py exec
 A reference table (CREATE [ROWSTORE] REFERENCE TABLE in its definition) is recorded with
 reference true and an exact COUNT(*) at P3 and O4, because TABLE_STATISTICS reports no rows for
 it (Helios fact 36); its plan is one bucket through the staging path of copy.py.
-Routines are captured by name and type only and are not migrated in this pass: P2, P3 and O4
-refuse while objects.routines.ignore does not list one, or a procedure a pipeline loads into.
+Routines (functions, table-valued functions, aggregates, procedures) and the write-capable
+account list are read with the owner session (routines.py), since the runner sees no rows in
+ROUTINES and no other account's grants; each routine definition goes to
+definitions/routines/<name>.<kind>.sql. Without an owner session the capture says so and the
+plan sheet prints "not captured". A load target INTO PROCEDURE whose procedure is ignored by
+objects.routines.ignore, or absent from the capture, refuses P3 and O4, since O9 would fail.
 """
 import csv
 import datetime as dt
@@ -22,7 +26,7 @@ import re
 import time
 from pathlib import Path
 
-from . import steps
+from . import routines, steps
 from .common import KitError, iso, utc_now
 from .sqlutil import ident, qualified, strip_literals
 
@@ -60,7 +64,6 @@ LAYOUT_SQL = ('SELECT NUM_PARTITIONS, NUM_SUB_PARTITIONS, IS_SYNC, IS_SYNC_DURAB
 ATTACHMENT_SQL = ('SELECT DATABASE_NAME, ATTACH_TYPE, STORAGE_ID, COMPUTE_ID, ATTACH_SYNTAX '
                   'FROM information_schema.MV_CLOUD_ATTACHED_DATABASES WHERE DATABASE_NAME = %s')
 OBJECTS_SQL = 'SELECT TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA = %s ORDER BY TABLE_NAME'
-ROUTINES_SQL = 'SELECT ROUTINE_NAME, ROUTINE_TYPE FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA = %s ORDER BY ROUTINE_NAME'
 COLUMNS_SQL = ('SELECT TABLE_NAME, COLUMN_NAME, ORDINAL_POSITION, COLUMN_DEFAULT, IS_NULLABLE, DATA_TYPE, COLUMN_TYPE, '
                'EXTRA, GENERATION_EXPRESSION FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = %s '
                'ORDER BY TABLE_NAME, ORDINAL_POSITION')
@@ -358,12 +361,17 @@ def _pipelines(owner_session, db_name, app_managed, now):
             'items': [by_name[n] for n in sorted(by_name)]}
 
 
+ROUTINES_NOT_CAPTURED = 'routines not captured: no owner profile; the runner sees none in ROUTINES'
+
+
 def capture(session, db, config, owner_session=None, exact_counts=False, log=None, step='P3', samples=3, sleep=time.sleep):
     """Capture the inventory of db.source through a read-only runner session.
 
     Inputs: a Session with the read guard, the DatabaseSpec, the Config, an optional owner
-    Session for pipelines. Output: the inventory dict (see write for the file layout).
-    Statements issued: the SELECT and SHOW statements at the top of this module.
+    Session for pipelines, routines and the write-capable accounts (the runner sees neither
+    the routines nor other accounts' grants). Output: the inventory dict (see write for the
+    file layout). Statements issued: the SELECT and SHOW statements at the top of this module,
+    and those of routines.capture through the owner session.
     """
     now = utc_now()
     name = db.source
@@ -371,7 +379,6 @@ def capture(session, db, config, owner_session=None, exact_counts=False, log=Non
     layout = _one(session.query(LAYOUT_SQL, (name,)), 'Source database %s' % name)
     attachment = _one(session.query(ATTACHMENT_SQL, (name,)), 'attachment', required=False)
     objects = session.query(OBJECTS_SQL, (name,))
-    routines = [{'name': r['ROUTINE_NAME'], 'type': r['ROUTINE_TYPE']} for r in session.query(ROUTINES_SQL, (name,))]
     columns = _group_columns(session.query(COLUMNS_SQL, (name,)))
     keys = _group_keys(session.query(KEYS_SQL, (name,)))
     estimates = {r['TABLE_NAME']: _int(r['estimated_rows']) for r in session.query(ROWS_SQL, (name,))}
@@ -410,11 +417,17 @@ def capture(session, db, config, owner_session=None, exact_counts=False, log=Non
             'est_rows': exact if reference else estimates.get(obj, 0), 'exact_rows': exact, 'size_gib': sizes.get(obj),
             'computed_columns': [c['name'] for c in cols if c['generation_expression']],
         })
+    if owner_session is not None:
+        captured = routines.capture(owner_session, name)
+        routines_note = '%d routines captured with the owner profile' % len(captured)
+    else:
+        captured, routines_note = [], ROUTINES_NOT_CAPTURED
     inventory = {
         'kit': 's2rebuild', 'version': 1, 'database': name, 'captured_utc': iso(now), 'step': step,
         'layout': {k: _int(v) for k, v in layout.items()}, 'attachment': attachment,
-        'tables': tables, 'views': views, 'routines': routines,
-        'accounts': _write_accounts(session, name, protected),
+        'tables': tables, 'views': views, 'routines': captured,
+        'routines_captured': owner_session is not None, 'routines_note': routines_note,
+        'accounts': _write_accounts(owner_session if owner_session is not None else session, name, protected),
         'sessions': _sessions(session, name, samples, sleep),
         'size_gib_total': round(sum(t['size_gib'] or 0.0 for t in tables), 3),
         'est_rows_total': sum(t['est_rows'] for t in tables),
@@ -425,69 +438,17 @@ def capture(session, db, config, owner_session=None, exact_counts=False, log=Non
         inventory['pipelines'] = {'captured': False, 'items': [],
                                   'note': 'pipelines not captured: no owner profile; the O9 gate cannot pass without a capture'}
     if log is not None:
-        log('inventory of %s: %d tables (%d reference, counted exactly), %d views, %d routines, %d write-capable accounts, %s' % (
-            name, len(tables), sum(1 for t in tables if t['reference']), len(views), len(routines), len(inventory['accounts']),
+        log('inventory of %s: %d tables (%d reference, counted exactly), %d views, %s, %d write-capable accounts, %s' % (
+            name, len(tables), sum(1 for t in tables if t['reference']), len(views), routines_note, len(inventory['accounts']),
             inventory['pipelines']['note']))
     return inventory
-
-
-# ---------------------------------------------------------------------------
-# Routines (not migrated in this pass)
-# ---------------------------------------------------------------------------
-ROUTINES_IGNORE_KEY = 'objects.routines.ignore'
-
-
-def routine_listed(config, db, name):
-    """True when objects.routines.ignore lists the routine by name, or as <database>.<name> for this database only."""
-    ignore = set(config.objects.routines.ignore) if config.objects is not None else set()
-    return name in ignore or '%s.%s' % (db.source, name) in ignore
-
-
-def unmigrated(config, db, routines, pipelines=()):
-    """(listed, refusals) for the procedures and functions of a database; no statement is issued.
-
-    Routines are not recreated in the replacement in this pass. listed holds 'procedure name'
-    for each routine objects.routines.ignore lists. refusals names each routine the key does
-    not list, and each captured pipeline that loads into a procedure the key does not list.
-    """
-    listed, refusals = [], []
-    for r in routines:
-        label = '%s %s' % (str(r['type']).lower(), r['name'])
-        if routine_listed(config, db, r['name']):
-            listed.append(label)
-        else:
-            refusals.append('%s is not listed in %s' % (label, ROUTINES_IGNORE_KEY))
-    for item in pipelines:
-        target = str(item.get('target') or '')
-        if target.startswith('procedure ') and not routine_listed(config, db, target.split(' ', 1)[1]):
-            refusals.append('pipeline %s loads into %s, which is not listed in %s' % (item['name'], target, ROUTINES_IGNORE_KEY))
-    return listed, refusals
-
-
-def refuse_unmigrated(inventory, config, db, step, journal=None):
-    """Raise KitError when the capture holds a routine or a procedure target objects.routines.ignore does not list.
-
-    With a journal the step is started and recorded failed first, so an earlier pass of the
-    step no longer counts. Returns the listed routines when nothing is refused.
-    """
-    pipelines = (inventory.get('pipelines') or {}).get('items') or []
-    listed, refusals = unmigrated(config, db, inventory.get('routines') or [], pipelines)
-    if not refusals:
-        return listed
-    note = ('%s refused for %s: routines are not migrated in this pass: %s. List each name (or database.name) under %s '
-            'to accept that it is absent from the database after the switch, then capture again' % (
-                step, db.source, '; '.join(refusals), ROUTINES_IGNORE_KEY))
-    if journal is not None:
-        journal.step_start(step)
-        journal.step_end(step, 'failed', note)
-    raise KitError(note)
 
 
 # ---------------------------------------------------------------------------
 # Files
 # ---------------------------------------------------------------------------
 def write(inventory, directory, plans=None):
-    """Write inventory.json, tables.csv, definitions/ (0600) and pipelines/ (0600) under directory."""
+    """Write inventory.json, tables.csv, definitions/ with definitions/routines/ (0600) and pipelines/ (0600) under directory."""
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     write_private(directory / INVENTORY_FILE, json.dumps(inventory, indent=1, sort_keys=False, default=str))
@@ -495,6 +456,9 @@ def write(inventory, directory, plans=None):
         _write_private(directory / DEFINITIONS_DIR / (t['name'] + '.sql'), t['definition'] + '\n')
     for v in inventory['views']:
         _write_private(directory / DEFINITIONS_DIR / (v['name'] + '.view.sql'), (v['definition'] or '') + '\n')
+    for r in inventory.get('routines') or []:
+        if r.get('definition'):
+            _write_private(directory / DEFINITIONS_DIR / routines.DEFINITIONS_SUBDIR / routines.file_name(r), r['definition'] + '\n')
     plans = plans if plans is not None else []
     by_name = {p.name: p for p in plans}
     with (directory / TABLES_CSV).open('w', newline='', encoding='utf8') as fh:
@@ -711,11 +675,10 @@ def drift(before, after):
     new_objects = {t['name']: t for t in after['tables']}
     old_views = {v['name']: v for v in before.get('views', [])}
     new_views = {v['name']: v for v in after.get('views', [])}
-    old_routines = {'routine ' + r['name'] for r in before.get('routines', [])}
-    new_routines = {'routine ' + r['name'] for r in after.get('routines', [])}
+    routines_added, routines_removed, routines_changed = routines.drift(before, after)
     report = {
-        'objects_added': sorted((set(new_objects) | set(new_views) | new_routines) - (set(old_objects) | set(old_views) | old_routines)),
-        'objects_removed': sorted((set(old_objects) | set(old_views) | old_routines) - (set(new_objects) | set(new_views) | new_routines)),
+        'objects_added': sorted((set(new_objects) | set(new_views)) - (set(old_objects) | set(old_views))) + routines_added,
+        'objects_removed': sorted((set(old_objects) | set(old_views)) - (set(new_objects) | set(new_views))) + routines_removed,
         'columns_added': [], 'columns_removed': [], 'definitions_changed': [], 'rows_changed': [],
     }
     for name in sorted(set(old_objects) & set(new_objects)):
@@ -730,6 +693,7 @@ def drift(before, after):
     for name in sorted(set(old_views) & set(new_views)):
         if ' '.join(str(old_views[name]['definition']).split()) != ' '.join(str(new_views[name]['definition']).split()):
             report['definitions_changed'].append(name)
+    report['definitions_changed'].extend(routines_changed)
     report['count'] = sum(len(report[k]) for k in ('objects_added', 'objects_removed', 'columns_added', 'columns_removed',
                                                    'definitions_changed'))
     return report
@@ -782,11 +746,11 @@ def inventory_dir(config, run_id, db, step):
 def handle_p3(step, ctx):
     """P3 handler: the profile command does the capture; here the step reports whether a capture exists.
 
-    A capture with a routine or procedure target objects.routines.ignore does not list is refused.
+    A capture whose load target INTO PROCEDURE names a procedure the replacement will not hold is refused.
     """
     directory = inventory_dir(ctx.config, ctx.run_id or '', ctx.db, 'P3')
     if (directory / INVENTORY_FILE).is_file():
-        refuse_unmigrated(load(directory), ctx.config, ctx.db, 'P3')
+        routines.refuse_pipeline_targets(load(directory), ctx.config, ctx.db, 'P3')
         return steps.Outcome(steps.PASSED, 'inventory present at %s' % directory)
     note = 'run s2rebuild profile to capture the inventory and write the profile workbook'
     if ctx.dry_run:
@@ -797,11 +761,11 @@ def handle_p3(step, ctx):
 def handle_o4(step, ctx):
     """O4 handler: the freeze capture is driven by the profile code path (cli); report presence of the capture.
 
-    A capture with a routine or procedure target objects.routines.ignore does not list is refused.
+    A capture whose load target INTO PROCEDURE names a procedure the replacement will not hold is refused.
     """
     directory = inventory_dir(ctx.config, ctx.run_id or '', ctx.db, 'O4')
     if (directory / INVENTORY_FILE).is_file():
-        refuse_unmigrated(load(directory), ctx.config, ctx.db, 'O4')
+        routines.refuse_pipeline_targets(load(directory), ctx.config, ctx.db, 'O4')
         return steps.Outcome(steps.PASSED, 'freeze capture present at %s' % directory)
     note = 'run s2rebuild step O4 through the profile code path after the freeze (s2rebuild profile --step O4)'
     if ctx.dry_run:
@@ -829,10 +793,11 @@ def preflight(runner, db, config, owner=None):
 
     Connection and engine version; the runner's privileges against section 5, each missing one by
     name; whether the runner may create branches (recorded, not assumed); the source layout and
-    STORAGE_ID; every procedure and function listed in objects.routines.ignore (routines are not
-    migrated in this pass); the replacement and retained names free; leaf cores times 8 against the target
-    partition count when MV_NODES is readable; with the owner profile, its connection and the
-    pipelines it can see. Statements issued: SELECT only.
+    STORAGE_ID; the replacement and retained names free; leaf cores times 8 against the target
+    partition count when MV_NODES is readable; with the owner profile, its connection, the
+    pipelines it can see and the routines by kind with the ones objects.routines.ignore lists
+    (the runner sees none, so without the owner profile the line says so and never "none").
+    Statements issued: SELECT, USE and SHOW only.
     """
     from .ownersql import RUNNER_PRIVILEGES
     ok, lines, facts = True, [], {}
@@ -866,15 +831,6 @@ def preflight(runner, db, config, owner=None):
     else:
         facts['source_attachment'] = dict(attached[0])
         lines.append('source STORAGE_ID: %s (%s), recorded' % (attached[0].get('STORAGE_ID'), attached[0].get('ATTACH_TYPE')))
-    routines = [{'name': r['ROUTINE_NAME'], 'type': r['ROUTINE_TYPE']} for r in runner.query(ROUTINES_SQL, (db.source,))]
-    listed, refusals = unmigrated(config, db, routines)
-    facts['routines_not_migrated'] = listed
-    if refusals:
-        ok = False
-        lines.append('routines: FAILED, not migrated in this pass: %s; list each name (or database.name) under %s '
-                     'to accept that it is absent after the switch' % ('; '.join(refusals), ROUTINES_IGNORE_KEY))
-    else:
-        lines.append('routines: %s' % (('not migrated, listed in %s: %s' % (ROUTINES_IGNORE_KEY, ', '.join(listed))) if listed else 'none'))
     for role, name in (('replacement', db.replacement), ('retained', db.retained)):
         if runner.query(LAYOUT_SQL, (name,)) or runner.query(ATTACHMENT_SQL, (name,)):
             ok = False
@@ -899,8 +855,15 @@ def preflight(runner, db, config, owner=None):
         count = owner.query(PIPELINE_COUNT_SQL, (db.source,))
         facts['owner_user'] = who2.get('u')
         lines.append('owner: connected as %s; %s pipeline(s) visible on %s' % (who2.get('u'), count[0]['n'] if count else 0, db.source))
+        captured = routines.capture(owner, db.source)
+        snapshot = {'routines': captured, 'routines_captured': True}
+        facts['routines'] = [{'name': r['name'], 'kind': r['kind']} for r in captured]
+        facts['routines_ignored'] = routines.split(config, db, captured)[1]
+        lines.append('routines: ' + routines.summary(config, db, snapshot))
     else:
         lines.append('owner: no owner profile configured; admin steps print their blocks and wait for recorded gates')
+        facts['routines'] = None
+        lines.append('routines: not visible to the runner; owner profile needed')
     return ok, lines, facts
 
 
@@ -916,9 +879,12 @@ def handle_p2(step, ctx):
     try:
         if ctx.dry_run:
             for sql, args in ((CURRENT_SQL, ()), (GRANTEE_PRIVILEGES_SQL, ('<grantee>',)), (LAYOUT_SQL, (ctx.db.source,)),
-                              (ATTACHMENT_SQL, (ctx.db.source,)), (ROUTINES_SQL, (ctx.db.source,)), (LAYOUT_SQL, (ctx.db.replacement,)),
+                              (ATTACHMENT_SQL, (ctx.db.source,)), (LAYOUT_SQL, (ctx.db.replacement,)),
                               (LAYOUT_SQL, (ctx.db.retained,)), (LEAF_CORES_SQL, ())):
                 runner.query(sql, args)
+            if owner is not None:
+                owner.query(routines.ROUTINES_SQL, (ctx.db.source,))
+                owner.query(routines.AGGREGATES_SQL)
             return steps.Outcome(steps.PASSED, 'dry run: preflight queries printed')
         ok, lines, facts = preflight(runner, ctx.db, ctx.config, owner)
         record = None

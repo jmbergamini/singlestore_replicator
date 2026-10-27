@@ -66,10 +66,35 @@ class ClassifyTests(unittest.TestCase):
             ('KILL 42', 'KILL CONNECTION', ()),
             ("CREATE USER 'u'@'%' IDENTIFIED BY '<password>'", 'CREATE USER', ()),
             ("DROP USER 'u'@'%'", 'DROP USER', ()),
+            # W5: the three routine kinds name their database; a body's semicolons sit inside BEGIN ... END
+            ('CREATE FUNCTION `repl`.`f`(a INT) RETURNS INT AS BEGIN RETURN a + 1; END', 'CREATE FUNCTION', ('repl',)),
+            ('CREATE FUNCTION `repl`.`tvf`(n INT) RETURNS TABLE AS RETURN SELECT 1', 'CREATE FUNCTION', ('repl',)),
+            ('CREATE DEFINER=`app`@`%` PROCEDURE `repl`.`p`() AS\nDECLARE x INT;\nBEGIN\n  ECHO SELECT 1;\nEND', 'CREATE PROCEDURE', ('repl',)),
+            ('CREATE OR REPLACE AGGREGATE `repl`.`a`(INT) RETURNS INT WITH STATE INT INITIALIZE WITH f1 ITERATE WITH f2 MERGE WITH f3 TERMINATE WITH f4',
+             'CREATE AGGREGATE', ('repl',)),
         ]
         for sql, kind, dbs in cases:
             st = classify(sql)
             self.assertEqual((st.kind, st.databases), (kind, dbs), sql)
+        self.assertEqual(classify('CREATE PROCEDURE `repl`.`p`() AS BEGIN ECHO SELECT 1; END').detail, 'p')
+        for sql in ('CREATE PROCEDURE `repl`.`p`() AS BEGIN ECHO SELECT 1; END; DROP DATABASE `src`',
+                    'CREATE AGGREGATE `repl`.`a`(INT) RETURNS INT; DROP DATABASE `src`',
+                    'CREATE FUNCTION `repl`.`f`(a INT) RETURNS INT AS RETURN a; DROP DATABASE `src`',
+                    'CREATE FUNCTION `f`(a INT) RETURNS INT AS BEGIN RETURN a; END'):
+            with self.assertRaises(GuardError, msg=sql):
+                classify(sql)
+        o5 = steps.guard_for('O5', DB, steps.OWNER)
+        o5.check('USE `%s`' % TGT)
+        o5.check('CREATE FUNCTION `%s`.`f`(a INT) RETURNS INT AS BEGIN RETURN a; END' % TGT)
+        o5.check('CREATE AGGREGATE `%s`.`a`(INT) RETURNS INT WITH STATE INT INITIALIZE WITH f1 ITERATE WITH f2 MERGE WITH f3 TERMINATE WITH f4' % TGT)
+        for sql in ('CREATE FUNCTION `%s`.`f`(a INT) RETURNS INT AS BEGIN RETURN a; END' % SRC,
+                    'CREATE PROCEDURE `%s`.`p`() AS BEGIN ECHO SELECT 1; END' % TGT, 'CREATE VIEW `%s`.`v` AS SELECT 1' % TGT):
+            with self.assertRaises(GuardError, msg=sql):
+                o5.check(sql)
+        o7 = steps.guard_for('O7', DB, steps.OWNER)
+        o7.check('CREATE PROCEDURE `%s`.`p`() AS BEGIN ECHO SELECT 1; END' % TGT)
+        with self.assertRaises(GuardError):
+            o7.check('CREATE FUNCTION `%s`.`f`(a INT) RETURNS INT AS BEGIN RETURN a; END' % TGT)
         self.assertEqual(classify('ALTER TABLE `r`.`t` ADD COLUMN x int').detail, 'OTHER')
         self.assertEqual(classify('DETACH DATABASE `s` FORCE').detail, 'FORCE')
         self.assertEqual(classify("ATTACH DATABASE `s` READ ONLY STORAGEID x").detail, 'READ ONLY')
@@ -373,6 +398,7 @@ ALLOWANCES = {
     'transform.py': set(),
     'verify.py': set(),
     'postcopy.py': set(),
+    'routines.py': {'pipeline'},  # the load target refusal (a pipeline INTO PROCEDURE whose procedure the replacement will not hold)
     'watch.py': {'pipeline', 'drop', 'truncate', 'grant'},     # PIPELINES state query, the write regex (DROP, TRUNCATE), grantee lookup
     'report_md.py': set(),
     'ownersql.py': {'drop', 'grant', 'attach', 'pipeline', 'detach', 'kill'},  # account and cleanup blocks, attachment checks, pipeline block dispatch

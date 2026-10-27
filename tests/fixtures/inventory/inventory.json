@@ -474,9 +474,21 @@
  "routines": [
   {
    "name": "nightly_rollup",
-   "type": "PROCEDURE"
+   "kind": "procedure",
+   "type": "PROCEDURE",
+   "definer": null,
+   "definition": "CREATE PROCEDURE `nightly_rollup`() AS\nBEGIN\n  INSERT INTO `totals` SELECT `customer_id`, SUM(`amount`) FROM `orders` GROUP BY `customer_id`;\nEND"
+  },
+  {
+   "name": "tax_rate",
+   "kind": "function",
+   "type": "FUNCTION",
+   "definer": "`app`@`%`",
+   "definition": "CREATE DEFINER=`app`@`%` FUNCTION `tax_rate`(a INT) RETURNS INT AS\nBEGIN\n  RETURN 1;\nEND"
   }
  ],
+ "routines_captured": true,
+ "routines_note": "2 routines captured with the owner profile",
  "accounts": [
   {
    "grantee": "'app_user'@'%'",

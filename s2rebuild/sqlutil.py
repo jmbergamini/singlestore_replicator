@@ -25,8 +25,11 @@ RUNNER_KINDS = frozenset({'CREATE DATABASE', 'CREATE TABLE', 'INSERT', 'DELETE',
 OWNER_KINDS = frozenset({'STOP PIPELINE', 'START PIPELINE', 'CREATE PIPELINE', 'ALTER PIPELINE',
                          'DROP PIPELINE', 'DETACH DATABASE', 'ATTACH DATABASE', 'GRANT', 'REVOKE',
                          'KILL CONNECTION', 'KILL QUERY', 'CREATE USER', 'DROP USER', 'DROP DATABASE', 'SET GLOBAL',
-                         'USE'})
+                         'USE', 'CREATE FUNCTION', 'CREATE AGGREGATE', 'CREATE PROCEDURE'})
 ALL_KINDS = READ_KINDS | RUNNER_KINDS | OWNER_KINDS
+# a routine text: CREATE [OR REPLACE] [DEFINER=...] FUNCTION | AGGREGATE | PROCEDURE `db`.`name`( ...; the body of a function or
+# procedure holds semicolons inside BEGIN ... END, the one place the kit accepts them (classify)
+ROUTINE = re.compile(r'CREATE (?:OR REPLACE )?' + _DEFINER_CLAUSE + r'(FUNCTION|AGGREGATE|PROCEDURE) ' + _QUAL + r'(?:[ (]|$)', re.I)
 
 # The one runner write that may name the source: the O3 write probe (architecture 10.7).
 PROBE = re.compile(r"DELETE FROM " + _QUAL + r" WHERE " + _BT + r" = (?:'[^']*'|-?[0-9]+)$")
@@ -149,6 +152,9 @@ def classify(sql):
     if not text:
         raise GuardError('Refusing an empty statement')
     bare = strip_quoted(text)
+    routine = ROUTINE.match(text)
+    if routine is not None:
+        return _classify_routine(routine, bare, text)
     if ';' in bare:
         raise GuardError('Refusing compound text; the kit issues one statement per call')
     first = text.split(' ', 1)[0].upper()
@@ -248,6 +254,21 @@ def classify(sql):
     if _match(r'DROP USER ', text):
         return Statement('DROP USER', (), '', text)
     raise GuardError('Refusing statement of an unsupported kind: ' + first)
+
+
+def _classify_routine(m, bare, text):
+    """CREATE FUNCTION, CREATE AGGREGATE or CREATE PROCEDURE naming `db`.`name`: the one kind whose text may hold semicolons.
+
+    A function or procedure body is a BEGIN ... END block whose statements end with semicolons,
+    so the compound rule is: semicolons are accepted only when the text holds BEGIN and ends
+    with END (the outer block); any other semicolon is compound text and refused. An aggregate
+    and a table-valued function carry no block and no semicolon.
+    """
+    if ';' in bare:
+        words = bare.upper().split()
+        if 'BEGIN' not in words or words[-1] != 'END':
+            raise GuardError('Refusing compound text; a routine body holds semicolons only inside its BEGIN ... END block')
+    return Statement('CREATE ' + m.group(1).upper(), (m.group(2),), m.group(3), text)
 
 
 class Guard:

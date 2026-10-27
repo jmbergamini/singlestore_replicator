@@ -16,7 +16,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font
 from openpyxl.utils import get_column_letter
 
-from . import estimate, steps, transform, verify
+from . import estimate, routines, steps, transform, verify
 from .common import KitError, format_duration, iso
 
 SHEET_NAME_LIMIT = 31
@@ -174,8 +174,8 @@ def summary_rows(inventory, plans, est, fit, config, db, run_id, baseline, steps
                  ('Tables with unique-key lock risk', ', '.join(p.name for p in plans if p.unique_key_lock_risk) or 'none'),
                  ('Tables hashed over all columns (no non-null key)', ', '.join(p.name for p in plans if p.key_kind == 'row') or 'none'),
                  ('Views with a DEFINER', ', '.join(v['name'] for v in inventory.get('views') or [] if v.get('definer')) or 'none'),
-                 ('Routines not migrated (objects.routines.ignore)',
-                  ', '.join('%s %s' % (str(r['type']).lower(), r['name']) for r in inventory.get('routines') or []) or 'none')])
+                 ('Routines (captured with the owner profile; created at O5 and O7)', routines.summary(config, db, inventory)),
+                 ('Routines ignored (objects.routines.ignore)', ', '.join(routines.split(config, db, inventory.get('routines') or [])[1]) or 'none')])
     if pipelines.get('captured'):
         items = pipelines['items']
         rows.extend([('Pipelines the application recreates', ', '.join(i['name'] for i in items if i['app_managed']) or 'none'),

@@ -18,7 +18,7 @@ import sqlite3
 from pathlib import Path
 
 from .common import KitError, auto_table_limit, format_duration, iso, parse_utc, utc_now
-from .inventory import unmigrated
+from . import routines
 from .journal import read_only_uri
 
 DEFAULT_SCAN_S_PER_ROW = 7.62e-8
@@ -540,8 +540,8 @@ def plan_sheet(config, db, run_id, inventory, est, fit, rehearsal=None, env=None
     accounts = (inventory or {}).get('accounts') or []
     lines.append('Accounts   write-capable: %s%s' % (', '.join(a['user'] for a in accounts) or 'none found',
                                                      ' (Path B would revoke these on every database)' if config.freeze.mode == 'lockout' else ''))
-    listed, refusals = unmigrated(config, db, (inventory or {}).get('routines') or [], pipelines.get('items') or [])
-    lines.append('Routines   %s' % ('; '.join(['%s not migrated' % label for label in listed] + ['REFUSED: ' + r for r in refusals]) or 'none'))
+    refusals = routines.pipeline_target_refusals(config, db, inventory or {})
+    lines.append('Routines   %s' % '; '.join([routines.summary(config, db, inventory or {})] + ['REFUSED: ' + r for r in refusals]))
     lines.append('Rehearsal  %s' % (rehearsal or 'none recorded'))
     if config.closeout.retain_days < 90:
         lines.append('Retention  closeout.retain_days is %d, under the 90 day default: the retained copy %s may be deleted by the customer '

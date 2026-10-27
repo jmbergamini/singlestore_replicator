@@ -27,7 +27,7 @@ import json
 import re
 
 from . import copy as copy_module
-from . import estimate, inventory, ownersql, report_md, report_xlsx, steps, verify
+from . import estimate, inventory, ownersql, report_md, report_xlsx, routines, steps, verify
 from .common import EXIT_GATE, EXIT_INCOMPLETE, EXIT_MISMATCH, EXIT_REFUSED, KitError
 from .sqlutil import ident, qualified, read_guard, runner_guard, strip_literals, strip_quoted
 
@@ -389,11 +389,12 @@ def reopen_copy_step(journal, round_number, log):
 
 
 def handle_o7(step, ctx):
-    """O7 handler: views (place_views), the stale check with re-copy of mismatching tables until zero mismatches, then the counters.
+    """O7 handler: views (place_views), then the procedures (routines.place), the stale check with re-copy of mismatching tables until
+    zero mismatches, then the counters.
 
-    A view whose definition names the source database refuses the step before any statement.
-    Without the owner profile the step ends pending while a view is missing, after the stale
-    check and the counters ran.
+    A view or a procedure whose definition names the source database refuses the step before any
+    statement. Without the owner profile the step ends pending while a view is missing, after the
+    stale check and the counters ran; the procedures wait for the views.
     """
     try:
         data, plans, directory = copy_module.load_plans(ctx)
@@ -407,11 +408,15 @@ def handle_o7(step, ctx):
     if named:
         return steps.Outcome(steps.REFUSED, 'view(s) %s name the source database %s in their definition; no view statement was issued. Edit each '
                              'definition in the capture so it names no database, then rerun O7' % (', '.join(named), ctx.db.source), EXIT_REFUSED)
+    refusal = routines.refuse_source_names(data, ctx.config, ctx.db, routines.O7_KINDS)
+    if refusal:
+        return steps.Outcome(steps.REFUSED, refusal, EXIT_REFUSED)
     guard = runner_guard(ctx.db.replacement, 'runner O7')
     session = ctx.runner_session(guard)
     try:
         if ctx.dry_run:
             place_views(ctx, views, session)
+            routines.place(ctx, data, routines.O7_KINDS, 'O7')
             for t in data['tables']:
                 if (t.get('auto_increment') or {}).get('column'):
                     session.query(max_count_sql(ctx.db.replacement, t['name'], t['auto_increment']['column']))
@@ -421,6 +426,11 @@ def handle_o7(step, ctx):
             return steps.Outcome(steps.PASSED, 'dry run: view, counter and stale check statements printed')
         ctx.journal.check_plan(plans, statements.source_db, statements.target_db)
         missing = place_views(ctx, views, session)
+        if not missing:
+            # the procedures after the views, since a procedure may read a view; the gate records the ROUTINES count for S3
+            outcome = routines.place(ctx, data, routines.O7_KINDS, 'O7')
+            if outcome is not None:
+                return outcome
         baseline = estimate.load_baseline(ctx.config.resolve(ctx.config.estimate.baseline) if ctx.config.estimate.baseline else None)
         recopies = 0
         while True:
