@@ -424,7 +424,7 @@ class SampleDatabaseTests(unittest.TestCase):
         before = list(h.fake.writes)
         code, text = run_cli(['sample-database', SRC, TGT, '--percent', '10'] + base, env=h.env)
         self.assertEqual(code, EXIT_REFUSED)
-        self.assertIn('a database of the configured run', text)
+        self.assertIn('a replacement or retained name of the configured run', text)
         code, text = run_cli(['sample-database', SRC, 'sample_three', '--percent', '0'] + base, env=h.env)
         self.assertEqual(code, EXIT_REFUSED)
         self.assertIn('--percent must be a whole number from 1 to 100', text)
@@ -436,6 +436,16 @@ class SampleDatabaseTests(unittest.TestCase):
         self.assertEqual(code, EXIT_DONE, text)
         self.assertIn('DRY RUN: sample-database would capture %s and build sample_three as a 10 percent sample' % SRC, text)
         self.assertEqual(h.fake.writes, before)
+
+    def test_w12_a_sample_may_take_the_configured_source_name(self):
+        """The lab source is built for its own run: a NAME equal to a configured source is accepted (build refuses it while it exists),
+        a replacement or retained name is refused (live I1 setup, October 27)."""
+        config = config_from()
+        db = config.databases[0]
+        sample.check_names('other_db', db.source, config)
+        for name in (db.replacement, db.retained):
+            with self.assertRaises(KitError):
+                sample.check_names('other_db', name, config)
 
     def test_w12_a_reference_table_in_the_sample_goes_through_staging(self):
         """A reference table is copied whole: from a READ ONLY source through a sharded staging table in the sample (a plain INSERT would fail

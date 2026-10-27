@@ -83,13 +83,17 @@ def source_read_only(session, source):
 
 
 def check_names(source, name, config=None):
-    """Refuse a name that is not an identifier, a sample named like its source, or a sample named like a database of the configured run."""
+    """Refuse a name that is not an identifier, a sample named like its source, or a sample named like a replacement or retained name of the run.
+
+    A sample may take the name of a configured source: that is how a lab source is built for its own run. build
+    refuses a NAME that exists, so a live source is never written.
+    """
     ident(source)
     ident(name)
     if source == name:
         raise KitError('The sample needs a name of its own; SOURCE and NAME are both %s' % name)
-    if config is not None and name in config.run_names():
-        raise KitError('%s is a database of the configured run (a source, replacement or retained name); a sample takes a name outside the run' % name)
+    if config is not None and name in [n for db in config.databases for n in (db.replacement, db.retained)]:
+        raise KitError('%s is a replacement or retained name of the configured run; a sample takes another name' % name)
 
 
 def _stage(session, statements, plan, planned, log):

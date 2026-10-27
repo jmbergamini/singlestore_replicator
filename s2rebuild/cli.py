@@ -149,7 +149,7 @@ def build_parser():
     p['rehearse'].add_argument('--start-pipelines', action='store_true', help='start the recreated pipelines at the rehearsed O11 '
                                                                                '(default: created stopped, never started)')
     p['sample-database'].add_argument('source', metavar='SOURCE', help='the database to sample')
-    p['sample-database'].add_argument('name', metavar='NAME', help='the sample to create; must not be a database of the configured run')
+    p['sample-database'].add_argument('name', metavar='NAME', help='the sample to create; must not be a replacement or retained name of the configured run (a configured source name is allowed while it does not exist)')
     p['sample-database'].add_argument('--percent', metavar='N', type=int, required=True, help='the rows to take: CRC32 of the key MOD 100 under N '
                                                                                                 '(1 to 100; 100 copies every table whole)')
     p['sample-database'].add_argument('--tables', metavar='LIST', help='comma-separated tables that get rows (every table is still created)')
