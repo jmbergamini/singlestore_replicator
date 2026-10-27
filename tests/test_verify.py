@@ -270,7 +270,7 @@ class StaleCheckAndHandlersTests(unittest.TestCase):
         wb = load_workbook(str(reports / 'final.xlsx'))
         self.assertEqual(wb.sheetnames[0], 'Summary')
         self.assertEqual(wb.sheetnames[1:5], ['t_single', 't_nokey', 't_comp', 't_empty'])
-        self.assertEqual(wb.sheetnames[5:], ['Views', 'Pipelines', 'Pipeline offsets'])
+        self.assertEqual(wb.sheetnames[5:], ['Views', 'Routines', 'Pipelines', 'Pipeline offsets'])
         summary = {str(r[0].value): r[1].value for r in wb['Summary'].iter_rows(min_col=1, max_col=2) if r[0].value}
         self.assertEqual(summary['Rows copied'], 1500)
         self.assertEqual(summary['Tier count'], '4 match')

@@ -24,6 +24,12 @@ def write_run_report(path, inventory, plans, journal, config, db, run_id, calibr
             lines.append('### ' + str(label))
         else:
             lines.append('- %s: %s' % (label, value))
+    # the definer per view and routine, as the Views and Routines tabs of the final workbook show them
+    for title, header, table_rows in (('Views', report_xlsx.VIEW_HEADER, report_xlsx.view_rows(inventory, journal)),
+                                      ('Routines', report_xlsx.ROUTINE_HEADER, report_xlsx.routine_rows(inventory, journal, config, db))):
+        lines.extend(['', '## ' + title, ''])
+        for row in table_rows:
+            lines.append('- ' + '; '.join('%s %s' % (label, value) for label, value in zip(header, row) if value is not None))
     lines.extend(['', '## Timeline', ''])
     for event in journal.events():
         lines.append('- %s %s %s' % (event['ts'], event['kind'], str(event['detail'])[:200]))

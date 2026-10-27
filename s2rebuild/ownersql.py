@@ -962,6 +962,7 @@ def handle_c3(step, ctx):
         for variant, companion in companion_blocks('C3', names):
             print_block(companion, ctx, owner_sql_path(ctx, 'C3', variant=variant))
         return out
+    record_endstate_listing(ctx, 'before')
     try:
         out = handle_admin(step, ctx, block, after=lambda results: retained_write_probe(ctx))
     except KitError as exc:

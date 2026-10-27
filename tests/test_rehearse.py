@@ -212,7 +212,7 @@ class RehearsalRunTests(unittest.TestCase):
                          dict({s: 'passed' for s in ('O2', 'O3', 'O4', 'O5', 'O6', 'O7', 'O8', 'O9', 'O10', 'O11', 'C1', 'C3')}, C2='skipped'))
         self.assertTrue(j.events('rollback')[-1].startswith('R2a:'), 'the rollback leg re-attached the original record by its own syntax')
         self.assertEqual(len(j.events('switch_go')), 1, 'O10 through run_step recorded the go once, after the rollback')
-        self.assertEqual(len(j.events('endstate_listing')), 1)
+        self.assertEqual([d.split(':')[0] for d in j.events('endstate_listing')], ['before', 'after'], 'C3 recorded the listing before and after its gate')
         self.assertTrue((rehearsal_dir(h) / h.run_id / src / 'owner-sql' / 'O10.sql').is_file(), 'the rehearsed steps write under rehearsal/')
         sid = j.attachment('retained')['storage_id']
         writes = attach_writes(h)

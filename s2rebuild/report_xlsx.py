@@ -373,6 +373,119 @@ def _latest(results, tier):
     return None
 
 
+def latest_results(verifications):
+    """{(tier, table): the latest verification row} in journal order: the Summary shows the latest result; the table tab keeps the history."""
+    out = {}
+    for r in verifications:
+        out[(r['tier'], r['table_name'])] = r
+    return out
+
+
+NOT_RECORDED = 'not recorded'
+
+
+def entry_text(att):
+    """One line for a recorded entry: name, STORAGE_ID, ATTACH_TYPE, COMPUTE_ID, how it is attached and its ATTACH_SYNTAX; not recorded where absent."""
+    if not att:
+        return NOT_RECORDED
+    if att.get('is_detached'):
+        state = 'detached'
+    elif att.get('attach_type'):
+        state = 'attached %s' % att['attach_type']
+    else:
+        state = 'attachment ' + NOT_RECORDED
+    return 'name %s, STORAGE_ID %s, ATTACH_TYPE %s, COMPUTE_ID %s (%s); ATTACH_SYNTAX %s' % (
+        att.get('database_name'), att.get('storage_id') or NOT_RECORDED, att.get('record_type') or NOT_RECORDED,
+        att.get('compute_id') or NOT_RECORDED, state, att.get('attach_syntax') or NOT_RECORDED)
+
+
+LISTING_EVENTS = (('switch_listing', 'O10', ('before', 'after')), ('endstate_listing', 'C3', ('before', 'after', 'before repair', 'after repair')))
+
+
+def listing_rows(journal):
+    """The entries of both storages as O10 and C3 recorded them (switch_listing, endstate_listing), the latest of each moment; not recorded where absent."""
+    rows = []
+    for kind, step_id, moments in LISTING_EVENTS:
+        found = {}
+        for detail in journal.events(kind):
+            when, _, text = detail.partition(': ')
+            found[when] = text
+        for when in moments:
+            if when in found or ' ' not in when:  # before and after always print; the repair moments only when C3 ran a repair
+                rows.append(('Entries %s %s' % (when, step_id), found.get(when) or NOT_RECORDED))
+    return rows
+
+
+def workspace_rows(journal):
+    """The Workspace rows of the final Summary: the settings P2 observed and what O1 recorded (the answer, an accepted autoscale)."""
+    from . import workspace
+    facts = workspace.recorded(journal)
+    if facts and facts.get('source') == 'api':
+        fields = facts.get('fields') or {}
+        observed = 'state %s; autoscale %s; auto-suspend %s (Management API at P2)' % (
+            facts.get('state') or 'not reported', workspace.describe(fields.get(workspace.AUTOSCALE_FIELD)),
+            workspace.describe(fields.get(workspace.AUTO_SUSPEND_FIELD)))
+    elif facts:
+        observed = 'not read at P2 (no Management API key); the three questions were printed for O1'
+    else:
+        observed = NOT_RECORDED
+    return [('Workspace', None), ('Observed at P2', observed),
+            ('Answered at O1', '; '.join(journal.events('workspace')) or NOT_RECORDED),
+            ('Autoscale accepted at O1', '; '.join(journal.events('accept_autoscale')) or 'none')]
+
+
+def definer_text(event):
+    """The definer an object got in the replacement, from the view or routine event O7 or O5 recorded; not recorded without one."""
+    if not event:
+        return NOT_RECORDED
+    choice = event.get('definer')
+    if choice == 'kept':  # postcopy.KEPT, OWNER_DEFINER and FOUND; postcopy imports this module
+        return 'original definer kept'
+    if choice == 'owner':
+        return 'the owner account'
+    if choice == 'found':
+        return 'found in the replacement: %s' % (event.get('observed_definer') or 'definer ' + NOT_RECORDED)
+    return str(choice)
+
+
+VIEW_HEADER = ['view', 'original definer', 'created in replacement', 'definer in replacement']
+ROUTINE_HEADER = ['routine', 'kind', 'original definer', 'created in replacement', 'definer in replacement', 'ignored by configuration']
+
+
+def _events_by(journal, kind, key):
+    out = {}
+    for detail in journal.events(kind):
+        data = json.loads(detail)
+        out[data[key]] = data
+    return out
+
+
+def view_rows(inventory, journal):
+    """One row per captured view for the Views tab: the original definer, whether O7 created it and the definer it got."""
+    events = _events_by(journal, 'view', 'view')
+    rows = []
+    for v in inventory.get('views') or []:
+        e = events.get(v['name'])
+        rows.append([v['name'], v.get('definer') or 'none', ('yes (%s)' % e.get('reason', 'definer removed')) if e else 'no', definer_text(e)])
+    return rows or [['none', None, None, None]]
+
+
+def routine_rows(inventory, journal, config, db):
+    """One row per captured routine for the Routines tab: kind, original definer, whether O5 or O7 created it, its definer, ignored or not."""
+    events = _events_by(journal, 'routine', 'routine')
+    rows = []
+    for r in inventory.get('routines') or []:
+        kind = r.get('kind') or routines.kind_of(r.get('type'), r.get('definition'))
+        left_out = routines.ignored(config, db, r['name'])
+        e = events.get(r['name'])
+        rows.append([r['name'], kind, r.get('definer') or 'none', ('yes (%s)' % e.get('reason', NOT_RECORDED)) if e else ('no (ignored)' if left_out else 'no'),
+                     definer_text(e), 'yes' if left_out else 'no'])
+    if not rows:
+        note = 'none' if inventory.get('routines_captured') else 'none captured (the owner profile reads routines)'
+        rows.append([note, None, None, None, None, None])
+    return rows
+
+
 def final_summary_rows(inventory, plans, journal, config, db, run_id, name_map=None, baseline=None, calibration=None):
     """The (label, value) rows of the final workbook's Summary tab; calibration, when given, is the C2 Calibration line."""
     from . import inventory as inventory_module
@@ -393,7 +506,9 @@ def final_summary_rows(inventory, plans, journal, config, db, run_id, name_map=N
     rows.append(('Totals', None))
     size_gib = sum(p.size_gib or 0.0 for p in plans)
     hours = total['wall_seconds'] / 3600.0 if total['wall_seconds'] else 0.0
-    rows.extend([('Tables', len(plans)), ('Rows copied', total['rows']), ('Primary files GiB', round(size_gib, 3)),
+    rows.extend([('Tables', len(plans)),
+                 ('Reference tables (copied through a staging table)', ', '.join(p.name for p in plans if getattr(p, 'reference', False)) or 'none'),
+                 ('Rows copied', total['rows']), ('Primary files GiB', round(size_gib, 3)),
                  ('Copy start', total['start'] or 'not run'), ('Copy end', total['end'] or 'not run'),
                  ('Copy wall time', format_duration(total['wall_seconds'])), ('Copy worker seconds', round(total['worker_seconds'])),
                  ('Rows per hour', round(total['rows'] / hours) if hours else 0), ('GiB per hour', round(size_gib / hours, 1) if hours else 0),
@@ -418,14 +533,9 @@ def final_summary_rows(inventory, plans, journal, config, db, run_id, name_map=N
                                    if config.freeze.mode == 'lockout' else 'none (Path A read-only attachment)')))
     rows.append((None, None))
     rows.append(('Verification', None))
-    verifications = journal.verifications()
-    tier_results = {}
-    for r in verifications:
-        key = (r['tier'], r['table_name'])
-        current = tier_results.get(key)
-        if current is None or verify.RESULT_PRECEDENCE.index(r['result']) < verify.RESULT_PRECEDENCE.index(current) \
-                or r['result'] == verify.MATCH and current == verify.MATCH:
-            tier_results[key] = r['result']
+    # the latest row per tier and table: a match after a mismatch counts as a match; the table tab keeps every row
+    latest_rows = latest_results(journal.verifications())
+    tier_results = {key: r['result'] for key, r in latest_rows.items()}
     for tier in ('count', 'newest', 'fingerprint'):
         latest = {table: result for (t, table), result in tier_results.items() if t == tier}
         if latest:
@@ -434,8 +544,12 @@ def final_summary_rows(inventory, plans, journal, config, db, run_id, name_map=N
                 counts[v] = counts.get(v, 0) + 1
             rows.append(('Tier %s' % tier, ', '.join('%d %s' % (n, k) for k, n in sorted(counts.items()))))
     rows.append(('Tables without a time column', ', '.join(p.name for p in plans if not p.time_column) or 'none'))
-    sampled = sorted({r['table_name'] for r in verifications if r['result'] == 'sampled'})
+    sampled = sorted({table for (tier, table), r in latest_rows.items() if r['result'] == verify.SAMPLED})
     rows.append(('Sampled tables', ', '.join(sampled) or 'none'))
+    rows.append(('Sampled fingerprints (latest, with the predicate)', '; '.join(
+        '%s (%s rows, WHERE %s)' % (table, r.get('sample_rows') if r.get('sample_rows') is not None else 'rows ' + NOT_RECORDED,
+                                     r.get('predicate') or 'predicate ' + NOT_RECORDED)
+        for (tier, table), r in sorted(latest_rows.items()) if tier == 'fingerprint' and r['result'] == verify.SAMPLED) or 'none'))
     skipped = sorted({table for (tier, table), result in tier_results.items() if tier == 'fingerprint' and result == verify.NOT_FINGERPRINTED})
     rows.append(('Not fingerprinted (budget)', ', '.join(skipped) or 'none'))
     verified = [t['verified_at_utc'] for t in journal.tables() if t.get('verified_at_utc')]
@@ -465,20 +579,25 @@ def final_summary_rows(inventory, plans, journal, config, db, run_id, name_map=N
         att = journal.attachment(role)
         rows.append((role, ('%s STORAGE_ID %s %s; record %s COMPUTE_ID %s%s' % (
             att['database_name'], att.get('storage_id'), att.get('attach_type') or '', att.get('record_type') or 'unknown', att.get('compute_id'),
-            ' (not attached)' if att.get('is_detached') else '')) if att else 'not recorded'))
+            ' (not attached)' if att.get('is_detached') else '')) if att else NOT_RECORDED))
+    rows.append((None, None))
+    # the two entries a run leaves (the live record and the retained record, whole), then the listings O10 and C3 recorded
+    rows.append(('End state', None))
+    retained = journal.attachment('retained')
+    rows.extend([('Live entry', entry_text(journal.attachment('live'))), ('Retained entry', entry_text(retained))])
+    rows.extend(listing_rows(journal))
     rows.append((None, None))
     rows.append(('Retention', None))
-    retained = journal.attachment('retained')
     sizes = [float(t.get('size_gib') or 0) for t in journal.tables()]
     rows.extend([('Retained copy', db.retained),
                  ('Retained record', ('STORAGE_ID %s, ATTACH_TYPE %s, COMPUTE_ID %s' % (retained.get('storage_id'), retained.get('record_type') or 'unknown',
-                                                                                        retained.get('compute_id'))) if retained else 'not recorded'),
+                                                                                        retained.get('compute_id'))) if retained else NOT_RECORDED),
                  ('Retained size GiB', round(sum(sizes), 3)),
-                 ('Switched', meta.get('switched_utc') or 'not recorded'),
-                 ('Retain until', meta.get('retain_until_utc') or 'not recorded (C2 records it)'),
+                 ('Switched', meta.get('switched_utc') or NOT_RECORDED),
+                 ('Retain until', meta.get('retain_until_utc') or NOT_RECORDED + ' (C2 records it)'),
                  ('Delete later with', 's2rebuild cleanup --delete %s --run %s (the customer, after the date; the kit never deletes it)' % (db.retained, run_id))])
-    for listing in journal.events('endstate_listing')[-1:] or journal.events('switch_listing')[-1:]:
-        rows.append(('Entries', listing))
+    rows.append((None, None))
+    rows.extend(workspace_rows(journal))
     rows.append((None, None))
     rows.append(('Open items', None))
     pending = [s for s, r in board.items() if r.get('status') in ('pending', 'failed', 'running')]
@@ -540,7 +659,15 @@ def final_table_rows(table, plan, journal, per_table):
                  ('Rows in sample', t3.get('sample_rows') if t3 else None),
                  ('SQL source side', t3['sql_source'] if t3 else None), ('SQL target side', t3['sql_target'] if t3 else None),
                  ('Verified at', jt.get('verified_at_utc')),
-                 (None, None), ('Attributes', None),
+                 (None, None), ('Verification history', None)])
+    # every row in journal order (the Summary shows the latest per tier); a sampled row carries its predicate
+    for r in results:
+        rows.append(('%s %s' % (r['tier'], r['checked_utc']), '%s (epoch %s): source %s, target %s%s' % (
+            r['result'], r.get('epoch') if r.get('epoch') is not None else NOT_RECORDED, r['source_value'], r['target_value'],
+            ('; WHERE ' + r['predicate']) if r.get('predicate') else '')))
+    if not results:
+        rows.append(('', 'none'))
+    rows.extend([(None, None), ('Attributes', None),
                  ('Primary key', ', '.join(primary) or 'none'), ('Unique keys', '; '.join(unique) or 'none'), ('Shard key', ', '.join(shard) or 'none'),
                  ('Sort key', ', '.join(sort) or 'none'), ('Other indexes', '; '.join(other) or 'none'),
                  ('AUTO_INCREMENT column', (table.get('auto_increment') or {}).get('column') or 'none'),
@@ -571,7 +698,7 @@ def write_final_workbook(path, inventory, plans, journal, config, db, run_id, ba
     wb = Workbook()
     summary = wb.active
     summary.title = 'Summary'
-    used = {'Summary', 'Pipelines', 'Pipeline offsets', 'System', 'Views', 'History'}
+    used = {'Summary', 'Pipelines', 'Pipeline offsets', 'System', 'Views', 'Routines', 'History'}
     name_map = {p.name: sheet_name(p.name, used) for p in plans}
     _rows(summary, final_summary_rows(inventory, plans, journal, config, db, run_id, name_map, baseline, calibration))
     summary.cell(row=1, column=1).font = _TITLE
@@ -589,17 +716,13 @@ def write_final_workbook(path, inventory, plans, journal, config, db, run_id, ba
         for i, line in enumerate(str(p.definition or '').splitlines(), start=nxt + 1):
             ws.cell(row=i, column=1, value=line)
         _widths(ws, [34, 60])
+    # the definer choice O7 recorded per view (postcopy.create_views) and O5 or O7 per routine (routines.place)
     ws = wb.create_sheet('Views')
-    view_events = {}
-    for e in journal.events():
-        if e['kind'] == 'view':
-            data = json.loads(e['detail'])
-            view_events[data['view']] = data
-    # the definer choice O7 recorded per view (postcopy.create_views); an older journal recorded only the removal
-    _table(ws, ['view', 'original definer', 'created in replacement'],
-           [[v['name'], v.get('definer') or 'none', ('yes (%s)' % view_events[v['name']].get('reason', 'definer removed'))
-             if v['name'] in view_events else 'no'] for v in inventory.get('views') or []] or [['none', None, None]])
-    _widths(ws, [40, 30, 60])
+    _table(ws, VIEW_HEADER, view_rows(inventory, journal))
+    _widths(ws, [40, 30, 60, 40])
+    ws = wb.create_sheet('Routines')
+    _table(ws, ROUTINE_HEADER, routine_rows(inventory, journal, config, db))
+    _widths(ws, [40, 12, 30, 60, 40, 12])
     pipelines = inventory.get('pipelines') or {}
     journal_pipes = {p['name']: p for p in journal.pipelines()}
     ws = wb.create_sheet('Pipelines')

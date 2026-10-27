@@ -964,7 +964,7 @@ class CloseoutHandlerTests(unittest.TestCase):
         self.assertEqual(out.status, steps.PASSED, h.text())
         self.assertEqual([w for w in h.fake.writes[len(before):] if not w.startswith('DELETE FROM `%s`' % RET)], [], 'C3 issues the write probe only')
         self.assertEqual(len(h.journal.events('endstate_probe')), 1)
-        self.assertEqual(len(h.journal.events('endstate_listing')), 1)
+        self.assertEqual([d.split(':')[0] for d in h.journal.events('endstate_listing')], ['before', 'after'], 'the listing before and after the gate')
         self.assertEqual(len(h.fake.portal_entries()), 2)
         out = h.step('C4', redo=True)
         self.assertEqual(out.status, steps.PASSED, h.text())
