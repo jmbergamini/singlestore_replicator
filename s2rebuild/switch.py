@@ -1,4 +1,4 @@
-"""s2rebuild switch: the O10 state machine over the attachment views, forward S0 to S3 and rollback R1 to R3.
+"""s2rebuild switch: the O10 state machine over the attachment views, forward S0 to S4 and rollback R1 to R2c.
 
 Author: John Bergamini
 
@@ -37,9 +37,24 @@ ATTACH_SYNTAX); the key is name, STORAGE_ID, ATTACH_TYPE and COMPUTE_ID (records
 ROW_NUMBER is never read. The journal stores the whole record per role; every DETACH, ATTACH and
 DROP of the machine and of the rollback runs behind a comparison with the recorded record and
 refuses with both records printed when they differ. S1 records the original's detached record,
-whose own ATTACH_SYNTAX (the AT MILESTONE form) R2 runs to re-attach it. Statements issued
-through the O10 owner guard: DETACH DATABASE (with the KILL escalation), ATTACH DATABASE and, in
-the optional rollback step R3, DROP DATABASE on the retained copy only.
+whose own ATTACH_SYNTAX (the AT MILESTONE form) S2b and R2a run to re-attach it.
+Two entries (release 1.0, proven on throwaway databases on October 27, 2026): S2b, while the
+live name is free, attaches the original record by its own syntax read write under the live
+name, proves it unchanged (the three smallest non-empty tables equal the journal's source
+counts, no foreign non-idle session) and drops it, so the original storage keeps only the
+retained record; S4, after S3's checks, drops the replacement record, whose branch (the live
+name) is independent of it. The gate after S4: the records with IS_DROPPED = 0 on both storages
+are exactly the live record and the retained record; the listing before and after goes into
+the journal. A failed proof at S2b stops with the original attached read write under the live
+name, the rollback state. Rollback before S2b ran: R1, then R2a (the original's own syntax).
+After S2b the original record is gone, so the rollback goes through the retained copy: R2b,
+ATTACH <retained> AS <source> STORAGEID <original>, a read-write pitr branch under the live
+name; when the server refuses a branch of a READ ONLY attachment, R2c detaches the retained
+name and re-attaches its record by syntax under the live name (a resume record; the retained
+name then leaves the Portal, and the report says where the data is). No rollback step drops
+the retained copy. Statements issued through the O10 owner guard: DETACH DATABASE (with the
+KILL escalation), ATTACH DATABASE, DROP DATABASE on the source record at S2b and on the
+replacement at S4.
 """
 import re
 import sys
@@ -63,8 +78,13 @@ SWITCH_ALLOWANCE_SECONDS = 10 * 60
 
 NOT_STARTED, DETACHED, RETAINED, SWITCHED, LIVE_DETACHED, UNKNOWN = (
     'not started', 'source detached', 'retained attached', 'switched', 'live branch detached', 'unknown')
-FORWARD = ('S1', 'S2', 'S3')
-ROLLBACK = ('R1', 'R2', 'R3')
+# the positions of the two-entry switch: S2b attached the original read write under the live name (also the state after a
+# rollback by R2a), S2b dropped it, S4 dropped the replacement, and a rollback through the retained copy (R2b or R2c)
+ORIGINAL_ATTACHED, SOURCE_DROPPED, COMPLETE, ROLLED_BACK = (
+    'original attached read write', 'original record dropped', 'switch complete', 'rolled back through the retained copy')
+FORWARD = ('S1', 'S2', 'S2b', 'S3', 'S4')
+ROLLBACK = ('R1', 'R2a', 'R2b', 'R2c')
+READ_ONLY_REFUSAL = 2720
 
 
 def _rows(session, sql, params):
@@ -85,9 +105,19 @@ ATTACHED_RECORD_SQL = ('SELECT %s FROM information_schema.MV_CLOUD_BRANCHES WHER
                        'AND IS_DETACHED = 0' % RECORD_COLUMNS)
 # the attached record of a name (parameter: name): S2 and S3 after, R1 before
 NAME_RECORD_SQL = 'SELECT %s FROM information_schema.MV_CLOUD_BRANCHES WHERE DATABASE_NAME = %%s AND IS_DROPPED = 0 AND IS_DETACHED = 0' % RECORD_COLUMNS
-# the detached record of a name on a storage (parameters: name, STORAGE_ID): S1 after, R2 before
+# the detached record of a name on a storage (parameters: name, STORAGE_ID): S1 after, S2b and R2a before
 DETACHED_RECORD_SQL = ('SELECT %s FROM information_schema.MV_CLOUD_BRANCHES WHERE DATABASE_NAME = %%s AND STORAGE_ID = %%s AND IS_DROPPED = 0 '
                        'AND IS_DETACHED = 1' % RECORD_COLUMNS)
+# every record of a name, dropped ones included (parameter: the name): the position reads whether the original record is dropped
+ALL_RECORDS_SQL = 'SELECT %s FROM information_schema.MV_CLOUD_BRANCHES WHERE DATABASE_NAME = %%s' % RECORD_COLUMNS
+# the Portal entries of a storage, the records with IS_DROPPED = 0 (parameter: STORAGE_ID): the S2b after-check and the gate
+STORAGE_ENTRIES_SQL = 'SELECT %s FROM information_schema.MV_CLOUD_BRANCHES WHERE STORAGE_ID = %%s AND IS_DROPPED = 0' % RECORD_COLUMNS
+STORAGE_ENTRY_COUNT_SQL = 'SELECT COUNT(*) AS n FROM information_schema.MV_CLOUD_BRANCHES WHERE STORAGE_ID = %s AND IS_DROPPED = 0'
+# COUNT of attached databases under a name (parameter: the name): the skip_if of the printed R2c statements
+NAME_ATTACHED_COUNT_SQL = 'SELECT COUNT(*) AS n FROM information_schema.MV_CLOUD_ATTACHED_DATABASES WHERE DATABASE_NAME = %s'
+# the state of one record (parameters: name, STORAGE_ID, COMPUTE_ID): IS_DROPPED = 1 after a DROP
+RECORD_STATE_SQL = ('SELECT %s FROM information_schema.MV_CLOUD_BRANCHES WHERE DATABASE_NAME = %%s AND STORAGE_ID = %%s AND LATEST_COMPUTE_ID = %%s'
+                    % RECORD_COLUMNS)
 KEY_FIELDS = ('DATABASE_NAME', 'STORAGE_ID', 'ATTACH_TYPE', 'COMPUTE_ID')
 JOURNAL_KEY_FIELDS = ('database_name', 'storage_id', 'record_type', 'compute_id')
 SYNTAX_COMPUTE = re.compile(r' COMPUTEID ([A-Za-z0-9_:-]+)\s*;?\s*$')
@@ -192,6 +222,52 @@ def journal_record(journal, role, record):
     journal.record_attachment_row(role, record)
 
 
+def all_records(session, name):
+    """Every record of a name as identify builds them, dropped ones included, without the attachment join. Issues one read."""
+    return [_record(row) for row in _rows(session, ALL_RECORDS_SQL, (name,))]
+
+
+def original_state(source_records, names):
+    """'attached', 'detached', 'dropped' or None: the state of the original record (the recorded source STORAGE_ID and COMPUTE_ID) among records."""
+    sid, cid = str(names.get('source_sid')), names.get('source_cid')
+    for r in source_records:
+        if str(r['STORAGE_ID']) != sid or (_known(cid) and str(r['COMPUTE_ID']) != str(cid)):
+            continue
+        if r['IS_DROPPED']:
+            return 'dropped'
+        return 'detached' if r['IS_DETACHED'] else 'attached'
+    return None
+
+
+def entry_key(record):
+    """(name, STORAGE_ID, ATTACH_TYPE, COMPUTE_ID, detached) of a Portal entry, for the two-entry gate and the journal listing."""
+    key = record_key(record)
+    detached = int(record.get('is_detached') or 0) if 'record_type' in record else int(record.get('IS_DETACHED') or 0)
+    return None if key is None else key + (detached,)
+
+
+def listing(session, names):
+    """The Portal entries (IS_DROPPED = 0) of the original storage and the replacement storage, as records. Issues one read per storage."""
+    out = []
+    for sid in dict.fromkeys(str(names.get(k)) for k in ('source_sid', 'replacement_sid') if _known(names.get(k))):
+        out.extend(_record(row) for row in _rows(session, STORAGE_ENTRIES_SQL, (sid,)))
+    return out
+
+
+def listing_text(entries):
+    """The entries as one line each: name, STORAGE_ID, ATTACH_TYPE, COMPUTE_ID and attached or detached."""
+    return '; '.join(record_text(r) for r in entries) or 'no entry'
+
+
+def read_only_refusal(exc):
+    """True when the server refused a statement because the attachment is read only: error 2720, or a message that says so."""
+    args = getattr(exc, 'args', ())
+    if args and args[0] == READ_ONLY_REFUSAL:
+        return True
+    text = str(exc).lower()
+    return 'read only' in text or 'read-only' in text or 'readonly' in text
+
+
 def live_is_branch_of_replacement(session, names, live_att, replacement_att):
     """True when the live name sits on the replacement's STORAGE_ID as its own branch of it; issues the MV_CLOUD_BRANCHES COUNT.
 
@@ -211,28 +287,49 @@ def live_is_branch_of_replacement(session, names, live_att, replacement_att):
 class Position:
     """The live attachment facts the machine reasons about."""
 
-    def __init__(self, source_att, retained_att, replacement_att, source_branch, live_branch=None, live_is_branch=False):
+    def __init__(self, source_att, retained_att, replacement_att, source_branch, live_branch=None, live_is_branch=False, source_records=None):
         self.source_att = source_att
         self.retained_att = retained_att
         self.replacement_att = replacement_att
         self.source_branch = source_branch
         self.live_branch = live_branch
         self.live_is_branch = live_is_branch
+        self.source_records = list(source_records or [])
+
+    def original(self, names):
+        """The state of the original record among the records of the source name: 'attached', 'detached', 'dropped' or None (not read)."""
+        return original_state(self.source_records, names)
 
     def state(self, names):
-        """NOT_STARTED, DETACHED, RETAINED, SWITCHED, LIVE_DETACHED or UNKNOWN from the facts and the recorded storage ids.
+        """The position from the facts and the recorded ids: NOT_STARTED, DETACHED, RETAINED, ORIGINAL_ATTACHED, SOURCE_DROPPED, SWITCHED,
+        COMPLETE, LIVE_DETACHED, ROLLED_BACK or UNKNOWN.
 
         SWITCHED needs the live name attached READWRITE on a STORAGE_ID that is none of the
         source, replacement or retained ids (and equals the recorded live id once one exists),
         with the retained copy attached READONLY. The replacement's id counts when the live name
-        is its own branch of the replacement (live_is_branch_of_replacement), as on Helios 10.8.0.
+        is its own branch of the replacement (live_is_branch_of_replacement), as on Helios 10.8.0;
+        COMPLETE is SWITCHED with the replacement name gone (S4). The live name READWRITE on the
+        original storage beside the retained copy is ORIGINAL_ATTACHED while it holds the original
+        record (S2b attached it, or R2a put it back) and ROLLED_BACK when it holds a branch of the
+        retained copy (R2b or R2c). SOURCE_DROPPED is the retained copy alone with the original
+        record dropped (S2b done, S3 ahead).
         """
         src_sid = str(names['source_sid'])
         retained_ok = bool(self.retained_att) and str(self.retained_att.get('ATTACH_TYPE')).upper() == 'READONLY'
         if self.source_att:
             sid = str(self.source_att.get('STORAGE_ID'))
             if sid == src_sid:
-                return NOT_STARTED if not self.retained_att else UNKNOWN
+                if not self.retained_att:
+                    return NOT_STARTED
+                if not retained_ok or str(self.source_att.get('ATTACH_TYPE')).upper() != 'READWRITE':
+                    return UNKNOWN
+                cid = str(self.source_att.get('COMPUTE_ID'))
+                attached = next((r for r in self.source_records if str(r['STORAGE_ID']) == sid and str(r['COMPUTE_ID']) == cid and not r['IS_DROPPED']), None)
+                if self.original(names) == 'attached' and (not _known(names.get('source_cid')) or cid == str(names['source_cid'])):
+                    return ORIGINAL_ATTACHED
+                if attached is not None and attached.get('PREV_DATABASE_NAME') == names['retained']:
+                    return ROLLED_BACK
+                return UNKNOWN
             if not retained_ok or str(self.source_att.get('ATTACH_TYPE')).upper() != 'READWRITE':
                 return UNKNOWN
             taken = {src_sid} | (set() if self.live_is_branch else {str(names['replacement_sid'])}) | (
@@ -241,12 +338,14 @@ class Position:
                 return UNKNOWN
             if _known(names.get('live_sid')) and sid != str(names['live_sid']):
                 return UNKNOWN
-            return SWITCHED
+            return SWITCHED if self.replacement_att else COMPLETE
         if self.retained_att:
             if not retained_ok:
                 return UNKNOWN
             if self.live_branch and str(self.live_branch.get('IS_DETACHED')) == '1':
                 return LIVE_DETACHED
+            if self.original(names) == 'dropped':
+                return SOURCE_DROPPED
             return RETAINED
         if self.source_branch and str(self.source_branch.get('IS_DETACHED')) == '1':
             return DETACHED
@@ -266,7 +365,7 @@ def read_position(session, names):
     branch = (source_att is not None and _known(names.get('replacement_sid')) and str(source_att.get('STORAGE_ID')) == str(names['replacement_sid'])
               and live_is_branch_of_replacement(session, names, source_att, replacement_att))
     return Position(source_att, _first(ATTACHED_SQL, (names['retained'],)), replacement_att, _first(BRANCH_SQL, (names['source_sid'],)), live,
-                    live_is_branch=branch)
+                    live_is_branch=branch, source_records=all_records(session, names['source']))
 
 
 def _sessions_params(names):
@@ -340,6 +439,7 @@ def forward_block(names, counts=None, s0_problems=None, withheld=None):
     block.check('S2 after: the retained name holds a resume record of the original', NAME_RECORD_SQL, (names['retained'],),
                 ownersql.Expect('columns_equal', value={'ATTACH_TYPE': 'resume', 'PREV_DATABASE_NAME': names['source']}), record='retained')
     block.note('S2 after: one small table count in the retained copy equals the journal source count (the kit checks this).')
+    s2b_block(block, names)
     block.check('S3 before: replacement attached READWRITE with the recorded STORAGE_ID', ATTACHED_SQL, (names['replacement'],),
                 ownersql.Expect('columns_equal', value={'STORAGE_ID': names['replacement_sid'], 'ATTACH_TYPE': 'READWRITE'}))
     block.check('S3 before: no attached database named source', ATTACHED_SQL, (names['source'],), ownersql.Expect('no_rows'))
@@ -362,8 +462,79 @@ def forward_block(names, counts=None, s0_problems=None, withheld=None):
     if not counts:
         block.note('S3 after: no capture is available, so the table, view and pipeline counts are not checked here; the kit refuses O10 without one.')
     block.note('S3 after: the three smallest non-empty tables match the journal counts (the kit checks these and records the live record).')
-    block.note('The replacement stays attached under its own name until C3.')
+    s4_block(block, names)
+    gate_block(block, names, 'gate')
     return block
+
+
+def s2b_block(block, names):
+    """S2b of the printed block: the original record attached by its own syntax under the live name, the zero-change proof, its DROP, the after-checks.
+
+    The statement is original_syntax (a milestone placeholder before S1 ran, with a note). The
+    proof is one COUNT(*) check per smallest non-empty table against the journal's source count
+    (names['source_counts']) and the S1 session query. A failed proof stops the block with the
+    original attached read write under the live name, the rollback state, and the DROP is never
+    reached.
+    """
+    block.check('S2b before: no attached database named source', ATTACHED_SQL, (names['source'],), ownersql.Expect('no_rows'))
+    block.check('S2b before: the original record is detached with its ATTACH_SYNTAX', DETACHED_RECORD_SQL, (names['source'], names['source_sid']),
+                ownersql.Expect('columns_equal', value=ownersql.record_expect(names, 'source')))
+    block.statement(original_syntax(names), 'S2b: attach the original record read write under the live name by its own ATTACH_SYNTAX')
+    if ownersql.placeholders(original_syntax(names)):
+        block.note('S2b: the AT MILESTONE value is the ATTACH_SYNTAX of the detached original record, recorded at S1. Generate this block again '
+                   'after S1 (s2rebuild owner-sql O10) to fill it in, or copy the ATTACH_SYNTAX from the row of the S2b before check.')
+    block.check('S2b after: the original record is attached READWRITE under the live name', ATTACHED_SQL, (names['source'],),
+                ownersql.Expect('columns_equal', value={'STORAGE_ID': names['source_sid'], 'ATTACH_TYPE': 'READWRITE', 'COMPUTE_ID': names['source_cid']}))
+    block.note('S2b zero-change proof: every check below must pass before the DROP. A failed check leaves the original attached read write '
+               'under the live name, which is the rollback state: reconcile, or record the go again; never run the DROP.')
+    for table, count in (names.get('source_counts') or [])[:3]:
+        block.check('S2b proof: %s holds the source row count' % table, count_sql(names['source'], table), (), ownersql.Expect('column_equals', 'n', count))
+    if not names.get('source_counts'):
+        block.note('S2b proof: the journal holds no source count yet (O6 records them); the kit refuses S2b without them.')
+    block.check('S2b proof: no non-idle session on the live name other than ours', SESSIONS_SQL, _sessions_params(names),
+                ownersql.Expect('column_equals', 'n', 0))
+    block.statement('DROP DATABASE %s' % ident(names['source']), 'S2b: drop the original record (its data stays in the retained copy)')
+    block.check('S2b after: the original record is dropped', RECORD_STATE_SQL, (names['source'], names['source_sid'], names['source_cid']),
+                ownersql.Expect('column_equals', 'IS_DROPPED', 1))
+    block.check('S2b after: no attached database named source', ATTACHED_SQL, (names['source'],), ownersql.Expect('no_rows'))
+    block.check('S2b after: the original storage holds one entry, the retained record', STORAGE_ENTRY_COUNT_SQL, (names['source_sid'],),
+                ownersql.Expect('column_equals', 'n', 1))
+    block.check('S2b after: the retained name still holds its resume record', NAME_RECORD_SQL, (names['retained'],),
+                ownersql.Expect('columns_equal', value={'ATTACH_TYPE': 'resume', 'PREV_DATABASE_NAME': names['source']}))
+    block.note('S2b after: one small table count in the retained copy equals the journal source count (the kit checks this).')
+
+
+def s4_block(block, names):
+    """S4 of the printed block: the replacement record dropped by its record after S3's checks, the live record unchanged."""
+    block.check('S4 before: the replacement name holds the recorded replacement record', ATTACHED_RECORD_SQL, (names['replacement'], names['replacement_sid']),
+                ownersql.Expect('columns_equal', value=ownersql.record_expect(names, 'replacement')))
+    block.check('S4 before: the live name is its own branch record of the replacement', BRANCH_OF_SQL,
+                (names['source'], names['replacement_sid'], names['replacement']), ownersql.Expect('column_at_least', 'n', 1))
+    block.statement('DROP DATABASE %s' % ident(names['replacement']), 'S4: drop the replacement record (the live branch is independent of it)')
+    block.check('S4 after: the replacement record is dropped', RECORD_STATE_SQL, (names['replacement'], names['replacement_sid'], names['replacement_cid']),
+                ownersql.Expect('column_equals', 'IS_DROPPED', 1))
+    block.check('S4 after: no attached database named replacement', ATTACHED_SQL, (names['replacement'],), ownersql.Expect('no_rows'))
+    block.check('S4 after: the live name still holds its pitr record of the replacement', NAME_RECORD_SQL, (names['source'],),
+                ownersql.Expect('columns_equal', value={'ATTACH_TYPE': 'pitr', 'PREV_DATABASE_NAME': names['replacement']}))
+    block.note('S4 after: one small table count on the live name equals the journal source count (the kit checks this).')
+
+
+def gate_block(block, names, label, recorded=False):
+    """The two-entry gate as checks: one entry on the original storage (the retained record), one on the replacement storage (the live record).
+
+    recorded=True (C3, after the switch recorded both records) compares the records with the
+    journal; the O10 block, generated before the switch, checks their type and parent.
+    """
+    retained = {'ATTACH_TYPE': 'resume', 'PREV_DATABASE_NAME': names['source'], 'STORAGE_ID': names['source_sid']}
+    live = {'ATTACH_TYPE': 'pitr', 'PREV_DATABASE_NAME': names['replacement'], 'STORAGE_ID': names['replacement_sid']}
+    if recorded:
+        retained['LATEST_COMPUTE_ID'], live['LATEST_COMPUTE_ID'] = names['retained_cid'], names['live_cid']
+    block.check('%s: the original storage holds one entry' % label, STORAGE_ENTRY_COUNT_SQL, (names['source_sid'],), ownersql.Expect('column_equals', 'n', 1))
+    block.check('%s: that entry is the retained record' % label, NAME_RECORD_SQL, (names['retained'],), ownersql.Expect('columns_equal', value=retained))
+    block.check('%s: the replacement storage holds one entry' % label, STORAGE_ENTRY_COUNT_SQL, (names['replacement_sid'],),
+                ownersql.Expect('column_equals', 'n', 1))
+    block.check('%s: that entry is the live record' % label, NAME_RECORD_SQL, (names['source'],), ownersql.Expect('columns_equal', value=live))
+    block.note('%s: the workspace now holds two entries, the live database and the retained copy; the kit records this listing in the journal.' % label)
 
 
 def count_sql(db_name, table):
@@ -376,12 +547,17 @@ def unproven_tables(table_counts):
     return [table for table, count in table_counts if count is None]
 
 
-def rollback_block(names, released=False, app_writes_seen=None, withheld=None):
-    """The rollback block R1 to R3, valid only before O11 released writers; a STOP item when it is no longer valid.
+def rollback_block(names, released=False, app_writes_seen=None, withheld=None, after_s2b=False):
+    """The rollback block, valid only before O11 released writers; a STOP item when it is no longer valid.
 
-    R1 detaches the live name only while it holds the recorded live record; R2 runs the detached
-    original record's own ATTACH_SYNTAX (original_syntax); R3 drops the retained name only while
-    it holds the recorded retained record.
+    R1 detaches the live name only while it holds the recorded live record. Before S2b ran
+    (after_s2b=False) R2a runs the detached original record's own ATTACH_SYNTAX
+    (original_syntax). After S2b (after_s2b=True) the original record is dropped, so R2b
+    attaches a read-write branch of the retained copy under the live name, and R2c, only when
+    the server refused R2b on the READ ONLY attachment, detaches the retained name and
+    re-attaches its record by syntax under the live name (a milestone placeholder with a note,
+    since the syntax exists only after the DETACH); its statements are skipped while the live
+    name is attached. No step drops the retained copy.
 
     Before R1 the zero-change proof: one COUNT(*) check per planned table of the live name
     against its journal target_count (names['table_counts'] from names_for), no pipeline Running
@@ -392,7 +568,8 @@ def rollback_block(names, released=False, app_writes_seen=None, withheld=None):
     target_count, or no planned table at all, is a STOP, since the live branch cannot be proven
     unchanged.
     """
-    block = ownersql.Block('O10', 'Rollback R1 to R3 (before O11 only)')
+    block = ownersql.Block('O10', 'Rollback R1 and R2b, R2c (after S2b ran; before O11 only)' if after_s2b else
+                           'Rollback R1 and R2a (before S2b ran; before O11 only)')
     if released or app_writes_seen:
         block.refuse('rollback refused: %s; a rollback is now a new freeze and a reconciliation' % (
             'C1 saw application writes on the live branch at %s' % app_writes_seen if app_writes_seen else 'O11 released writers on the live name'))
@@ -405,6 +582,9 @@ def rollback_block(names, released=False, app_writes_seen=None, withheld=None):
     block.note('By hand: when S1 or S2 ran but S3 did not, or R1 already ran, no database is attached under the live name; skip the '
                'zero-change proof and R1 and start at the R2 check. The notebook runs every item in order, so there the first proof check '
                'stops the block before any statement; finish from the R2 check of this block by hand.')
+    block.note('Two blocks exist: O10-rollback (R2a) while the original record is still detached, that is before S2b ran, and '
+               'O10-rollback-retained (R2b, then R2c when R2b is refused) once S2b dropped it. Use the one the S2b state calls for; the '
+               'R2 before check of the wrong one stops it with nothing issued.')
     block.note('Zero-change proof: S3 attached the live name READWRITE, so the application could write from then on. Every planned table must '
                'hold the row count of the copy, no pipeline may run on the live name, no write privilege the lockout took may be back, and '
                'no foreign session may be active; a failed check means reconcile first, never R1.')
@@ -425,23 +605,70 @@ def rollback_block(names, released=False, app_writes_seen=None, withheld=None):
                 ownersql.Expect('columns_equal', value=ownersql.record_expect(names, 'live')))
     block.statement('DETACH DATABASE %s' % ident(names['source']), 'R1: detach the live branch')
     block.check('R1 after: no attached database named source', ATTACHED_SQL, (names['source'],), ownersql.Expect('no_rows'))
-    block.check('R2 before: the original storage is detached', BRANCH_SQL, (names['source_sid'],), ownersql.Expect('column_equals', 'IS_DETACHED', 1))
-    block.check('R2 before: the original record is detached with its ATTACH_SYNTAX', DETACHED_RECORD_SQL, (names['source'], names['source_sid']),
-                ownersql.Expect('columns_equal', value=ownersql.record_expect(names, 'source')))
-    block.statement(original_syntax(names), 'R2: re-attach the original record read write by its own ATTACH_SYNTAX')
-    if ownersql.placeholders(original_syntax(names)):
-        block.note('R2: the AT MILESTONE value is the ATTACH_SYNTAX of the detached original record, recorded at S1. Generate this block again '
-                   'after S1 (s2rebuild owner-sql O10 --rollback) to fill it in, or copy the ATTACH_SYNTAX from the row of the R2 check.')
-    block.check('R2 after: source attached READWRITE with the original STORAGE_ID', ATTACHED_SQL, (names['source'],),
-                ownersql.Expect('columns_equal', value={'STORAGE_ID': names['source_sid'], 'ATTACH_TYPE': 'READWRITE', 'COMPUTE_ID': names['source_cid']}))
-    block.check('R3 before: the retained name holds the recorded record', ATTACHED_SQL, (names['retained'],),
-                ownersql.Expect('columns_equal', value={'STORAGE_ID': names['retained_sid'], 'COMPUTE_ID': names['retained_cid'], 'ATTACH_TYPE': 'READONLY'}))
-    block.statement('DROP DATABASE %s' % ident(names['retained']), 'R3 (optional): drop the retained branch')
-    block.check('R3 after: retained gone', ATTACHED_SQL, (names['retained'],), ownersql.Expect('no_rows'))
-    block.note('The detached live record left by R1 (name %s, STORAGE_ID %s, COMPUTE_ID %s) stays recoverable by its own ATTACH_SYNTAX; it shares '
-               'its STORAGE_ID with the replacement, so it is never deleted in the Portal by STORAGE_ID. The cleanup flow of the release 1.0 work '
-               'order removes it.' % (names['source'], names['live_sid'], names['live_cid']))
+    if after_s2b:
+        _r2b_items(block, names)
+    else:
+        _r2a_items(block, names)
+    block.note('The retained copy %s stays attached read only; no rollback step drops it. The detached live record left by R1 (name %s, '
+               'STORAGE_ID %s, COMPUTE_ID %s) stays recoverable by its own ATTACH_SYNTAX; it shares its STORAGE_ID with the replacement, so it '
+               'is never deleted in the Portal by STORAGE_ID.' % (names['retained'], names['source'], names['live_sid'], names['live_cid']))
     return block
+
+
+def _r2a_items(block, names):
+    """R2a: the detached original record re-attached read write by its own ATTACH_SYNTAX."""
+    block.check('R2a before: the original storage is detached', BRANCH_SQL, (names['source_sid'],), ownersql.Expect('column_equals', 'IS_DETACHED', 1))
+    block.check('R2a before: the original record is detached with its ATTACH_SYNTAX', DETACHED_RECORD_SQL, (names['source'], names['source_sid']),
+                ownersql.Expect('columns_equal', value=ownersql.record_expect(names, 'source')))
+    block.statement(original_syntax(names), 'R2a: re-attach the original record read write by its own ATTACH_SYNTAX')
+    if ownersql.placeholders(original_syntax(names)):
+        block.note('R2a: the AT MILESTONE value is the ATTACH_SYNTAX of the detached original record, recorded at S1. Generate this block again '
+                   'after S1 (s2rebuild owner-sql O10 --rollback) to fill it in, or copy the ATTACH_SYNTAX from the row of the R2a check.')
+    block.check('R2a after: source attached READWRITE with the original STORAGE_ID', ATTACHED_SQL, (names['source'],),
+                ownersql.Expect('columns_equal', value={'STORAGE_ID': names['source_sid'], 'ATTACH_TYPE': 'READWRITE', 'COMPUTE_ID': names['source_cid']}))
+
+
+def retained_branch_sql(names):
+    """R2b: a read-write pitr branch of the retained copy under the live name on the original storage."""
+    return 'ATTACH DATABASE %s AS %s STORAGEID %s' % (ident(names['retained']), ident(names['source']), names['source_sid'])
+
+
+def retained_resume_sql(names, syntax=None):
+    """R2c: the detached retained record's own ATTACH_SYNTAX with AS <source>, so its record comes back read write under the live name.
+
+    syntax is the ATTACH_SYNTAX read after the DETACH; without it the AT MILESTONE form carries a
+    placeholder for the printed block.
+    """
+    text = str(syntax or '').strip().rstrip(';')
+    m = re.match(r'ATTACH DATABASE `[A-Za-z0-9_]+`( .*)$', text)
+    if m and ' AT MILESTONE ' in text:
+        return 'ATTACH DATABASE %s AS %s%s' % (ident(names['retained']), ident(names['source']), m.group(1))
+    return "ATTACH DATABASE %s AS %s AT MILESTONE '<retained_milestone>' STORAGEID %s COMPUTEID %s" % (
+        ident(names['retained']), ident(names['source']), names['source_sid'], names['retained_cid'])
+
+
+def _r2b_items(block, names):
+    """R2b, then R2c as the fallback: the live name takes a branch of the retained copy, or the retained record itself when a branch is refused."""
+    block.check('R2b before: the original record is dropped', RECORD_STATE_SQL, (names['source'], names['source_sid'], names['source_cid']),
+                ownersql.Expect('column_equals', 'IS_DROPPED', 1))
+    block.check('R2b before: the retained name holds the recorded record READONLY', ATTACHED_SQL, (names['retained'],),
+                ownersql.Expect('columns_equal', value={'STORAGE_ID': names['retained_sid'], 'COMPUTE_ID': names['retained_cid'], 'ATTACH_TYPE': 'READONLY'}))
+    block.check('R2b before: no attached database named source', ATTACHED_SQL, (names['source'],), ownersql.Expect('no_rows'))
+    block.statement(retained_branch_sql(names), 'R2b: attach a read-write branch of the retained copy under the live name')
+    block.note('R2c, only when R2b was refused on the READ ONLY attachment (error %d): the two statements below are skipped while the live '
+               'name is attached. The AT MILESTONE value is the ATTACH_SYNTAX of the retained record after its DETACH; copy it from the '
+               'R2c check row and add AS %s after the name. The retained name then leaves the Portal; its data is under the live name as a '
+               'resume record of it.' % (READ_ONLY_REFUSAL, names['source']))
+    attached_source = (NAME_ATTACHED_COUNT_SQL, (names['source'],))
+    block.statement('DETACH DATABASE %s' % ident(names['retained']), 'R2c: detach the retained name (only after a refused R2b)', skip_if=attached_source)
+    block.check('R2c: the retained record is detached with its ATTACH_SYNTAX, or attached (R2b done)', ALL_RECORDS_SQL, (names['retained'],),
+                ownersql.Expect('some_rows'))
+    block.statement(retained_resume_sql(names), 'R2c: re-attach the retained record read write under the live name', skip_if=attached_source)
+    block.check('R2 after: source attached READWRITE on the original storage', ATTACHED_SQL, (names['source'],),
+                ownersql.Expect('columns_equal', value={'STORAGE_ID': names['source_sid'], 'ATTACH_TYPE': 'READWRITE'}))
+    block.check('R2 after: the live name holds a record made from the retained copy', NAME_RECORD_SQL, (names['source'],),
+                ownersql.Expect('columns_equal', value={'PREV_DATABASE_NAME': names['retained']}))
+    block.note('R2 after: the three smallest non-empty tables match the journal source counts (the kit checks these).')
 
 
 def original_syntax(names):
@@ -558,12 +785,17 @@ class SwitchMachine:
             self.names.update(ownersql.record_names(record, self.journal.attachment(record)))
         return live
 
-    def _run(self, sql, label):
+    def _run(self, sql, label, refusable=False):
+        """Execute one statement and journal it; refusable=True returns False instead of raising when the server refused it as read only."""
         try:
             self.session.execute(sql)
         except KitError:
             raise
         except Exception as exc:  # noqa: BLE001 - a failed statement is reported with the observed position
+            if refusable and read_only_refusal(exc):
+                self.journal.event('switch_statement_refused', '%s: %s %s' % (label, type(exc).__name__, getattr(exc, 'args', ('',))[0]))
+                self.log('    refused %s (error %s); the fallback follows' % (label, getattr(exc, 'args', ('',))[0]))
+                return False
             self.journal.event('switch_statement_failed', '%s: %s %s' % (label, type(exc).__name__, getattr(exc, 'args', ('',))[0]))
             try:
                 where = self.position()
@@ -572,6 +804,7 @@ class SwitchMachine:
             raise KitError('Switch statement "%s" failed: %s: %s; the switch is now at "%s"' % (label, type(exc).__name__, exc, where))
         self.journal.event('switch_statement', label)
         self.log('    executed %s' % label)
+        return True
 
     def require(self, step, expected_state):
         """Refuse a step unless the live position is the one it starts from."""
@@ -654,10 +887,62 @@ class SwitchMachine:
                        ATTACH_TYPE='resume', PREV_DATABASE_NAME=n['source'])
         self._small_table_check(n['retained'], 1)
 
+    def s2b(self):
+        """S2b, first half: rerun the S2 after-checks, attach the original record read write under the live name by its own ATTACH_SYNTAX, then s2b_drop."""
+        n = self.names
+        self.require('S2b', RETAINED)
+        self.s2_after()
+        self._expect('S2b before: no attached database named source', ATTACHED_SQL, (n['source'],), ownersql.Expect('no_rows'))
+        self._run(self._original_syntax('S2b before'), 'S2b ATTACH original by its ATTACH_SYNTAX')
+        self._identify('S2b after: the original record is attached READWRITE under the live name', n['source'], self._recorded('source'),
+                       ACCESS='READWRITE', IS_DETACHED=0)
+        self.s2b_drop()
+
+    def s2b_proof(self):
+        """The S2b zero-change proof on the original attached under the live name: the three smallest non-empty tables hold the journal's source
+        counts and no foreign non-idle session is on it. A failed proof refuses with the original left attached read write (the rollback state)."""
+        n = self.names
+        problems = []
+        try:
+            self._small_table_check(n['source'], 3)
+        except KitError as exc:
+            problems.append(str(exc).replace('Switch refused: ', ''))
+        sessions = _rows(self.session, SESSIONS_SQL, _sessions_params(n))
+        busy = int(sessions[0]['n']) if sessions else 0
+        if busy:
+            problems.append('%d foreign non-idle session%s on the live name' % (busy, '' if busy == 1 else 's'))
+        if problems:
+            self.journal.event('switch_check', 'S2b zero-change proof: FAILED (%s)' % '; '.join(problems))
+            raise KitError('Switch stopped at S2b: the zero-change proof failed, so the original record was not dropped. The original %s stays '
+                           'attached read write under the live name, which is the rollback state. Reconcile first, then record the go again '
+                           '(s2rebuild step O10 continues at S2b) or stay on the original. Differences: %s' % (n['source'], '; '.join(problems)))
+        self.journal.event('switch_check', 'S2b zero-change proof: ok (three smallest tables equal the journal source counts; no foreign non-idle session)')
+        self.log('    check S2b zero-change proof: ok')
+
+    def s2b_drop(self):
+        """S2b, second half: the zero-change proof, DROP DATABASE of the original record, and the after-checks (the storage keeps the retained record only)."""
+        n = self.names
+        self.require('S2b', ORIGINAL_ATTACHED)
+        self._identify('S2b before: the live name holds the original record READWRITE', n['source'], self._recorded('source'), ACCESS='READWRITE')
+        self.s2b_proof()
+        self._run('DROP DATABASE %s' % ident(n['source']), 'S2b DROP source')
+        self._expect('S2b after: the original record is dropped', RECORD_STATE_SQL, (n['source'], n['source_sid'], n['source_cid']),
+                     ownersql.Expect('column_equals', 'IS_DROPPED', 1))
+        self._expect('S2b after: no attached database named source', ATTACHED_SQL, (n['source'],), ownersql.Expect('no_rows'))
+        entries = [_record(r) for r in _rows(self.session, STORAGE_ENTRIES_SQL, (n['source_sid'],))]
+        retained = self._recorded('retained')
+        if len(entries) != 1 or not records_match(retained, entries[0]):
+            self.journal.event('switch_check', 'S2b after: the original storage holds only the retained record: FAILED (%s)' % listing_text(entries))
+            raise KitError('Switch refused after S2b: the original storage %s should hold one entry, the retained record (%s), and holds: %s'
+                           % (n['source_sid'], record_text(retained), listing_text(entries)))
+        self.journal.event('switch_check', 'S2b after: the original storage holds only the retained record: ok (%s)' % listing_text(entries))
+        self.log('    check S2b after: the original storage holds only the retained record: ok')
+        self._small_table_check(n['retained'], 1)
+
     def s3(self):
         """S3: rerun the S2 after-checks, attach the replacement as a branch under the live name, then the S3 after-checks."""
         n = self.names
-        self.require('S3', RETAINED)
+        self.require('S3', SOURCE_DROPPED)
         self.s2_after()
         self._expect('S3 before: replacement attached READWRITE with the recorded STORAGE_ID', ATTACHED_SQL, (n['replacement'],),
                      ownersql.Expect('columns_equal', value={'STORAGE_ID': n['replacement_sid'], 'ATTACH_TYPE': 'READWRITE'}))
@@ -704,11 +989,55 @@ class SwitchMachine:
                 raise KitError('Switch refused: %s.%s holds %d rows, the journal says %s' % (db_name, t['table_name'], count, t['source_count']))
             self.log('    check %s.%s count %d matches the journal' % (db_name, t['table_name'], count))
 
+    def s4(self):
+        """S4: rerun the S3 after-checks, drop the replacement record (create, parent of the live record), then the after-checks and the gate."""
+        n = self.names
+        self.require('S4', SWITCHED)
+        self.s3_after()
+        self._identify('S4 before: the replacement name holds the recorded replacement record', n['replacement'], self._recorded('replacement'),
+                       ACCESS='READWRITE', ATTACH_TYPE='create')
+        self._expect('S4 before: the live name is its own branch record of the replacement', BRANCH_OF_SQL,
+                     (n['source'], n['replacement_sid'], n['replacement']), ownersql.Expect('column_at_least', 'n', 1))
+        self._run('DROP DATABASE %s' % ident(n['replacement']), 'S4 DROP replacement')
+        self._expect('S4 after: the replacement record is dropped', RECORD_STATE_SQL, (n['replacement'], n['replacement_sid'], n['replacement_cid']),
+                     ownersql.Expect('column_equals', 'IS_DROPPED', 1))
+        self._expect('S4 after: no attached database named replacement', ATTACHED_SQL, (n['replacement'],), ownersql.Expect('no_rows'))
+        self._identify('S4 after: the live record is unchanged', n['source'], self._recorded('live'), ACCESS='READWRITE')
+        self._small_table_check(n['source'], 1)
+        self.gate()
+
+    def record_listing(self, when):
+        """Record the Portal entries of both storages (listing) in the journal as a switch_listing event; returns the entries."""
+        entries = listing(self.session, self.names)
+        self.journal.event('switch_listing', '%s: %s' % (when, listing_text(entries)))
+        self.log('    entries %s: %s' % (when, listing_text(entries)))
+        return entries
+
+    def gate(self):
+        """The two-entry gate: the entries with IS_DROPPED = 0 across both storages are exactly the live record and the retained record."""
+        entries = self.record_listing('after')
+        expected = {entry_key(self._recorded('live')): 'the live record', entry_key(self._recorded('retained')): 'the retained record'}
+        if None in expected:
+            raise KitError('Switch gate refused: the live or the retained record is not recorded whole; inspect the journal attachments')
+        found = {entry_key(e): e for e in entries}
+        extra = [record_text(e) for key, e in found.items() if key not in expected]
+        missing = [label for key, label in expected.items() if key not in found]
+        if extra or missing:
+            self.journal.event('switch_check', 'gate: FAILED (extra: %s; missing: %s)' % ('; '.join(extra) or 'none', ', '.join(missing) or 'none'))
+            raise KitError('Switch gate refused: the workspace should hold two entries, the live record and the retained record. Extra: %s. '
+                           'Missing: %s. Inspect the records before any further statement; C3 (End state) carries the repair block for a switch '
+                           'made without S2b and S4' % ('; '.join(extra) or 'none', ', '.join(missing) or 'none'))
+        self.journal.event('switch_check', 'gate: ok (two entries, the live record and the retained record)')
+        self.log('    check gate: ok (two entries, the live record and the retained record)')
+
     def forward(self, detach_kill=None):
         """Run the remaining forward steps from the live position, rerunning the after-checks on re-entry; returns the final state."""
         state = self.position()
         if state == LIVE_DETACHED:
             raise KitError('Switch cannot continue: a rollback is in progress (R1 ran); finish it with the rollback, then start a new switch')
+        if state == ROLLED_BACK:
+            raise KitError('Switch cannot continue: the live name holds a branch of the retained copy (a rollback ran through it); a new switch '
+                           'is a new freeze and copy')
         if state == NOT_STARTED:
             self.s1(detach_kill)
             state = DETACHED
@@ -716,12 +1045,23 @@ class SwitchMachine:
             self.s2()
             state = RETAINED
         if state == RETAINED:
+            self.s2b()
+            state = SOURCE_DROPPED
+        elif state == ORIGINAL_ATTACHED:
+            self.log('    the original is attached read write under the live name; continuing S2b at the zero-change proof')
+            self.s2b_drop()
+            state = SOURCE_DROPPED
+        if state == SOURCE_DROPPED:
             self.s3()
-            return SWITCHED
+            state = SWITCHED
         if state == SWITCHED:
-            self.log('    the live name already resolves to a new branch; rerunning the S3 after-checks')
+            self.s4()
+            return COMPLETE
+        if state == COMPLETE:
+            self.log('    the live name already resolves to a new branch and the replacement is gone; rerunning the after-checks and the gate')
             self.s3_after()
-            return SWITCHED
+            self.gate()
+            return COMPLETE
         raise KitError('Switch cannot continue from state "%s"; inspect the attachments before any further statement' % state)
 
     def zero_change_proof(self):
@@ -778,32 +1118,38 @@ class SwitchMachine:
         self.journal.event('rollback_proof', done)
         self.log('    ' + done)
 
-    def _original_syntax(self):
-        """R2 before: the original record is detached and matches the journal; returns its own ATTACH_SYNTAX (the AT MILESTONE form).
+    def _original_syntax(self, label='R2a before'):
+        """S2b and R2a before: the original record is detached and matches the journal; returns its own ATTACH_SYNTAX (the AT MILESTONE form).
 
         The syntax comes from the live record. When S1 recorded the detached record, its syntax
         must be the same text: a different one means the record was attached and detached again
         since, which refuses with both printed.
         """
         expected = self._recorded('source')
-        live = self._identify('R2 before: the original record is detached', self.names['source'], expected, IS_DETACHED=1)
+        live = self._identify('%s: the original record is detached' % label, self.names['source'], expected, IS_DETACHED=1)
         syntax = str(live.get('ATTACH_SYNTAX') or '').strip().rstrip(';')
         if not syntax:
-            raise KitError('Rollback refused at R2: the detached original record %s shows no ATTACH_SYNTAX; attach it by hand from the Portal'
-                           % record_text(live))
+            raise KitError('Refused at %s: the detached original record %s shows no ATTACH_SYNTAX; attach it by hand from the Portal'
+                           % (label, record_text(live)))
         recorded = (expected or {}).get('attach_syntax')
         if expected and int(expected.get('is_detached') or 0) and recorded and str(recorded).strip().rstrip(';') != syntax:
-            self.journal.event('switch_check', 'R2 before: ATTACH_SYNTAX differs from the one S1 recorded (recorded %s; live %s)' % (recorded, syntax))
-            raise KitError('Rollback refused at R2: the ATTACH_SYNTAX of the original record differs from the one S1 recorded, so the record '
+            self.journal.event('switch_check', '%s: ATTACH_SYNTAX differs from the one S1 recorded (recorded %s; live %s)' % (label, recorded, syntax))
+            raise KitError('Refused at %s: the ATTACH_SYNTAX of the original record differs from the one S1 recorded, so the record '
                            'was attached and detached again since. Recorded: %s. Live: %s. Inspect the record before any further statement'
-                           % (recorded, syntax))
+                           % (label, recorded, syntax))
         return syntax
 
-    def rollback(self, drop_retained=False):
-        """R1 to R3 from the live position; refused once O11 started releasing writers or application writes were seen.
+    def original_dropped(self):
+        """True when the recorded original record shows IS_DROPPED = 1 (S2b ran); reads the records of the source name."""
+        return original_state(all_records(self.session, self.names['source']), self.names) == 'dropped'
 
-        From the switched position the zero-change proof runs first; behind S3 (source detached
-        or retained attached) nothing is attached under the live name, so R2 runs without it.
+    def rollback(self):
+        """R1, then R2a (before S2b ran) or R2b with R2c as the fallback (after S2b) from the live position; returns the position reached.
+
+        Refused once O11 started releasing writers or application writes were seen. From the
+        switched position the zero-change proof runs first; behind S3 (source detached, retained
+        attached, original dropped) nothing is attached under the live name, so R1 is skipped.
+        The retained copy is never dropped.
         """
         n = self.names
         reason = rollback_refusal(self.journal)
@@ -813,29 +1159,106 @@ class SwitchMachine:
         if state == NOT_STARTED:
             self.log('    nothing to roll back: the source is attached on its original storage')
             return NOT_STARTED
+        if state == ORIGINAL_ATTACHED:
+            self.log('    nothing to roll back: the original is attached read write under the live name (the rollback state)')
+            return ORIGINAL_ATTACHED
+        if state == ROLLED_BACK:
+            self.log('    nothing to roll back: the live name holds a branch of the retained copy')
+            return ROLLED_BACK
         if state == UNKNOWN:
             raise KitError('Rollback refused: the switch is at "unknown"; inspect the attachments before any further statement')
-        if state == SWITCHED:
+        if state in (SWITCHED, COMPLETE):
             self.zero_change_proof()
         self.journal.set_meta('rollback_started_utc', self.journal.get_meta('rollback_started_utc') or iso(utc_now()))
-        if state == SWITCHED:
+        if state in (SWITCHED, COMPLETE):
             self._identify('R1 before: the attached database named source is the recorded live record', n['source'], self._recorded('live'),
                            ACCESS='READWRITE')
             self._run('DETACH DATABASE %s' % ident(n['source']), 'R1 DETACH live branch')
             self._expect('R1 after: no attached database named source', ATTACHED_SQL, (n['source'],), ownersql.Expect('no_rows'))
-        self._expect('R2 before: the original storage is detached', BRANCH_SQL, (n['source_sid'],), ownersql.Expect('column_equals', 'IS_DETACHED', 1))
         self._expect('R2 before: no attached database named source', ATTACHED_SQL, (n['source'],), ownersql.Expect('no_rows'))
-        self._run(self._original_syntax(), 'R2 ATTACH original by its ATTACH_SYNTAX')
-        self._expect('R2 after: source attached READWRITE with the original STORAGE_ID', ATTACHED_SQL, (n['source'],),
+        if self.original_dropped():
+            return self._rollback_through_retained()
+        self._expect('R2a before: the original storage is detached', BRANCH_SQL, (n['source_sid'],), ownersql.Expect('column_equals', 'IS_DETACHED', 1))
+        self._run(self._original_syntax(), 'R2a ATTACH original by its ATTACH_SYNTAX')
+        self._expect('R2a after: source attached READWRITE with the original STORAGE_ID', ATTACHED_SQL, (n['source'],),
                      ownersql.Expect('columns_equal', value={'STORAGE_ID': n['source_sid'], 'ATTACH_TYPE': 'READWRITE'}))
-        self._identify('R2 after: the original record is attached READWRITE', n['source'], self._recorded('source'), record='source', ACCESS='READWRITE')
-        if drop_retained and _rows(self.session, ATTACHED_SQL, (n['retained'],)):
-            self._identify('R3 before: the retained name holds the recorded record', n['retained'], self._recorded('retained'), ACCESS='READONLY')
-            self._run('DROP DATABASE %s' % ident(n['retained']), 'R3 DROP retained')
-            self._expect('R3 after: retained gone', ATTACHED_SQL, (n['retained'],), ownersql.Expect('no_rows'))
+        self._identify('R2a after: the original record is attached READWRITE', n['source'], self._recorded('source'), record='source', ACCESS='READWRITE')
         self.journal.set_meta('rolled_back_utc', iso(utc_now()))
-        self.journal.event('rollback', 'original %s re-attached READWRITE by its own ATTACH_SYNTAX (%s)' % (n['source'], record_text(self._recorded('source'))))
-        return NOT_STARTED
+        self.journal.event('rollback', 'R2a: original %s re-attached READWRITE by its own ATTACH_SYNTAX (%s); the retained copy %s stays attached read only'
+                           % (n['source'], record_text(self._recorded('source')), n['retained']))
+        return self.position()
+
+    def repair_end_state(self):
+        """C3 repair for a switch made without S2b and S4 (an older kit): the post-switch sequence proven on October 27, 2026.
+
+        Detach the live name (behind its record check), attach the original record by its own
+        syntax, record and row check, DROP it, re-attach the live record by its own syntax, DROP
+        the replacement record behind its record check, then the gate. The live name is detached
+        for about 30 seconds on a 3 TB database (fact 34). Runs through the C3 owner guard.
+        """
+        n = self.names
+        live = self._recorded('live')
+        if live is None or self._recorded('source') is None:
+            raise KitError('C3 repair refused: the live record or the original record is not recorded in the journal; nothing was issued')
+        if _rows(self.session, ATTACHED_SQL, (n['source'],)):
+            self._identify('repair: the live name holds the recorded live record', n['source'], live, ACCESS='READWRITE')
+            self._run('DETACH DATABASE %s' % ident(n['source']), 'repair DETACH live')
+            self._expect('repair: no attached database named source', ATTACHED_SQL, (n['source'],), ownersql.Expect('no_rows'))
+        if not self.original_dropped():
+            self._run(self._original_syntax('repair'), 'repair ATTACH original by its ATTACH_SYNTAX')
+            self._identify('repair: the original record is attached READWRITE under the live name', n['source'], self._recorded('source'),
+                           ACCESS='READWRITE', IS_DETACHED=0)
+            self.s2b_proof()
+            self._run('DROP DATABASE %s' % ident(n['source']), 'repair DROP original record')
+            self._expect('repair: the original record is dropped', RECORD_STATE_SQL, (n['source'], n['source_sid'], n['source_cid']),
+                         ownersql.Expect('column_equals', 'IS_DROPPED', 1))
+        detached = self._identify('repair: the live record is detached with its ATTACH_SYNTAX', n['source'], live, IS_DETACHED=1)
+        syntax = str(detached.get('ATTACH_SYNTAX') or '').strip().rstrip(';')
+        if ' AT MILESTONE ' not in syntax:
+            raise KitError('C3 repair stopped: the detached live record %s shows no AT MILESTONE syntax; attach it by hand from the Portal'
+                           % record_text(detached))
+        self._run(syntax, 'repair ATTACH live record by its ATTACH_SYNTAX')
+        self._identify('repair: the live name holds the live record READWRITE again', n['source'], live, record='live', ACCESS='READWRITE', IS_DETACHED=0)
+        self._small_table_check(n['source'], 1)
+        if _rows(self.session, ATTACHED_SQL, (n['replacement'],)):
+            self._identify('repair: the replacement name holds the recorded replacement record', n['replacement'], self._recorded('replacement'),
+                           ACCESS='READWRITE', ATTACH_TYPE='create')
+            self._run('DROP DATABASE %s' % ident(n['replacement']), 'repair DROP replacement')
+            self._expect('repair: the replacement record is dropped', RECORD_STATE_SQL, (n['replacement'], n['replacement_sid'], n['replacement_cid']),
+                         ownersql.Expect('column_equals', 'IS_DROPPED', 1))
+        self.gate()
+
+    def _rollback_through_retained(self):
+        """R2b: a read-write branch of the retained copy under the live name; R2c when the server refuses it on the READ ONLY attachment."""
+        n = self.names
+        self._identify('R2b before: the retained name holds the recorded record READONLY', n['retained'], self._recorded('retained'), ACCESS='READONLY')
+        if self._run(retained_branch_sql(n), 'R2b ATTACH retained AS source (branch)', refusable=True):
+            how = 'R2b: a read-write pitr branch of the retained copy %s is attached under the live name %s; the retained copy stays attached read only'
+            how %= (n['retained'], n['source'])
+        else:
+            self._identify('R2c before: the retained name still holds the recorded record READONLY', n['retained'], self._recorded('retained'),
+                           ACCESS='READONLY')
+            self._run('DETACH DATABASE %s' % ident(n['retained']), 'R2c DETACH retained')
+            detached = self._identify('R2c: the retained record is detached with its ATTACH_SYNTAX', n['retained'], self._recorded('retained'), IS_DETACHED=1)
+            syntax = retained_resume_sql(n, detached.get('ATTACH_SYNTAX'))
+            if ownersql.placeholders(syntax):
+                raise KitError('Rollback stopped at R2c: the detached retained record %s shows no AT MILESTONE syntax; the live name is free and the '
+                               'retained name is detached. Attach the record by hand from its ATTACH_SYNTAX with AS %s' % (record_text(detached), n['source']))
+            self._run(syntax, 'R2c ATTACH retained record AS source by its ATTACH_SYNTAX')
+            how = ('R2c: the server refused a branch of the READ ONLY retained copy, so its record is attached read write under the live name %s as '
+                   'a resume record; the retained name %s is gone from the attached list (its record is detached) and the data is under the live '
+                   'name' % (n['source'], n['retained']))
+        self._expect('R2 after: source attached READWRITE on the original storage', ATTACHED_SQL, (n['source'],),
+                     ownersql.Expect('columns_equal', value={'STORAGE_ID': n['source_sid'], 'ATTACH_TYPE': 'READWRITE'}))
+        # the record under the live name is new (a pitr or resume record of the retained copy): the rollback event carries it, and the journal's
+        # source row keeps the original record, which the position reads to tell this state from the original attached
+        back = self._identify('R2 after: the live name holds a record made from the retained copy', n['source'], ACCESS='READWRITE',
+                              PREV_DATABASE_NAME=n['retained'])
+        self._small_table_check(n['source'], 3)
+        self.journal.set_meta('rolled_back_utc', iso(utc_now()))
+        self.journal.event('rollback', '%s (%s)' % (how, record_text(back)))
+        self.log('    ' + how)
+        return ROLLED_BACK
 
 
 def _unverified(journal):
@@ -1050,6 +1473,8 @@ def _o10(step, ctx):
     ownersql.guard_check_block(block, ctx)
     ownersql.print_block(block, ctx, ownersql.owner_sql_path(ctx, 'O10'))
     ownersql.print_block(ownersql.block_for('O10', names, ctx.config, rollback=True, **inputs), ctx, ownersql.owner_sql_path(ctx, 'O10', rollback=True))
+    for variant, companion in ownersql.companion_blocks('O10', names, ctx.config, rollback=True, **inputs):
+        ownersql.print_block(companion, ctx, ownersql.owner_sql_path(ctx, 'O10', rollback=True, variant=variant))
     if ctx.dry_run or not ctx.owner_configured:
         if inputs['s0_problems'] and not ctx.dry_run:
             # the print route refuses what the kit route refuses at S0; the printed block starts with the same STOP
@@ -1074,6 +1499,7 @@ def _o10(step, ctx):
             ctx.journal.event('switch_observed', 'O10 read the position "%s" from the attachment views before the go' % position)
         for line in s0_checks(ctx, names, position):
             ctx.log('    ' + line)
+        machine.record_listing('before')
         if not ctx.yes:
             typed = _typed_live_name(ctx, names['source'])
             if typed is None:
@@ -1099,8 +1525,10 @@ def _o10(step, ctx):
     finally:
         owner.close()
         runner.close()
-    return steps.Outcome(steps.PASSED, 'switch complete: live name %s resolves to STORAGE_ID %s; retained %s' % (
-        names['source'], names.get('live_sid'), names.get('retained_sid')))
+    return steps.Outcome(steps.PASSED, 'switch complete: two entries, the live name %s (STORAGE_ID %s, COMPUTE_ID %s) and the retained copy %s '
+                         '(STORAGE_ID %s, COMPUTE_ID %s); the original record and the replacement are dropped' % (
+                             names['source'], names.get('live_sid'), names.get('live_cid'), names['retained'], names.get('retained_sid'),
+                             names.get('retained_cid')))
 
 
 steps.register('O10', handle_o10)

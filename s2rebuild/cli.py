@@ -18,7 +18,7 @@ import sys
 import traceback
 from pathlib import Path
 
-from . import __title__, __version__, abandon, bundle, copy as copy_module, enginecapture, estimate, freeze, grants, inventory, lockout, notebook, ownersql, pipelines, postcopy, rehearse, report_md, report_xlsx, steps, switch, watch
+from . import __title__, __version__, abandon, bundle, cleanup, copy as copy_module, enginecapture, estimate, freeze, grants, inventory, lockout, notebook, ownersql, pipelines, postcopy, rehearse, report_md, report_xlsx, steps, switch, watch
 from .common import EXIT_DONE, EXIT_GATE, EXIT_MISMATCH, EXIT_REFUSED, KitError, check_run_id, parse_utc, run_date, unique_run_id, utc_now
 from .sqlutil import ident, secret_forms, sql_literal
 from .config import load_config
@@ -60,6 +60,8 @@ COMMANDS = [
                               'the replacement dropped, the run closed; --execute --note TEXT runs it with the owner profile', None),
     ('report', 'C2', 'Final Excel and Markdown for a run', None),
     ('calibrate', 'C2', 'Fit the throughput model from a journal and write customer/baseline.json', None),
+    ('cleanup', 'C5', 'List what the run left after C3 (the live record, the retained copy, its record, size and retain-until date); '
+                      '--delete NAME deletes the retained copy after the date, by its record, after the name is typed again; --yes does not apply', None),
     ('bundle', 'packaging', 'Write MANIFEST.json, check the denylist, zip the static tree to dist/; --verify ZIP checks a zip', None),
     ('engine-capture', 'tests', 'Read the engine version, the column list of every information_schema view the kit reads, SHOW '
                                 'AGGREGATES, the PASSWORD_ variables and, with --fixture-database, the runner-versus-owner row counts, '
@@ -168,6 +170,8 @@ def build_parser():
     p['owner-sql'].add_argument('step_id', metavar='ID', help='admin step id: %s' % ', '.join(steps.OWNER_SQL_STEPS))
     p['abandon'].add_argument('--execute', action='store_true', help='run the block with the owner profile (needs --note)')
     p['abandon'].add_argument('--note', metavar='TEXT', help='why the run is abandoned; recorded in the journal')
+    p['cleanup'].add_argument('--delete', metavar='NAME', help='the retained name to delete for good: refused before the retain-until date, '
+                                                                 'then the name is typed again at the prompt (owner profile)')
     p['mark-recopy'].add_argument('table', metavar='TABLE', help='table name as recorded in the journal')
     p['mark-recopy'].add_argument('--bucket', metavar='N', type=int, help='one bucket instead of every bucket of the table')
     p['calibrate'].add_argument('--journal', metavar='FILE', help='journal to fit (default: the run journal)')
@@ -1097,9 +1101,9 @@ def cmd_owner_sql(args, env, out, state):
         log = inv.open_log('owner-sql')
         for db in inv.databases:
             ctx = _step_context(inv, db, log)
-            names = ownersql.names_for(ctx)
-            block = ownersql.block_for(step_id, names, inv.config, rollback=args.rollback, **ownersql.block_inputs(ctx))
-            for variant, b in [(None, block)] + ownersql.companion_blocks(step_id, names, inv.config, rollback=args.rollback):
+            names, inputs = ownersql.names_for(ctx), ownersql.block_inputs(ctx)
+            block = ownersql.block_for(step_id, names, inv.config, rollback=args.rollback, **inputs)
+            for variant, b in [(None, block)] + ownersql.companion_blocks(step_id, names, inv.config, rollback=args.rollback, **inputs):
                 ownersql.guard_check_block(b, ctx)
                 path = ownersql.owner_sql_path(ctx, step_id, rollback=args.rollback, variant=variant)
                 if not inv.dry_run and inv.run_id != DRY_RUN_ID:
@@ -1188,6 +1192,28 @@ def cmd_abandon(args, env, out, state):
             ctx = steps.StepContext(inv.config, db, inv.journals[db.source], inv.run_id, log, dry_run=inv.dry_run, sessions=sessions)
             log(abandon.run(ctx, args.note or '', args.execute))
         return EXIT_DONE
+    finally:
+        inv.close()
+
+
+def cmd_cleanup(args, env, out, state):
+    """cleanup: list what the run left after C3; --delete NAME runs the customer's delete of the retained copy (C5) with the owner profile."""
+    inv = Invocation(args, env, out, state, run_mode=RUN_EXISTING)
+    try:
+        inv.open_journals()
+        log = inv.open_log('cleanup')
+        log(_header(inv, 'cleanup'))
+        sessions = inv.open_sessions() if args.delete and not inv.dry_run else None
+        code = EXIT_DONE
+        for db in inv.databases:
+            ctx = steps.StepContext(inv.config, db, inv.journals[db.source], inv.run_id, log, dry_run=inv.dry_run, sessions=sessions)
+            if args.delete and args.delete != db.retained:
+                continue
+            code = max(code, cleanup.run(ctx, args.delete))
+        if args.delete and not any(db.retained == args.delete for db in inv.databases):
+            raise KitError('cleanup deletes the retained copy of a configured database only; %s is none of %s'
+                           % (args.delete, ', '.join(db.retained for db in inv.databases)))
+        return code
     finally:
         inv.close()
 
@@ -1408,7 +1434,7 @@ DISPATCH = {'run': cmd_run, 'step': cmd_step, 'gate': cmd_gate, 'status': cmd_st
             'profile': cmd_profile, 'plan': cmd_plan, 'calibrate': cmd_calibrate, 'mark-recopy': cmd_mark_recopy, 'pause': cmd_pause,
             'resume': cmd_resume, 'watch': cmd_watch, 'quiet-proof': cmd_quiet_proof, 'report': cmd_report, 'owner-sql': cmd_owner_sql,
             'owner-notebook': cmd_owner_notebook, 'account-sql': cmd_account_sql, 'lockout': cmd_lockout, 'rehearse': cmd_rehearse,
-            'check': cmd_check, 'bundle': cmd_bundle, 'abandon': cmd_abandon, 'engine-capture': cmd_engine_capture}
+            'check': cmd_check, 'bundle': cmd_bundle, 'abandon': cmd_abandon, 'engine-capture': cmd_engine_capture, 'cleanup': cmd_cleanup}
 for _name, _label, _help, _milestone in COMMANDS:
     if _milestone is not None:
         DISPATCH[_name] = not_implemented(_name, _milestone)

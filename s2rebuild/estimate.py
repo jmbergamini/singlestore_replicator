@@ -529,4 +529,7 @@ def plan_sheet(config, db, run_id, inventory, est, fit, rehearsal=None, env=None
     listed, refusals = unmigrated(config, db, (inventory or {}).get('routines') or [], pipelines.get('items') or [])
     lines.append('Routines   %s' % ('; '.join(['%s not migrated' % label for label in listed] + ['REFUSED: ' + r for r in refusals]) or 'none'))
     lines.append('Rehearsal  %s' % (rehearsal or 'none recorded'))
+    if config.closeout.retain_days < 90:
+        lines.append('Retention  closeout.retain_days is %d, under the 90 day default: the retained copy %s may be deleted by the customer '
+                     '(s2rebuild cleanup --delete) that soon after the switch' % (config.closeout.retain_days, db.retained))
     return lines

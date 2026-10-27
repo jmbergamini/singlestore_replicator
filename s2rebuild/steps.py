@@ -112,9 +112,9 @@ REGISTRY = {s.id: s for s in [
     _step('C2', 'Report and calibrate', (PYTHON,), (RUNNER,),
           'Final Excel and Markdown written; baseline recalibrated from the journal, or kept with a note when the journal cannot be fitted',
           'report_xlsx', 'M5', ('C1',)),
-    _step('C3', 'Retention cleanup', (ADMIN,), (OWNER,),
-          'After retain_days: retained branch and replacement dropped, detached original storage deleted, evidence kept',
-          'ownersql', 'M4', ('C2',)),
+    _step('C3', 'End state', (ADMIN,), (OWNER,),
+          'Exactly two entries across both storages, the live record and the retained record; the live name resolves to the live record; '
+          'a write on the retained name refused; the listing recorded', 'ownersql', 'M4', ('C2',)),
     _step('C4', 'Remove migration account', (ADMIN,), (OWNER,),
           'DROP USER done, zero privileges remain, Keychain item deleted', 'ownersql', 'M4', ('C3',)),
 ]}
@@ -145,10 +145,14 @@ OWNER_ALLOWANCES = {
     'O3': (('DETACH DATABASE', 'ATTACH DATABASE'), ('source',), {}, {'ATTACH DATABASE': 'READ ONLY'}),
     'O7': (('USE', 'CREATE VIEW'), ('replacement',), {}, {}),
     'O9': (('USE', 'CREATE PIPELINE', 'ALTER PIPELINE'), ('replacement',), {}, {}),
-    'O10': (('DETACH DATABASE', 'ATTACH DATABASE'), ('source', 'replacement', 'retained'), {'DROP DATABASE': ('retained',)}, {}),
+    # O10: DROP DATABASE only on the original record (S2b) and the replacement (S4), never the retained copy
+    'O10': (('DETACH DATABASE', 'ATTACH DATABASE'), ('source', 'replacement', 'retained'), {'DROP DATABASE': ('source', 'replacement')}, {}),
     'O11': (('START PIPELINE', 'GRANT', 'SET GLOBAL'), ('source',), {}, {}),
-    'C3': (('DROP DATABASE',), ('retained', 'replacement'), {}, {}),
+    # C3: the End state gate issues reads; the repair block for a switch made without S2b and S4 names the source and the replacement
+    'C3': (('DETACH DATABASE', 'ATTACH DATABASE', 'DROP DATABASE'), ('source', 'replacement'), {'DETACH DATABASE': ('source',)}, {}),
     'C4': (('DROP USER',), (), {}, {}),
+    # C5 (s2rebuild cleanup): the customer's delete of the retained copy, by its record: DETACH, ATTACH by syntax, DROP on that name only
+    'cleanup': (('DETACH DATABASE', 'ATTACH DATABASE', 'DROP DATABASE'), ('retained',), {}, {}),
     'lockout': (('REVOKE', 'GRANT', 'KILL CONNECTION'), ('source',), {}, {}),
     'abandon': (('DETACH DATABASE', 'ATTACH DATABASE', 'DROP DATABASE'), ('source', 'replacement'),
                 {'DETACH DATABASE': ('source',), 'ATTACH DATABASE': ('source',), 'DROP DATABASE': ('replacement',)}, {}),

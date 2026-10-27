@@ -84,7 +84,7 @@ def switched_for_release(test):
                                 'LATEST_OFFSET': 5, 'LATEST_LOADED_OFFSET': 5, 'LATEST_SUCCESSFUL_OFFSET': 5}]
     machine, _ = machine_for(h)
     machine.counts['pipelines'] = 1
-    assert machine.forward() == switch.SWITCHED, h.text()
+    assert machine.forward() == switch.COMPLETE, h.text()
     write_o2(h, [ITEM])
     pass_steps(h, 'O7', 'O8', 'O9', 'O10')
     return h
@@ -101,9 +101,17 @@ def live_state(h):
 
 
 def block_now(h, step_id, rollback=False):
-    """The notebook form of a block built from the journal as it is now (the O10 handler writes the rollback file at O10)."""
+    """The notebook form of a block built from the journal as it is now (the O10 handler writes the rollback files at O10).
+
+    For the rollback, the variant the journal calls for: through the retained copy (R1, R2b, R2c)
+    once S2b dropped the original record, else R1 and R2a.
+    """
     ctx = h.ctx()
-    return ownersql.block_for(step_id, ownersql.names_for(ctx), h.config, rollback=rollback, **ownersql.block_inputs(ctx)).to_dict()
+    names, inputs = ownersql.names_for(ctx), ownersql.block_inputs(ctx)
+    if rollback and names['source_dropped']:
+        return dict(ownersql.companion_blocks(step_id, names, h.config, rollback=True, released=inputs['released'],
+                                              app_writes_seen=inputs['app_writes_seen'], grants=inputs['grants']))['retained'].to_dict()
+    return ownersql.block_for(step_id, names, h.config, rollback=rollback, **inputs).to_dict()
 
 
 def run_dict(h, block):
@@ -861,7 +869,7 @@ class ReleaseBoundaryTests(unittest.TestCase):
         self.assertEqual(h.journal.step_status('O11'), 'failed')
         self.assertIsNone(h.journal.get_meta('release_started_utc'))
         self.assertFalse(ownersql.block_inputs(h.ctx())['released'])
-        self.assertEqual(machine_for(h)[0].rollback(), switch.NOT_STARTED, 'nothing was released, so the rollback runs')
+        self.assertEqual(machine_for(h)[0].rollback(), switch.ROLLED_BACK, 'nothing was released, so the rollback runs')
         self.assertEqual(h.fake.attachment(SRC)['STORAGE_ID'], '1028600672070281646:7367158985892520834')
         hp = Harness(self)
         write_o2(hp, [ITEM])
@@ -919,19 +927,18 @@ class ReleaseBoundaryTests(unittest.TestCase):
         The release_started_utc write guards the first statement (START PIPELINE p1 here), so the
         three points sit on the block's first check ahead of it: before, after and its journal
         event; plus an owner session that cannot open and a check that fails its expectation. The
-        machine's proof passes and the rollback block runs R1 to R3. The rerun of O11 starts p1
+        machine's proof passes and the rollback block through the retained copy runs R1 and R2b. The rerun of O11 starts p1
         once and stamps both times; after a retention gap it fails at the kit's retention check
         instead, and the rollback stays open.
         """
         for case in EARLY_STOPS:
             with self.subTest(case=case):
                 h = self.stop_o11_before_its_first_statement(case)
-                h.fake.refuse_read_only_drop = False  # R3 drops the retained copy attached READ ONLY, which Helios 10.8.0 refuses with 2720 (W3 replaces R3 with the cleanup flow)
                 before = list(h.fake.writes)
                 machine_for(h)[0].zero_change_proof()
                 self.assertEqual(h.fake.writes, before, 'the proof reads only')
-                result = run_rollback_block(h)
-                self.assertEqual((result['status'], result['statements']), ('passed', 3), 'nothing was released, so the rollback runs')
+                result = run_rollback_block(h, retained=True)
+                self.assertEqual((result['status'], result['statements']), ('passed', 2), 'nothing was released, so the rollback runs')
                 self.assertEqual((h.fake.attachment(SRC)['STORAGE_ID'], h.fake.attachment(SRC)['ATTACH_TYPE']), ('1028600672070281646:7367158985892520834', 'READWRITE'))
                 h = self.stop_o11_before_its_first_statement(case)
                 out = h.step('O11', redo=True)
@@ -959,7 +966,6 @@ class ReleaseBoundaryTests(unittest.TestCase):
         for point in FAULT_POINTS:
             with self.subTest(point=point):
                 h = switched_for_release(self)
-                h.fake.refuse_read_only_drop = False  # R3 drops the retained copy attached READ ONLY, which Helios 10.8.0 refuses with 2720 (W3 replaces R3 with the cleanup flow)
                 stale = block_now(h, 'O10', rollback=True)
                 h.fake.fail_statement(r'^START PIPELINE', 'after' if point == 'journal' else point, crash=(point == 'journal'))
                 if point == 'journal':
@@ -972,7 +978,7 @@ class ReleaseBoundaryTests(unittest.TestCase):
                 if point == 'before':
                     self.assertEqual(live_state(h), ['Stopped'])
                     result = run_dict(h, stale)
-                    self.assertEqual((result['status'], result['statements']), ('passed', 3), 'nothing was released, so the rollback runs')
+                    self.assertEqual((result['status'], result['statements']), ('passed', 2), 'nothing was released, so the rollback runs (R1, R2b)')
                     self.assertEqual(h.fake.attachment(SRC)['STORAGE_ID'], '1028600672070281646:7367158985892520834')
                     continue
                 self.assertEqual(live_state(h), ['Running'])
@@ -1000,7 +1006,7 @@ class ReleaseBoundaryTests(unittest.TestCase):
                 h.journal.conn.execute("DELETE FROM meta WHERE key = 'release_started_utc'")
                 self.assertIsNone(switch.rollback_refusal(h.journal), 'the journal alone no longer refuses')
                 if point == 'before':
-                    self.assertEqual(machine_for(h)[0].rollback(), switch.NOT_STARTED, 'START never reached the server')
+                    self.assertEqual(machine_for(h)[0].rollback(), switch.ROLLED_BACK, 'START never reached the server')
                     continue
                 before = list(h.fake.writes)
                 with self.assertRaisesRegex(KitError, 'reconcile first.*1 pipeline Running on the live name'):
@@ -1034,7 +1040,7 @@ class ReleaseBoundaryTests(unittest.TestCase):
                 self.assertIsNotNone(h.journal.get_meta('release_started_utc'), 'recorded just before the first GRANT')
                 h.journal.conn.execute("DELETE FROM meta WHERE key = 'release_started_utc'")
                 if point == 'before':
-                    self.assertEqual(machine_for(h)[0].rollback(), switch.NOT_STARTED, 'the privilege is still withheld')
+                    self.assertEqual(machine_for(h)[0].rollback(), switch.ROLLED_BACK, 'the privilege is still withheld')
                     continue
                 before = list(h.fake.writes)
                 with self.assertRaisesRegex(KitError, "reconcile first.*'app'@'%' holds 1 of the write privileges the lockout took on " + re.escape(scope)):
@@ -1820,7 +1826,7 @@ class LockoutTests(unittest.TestCase):
                     self.assertEqual(h.fake.processlist, [])
                     self.assertEqual(h.fake.killed.count(21), 0 if statement == 'REVOKE' else 1)
                     machine, _ = machine_for(h)
-                    self.assertEqual(machine.forward(), switch.SWITCHED, h.text())
+                    self.assertEqual(machine.forward(), switch.COMPLETE, h.text())
                     self.assertEqual(len(detaches(h)), 1)
 
     def test_o3_lockout_needs_the_owner_and_owner_sql_prints_the_plan(self):

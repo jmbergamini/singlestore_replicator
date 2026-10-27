@@ -38,7 +38,7 @@ class DefaultsTests(unittest.TestCase):
         self.assertEqual(cfg.pipelines.credentials_env['KAFKA'], 'S2REBUILD_KAFKA_CREDENTIALS')
         self.assertEqual(cfg.estimate.baseline, 'customer/baseline.json')
         self.assertEqual(cfg.estimate.band_percent, 15)
-        self.assertEqual(cfg.closeout.retain_days, 7)
+        self.assertEqual(cfg.closeout.retain_days, 90)
         self.assertEqual(cfg.closeout.flexible_parallelism, 0.5)
         self.assertEqual(cfg.paths.runs_dir, 'customer/runs')
         db = cfg.databases[0]

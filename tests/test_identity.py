@@ -17,7 +17,7 @@ from s2rebuild.journal import COLUMNS, Journal, create_table_sql
 from s2rebuild.sqlutil import read_guard
 from tests.test_abandon import frozen_with_replacement
 from tests.test_copy import SRC, TGT
-from tests.test_switch import RET, SID, machine_for, switched_harness
+from tests.test_switch import RET, SID, machine_for, old_kit_switch, switched_harness
 
 
 def attach_writes(h):
@@ -36,16 +36,19 @@ def live_record(h, name):
 
 class RecordIdentityTests(unittest.TestCase):
     def test_rollback_detaches_the_live_branch_not_the_parent_and_re_attaches_the_original_by_its_syntax(self):
-        """R1 detaches the live pitr record and leaves its parent, the replacement, attached; R2 runs the detached original's own ATTACH_SYNTAX."""
+        """R1 detaches the live pitr record and leaves its parent, the replacement, attached; R2a runs the detached original's own ATTACH_SYNTAX.
+
+        A switch made without S2b (old_kit_switch) still has the detached original record, so the rollback takes R2a.
+        """
         h = switched_harness(self)
-        machine, names = machine_for(h)
-        self.assertEqual(machine.forward(), switch.SWITCHED, h.text())
+        machine, names = old_kit_switch(h)
+        self.assertEqual(machine.position(), switch.SWITCHED, h.text())
         detached_original = h.journal.attachment('source')
         self.assertEqual((detached_original['record_type'], detached_original['is_detached'], detached_original['compute_id']), ('create', 1, 'cid-1'))
         self.assertTrue(detached_original['attach_syntax'].startswith("ATTACH DATABASE `%s` AT MILESTONE '" % SRC), 'S1 recorded the detached record')
         parent = dict(h.fake.attachment(TGT))
         self.assertEqual(h.fake.attachment(SRC)['STORAGE_ID'], parent['STORAGE_ID'], 'the live name is a branch on the parent storage')
-        self.assertEqual(machine.rollback(), switch.NOT_STARTED, h.text())
+        self.assertEqual(machine.rollback(), switch.ORIGINAL_ATTACHED, h.text())
         self.assertEqual(h.fake.attachment(TGT), parent, 'the parent is untouched')
         live = next(b for b in h.fake.branches if b['DATABASE_NAME'] == SRC and b['ATTACH_TYPE'] == 'pitr')
         self.assertEqual((live['IS_DETACHED'], live['IS_DROPPED']), (1, 0), 'the live branch is detached, not dropped')
@@ -53,16 +56,15 @@ class RecordIdentityTests(unittest.TestCase):
         self.assertEqual((source['ATTACH_TYPE'], source['STORAGE_ID'], source['COMPUTE_ID']), ('READWRITE', SID, 'cid-1'))
         writes = attach_writes(h)
         self.assertEqual(writes[-2], 'DETACH DATABASE `%s`' % SRC)
-        self.assertEqual(writes[-1], detached_original['attach_syntax'], 'R2 is the recorded ATTACH_SYNTAX, not ATTACH ... STORAGEID')
-        self.assertEqual(h.fake.attachment(RET)['ATTACH_TYPE'], 'READONLY', 'R3 did not run')
-        self.assertEqual(h.journal.attachment('source')['is_detached'], 0, 'R2 recorded the original attached again')
+        self.assertEqual(writes[-1], detached_original['attach_syntax'], 'R2a is the recorded ATTACH_SYNTAX, not ATTACH ... STORAGEID')
+        self.assertEqual(h.fake.attachment(RET)['ATTACH_TYPE'], 'READONLY', 'no rollback step drops the retained copy')
+        self.assertEqual(h.journal.attachment('source')['is_detached'], 0, 'R2a recorded the original attached again')
 
     def test_a_statement_refuses_when_the_record_differs_and_issues_nothing(self):
         """Another actor replaced the live record by a new branch of the replacement: R1 refuses with both records printed and detaches nothing;
         a source record that differs from the journal refuses S1 before the DETACH."""
         h = switched_harness(self)
-        machine, names = machine_for(h)
-        machine.forward()
+        machine, names = old_kit_switch(h)
         recorded = h.journal.attachment('live')
         cur = h.fake.connect('admin').cursor()
         cur.execute('DETACH DATABASE `%s`' % SRC)
@@ -101,11 +103,10 @@ class RecordIdentityTests(unittest.TestCase):
         self.assertIsNone(h.journal.get_meta('abandoned_utc'))
 
     def test_a_second_record_under_the_live_name_never_matches_the_live_record(self):
-        """After the switch the live name carries two records, the detached original (create) and the live branch (pitr); identify returns
-        the attached one, even when the original is expected, and the two never match."""
+        """After a switch without S2b the live name carries two records, the detached original (create) and the live branch (pitr); identify
+        returns the attached one, even when the original is expected, and the two never match."""
         h = switched_harness(self)
-        machine, names = machine_for(h)
-        machine.forward()
+        machine, names = old_kit_switch(h)
         session = h.sessions.runner(read_guard())
         try:
             found = switch.records(session, SRC)
@@ -200,7 +201,7 @@ class RecordIdentityTests(unittest.TestCase):
         statements = [item.sql for item in before.statements]
         self.assertEqual(statements[1], "ATTACH DATABASE `%s` AT MILESTONE '<source_milestone>' STORAGEID %s COMPUTEID cid-1" % (SRC, SID))
         self.assertIn('Generate this block again after S1', before.render())
-        self.assertEqual(ownersql.placeholders(before.render()), ['<live_cid>', '<live_sid>', '<retained_cid>', '<retained_sid>', '<source_milestone>'])
+        self.assertEqual(ownersql.placeholders(before.render()), ['<live_cid>', '<live_sid>', '<source_milestone>'])
         ownersql.guard_check_block(before, ctx)
         machine, _ = machine_for(h)
         machine.s1()
@@ -209,7 +210,7 @@ class RecordIdentityTests(unittest.TestCase):
         self.assertEqual(syntax, h.journal.attachment('source')['attach_syntax'])
         self.assertTrue(syntax.startswith("ATTACH DATABASE `%s` AT MILESTONE '" % SRC) and syntax.endswith(' STORAGEID %s COMPUTEID cid-1' % SID))
         self.assertNotIn('Generate this block again after S1', after.render())
-        self.assertIn('-- CHECK R2 before: the original record is detached with its ATTACH_SYNTAX; expect LATEST_COMPUTE_ID = cid-1, ATTACH_TYPE = create',
+        self.assertIn('-- CHECK R2a before: the original record is detached with its ATTACH_SYNTAX; expect LATEST_COMPUTE_ID = cid-1, ATTACH_TYPE = create',
                       after.render())
         self.assertIn('never deleted in the Portal by STORAGE_ID', after.render())
 

@@ -160,7 +160,7 @@ SCHEMA = {
         'band_percent': Field('int', 15, minimum=0, maximum=100),
     },
     'closeout': {
-        'retain_days': Field('int', 7, minimum=0),
+        'retain_days': Field('int', 90, minimum=1),
         'flexible_parallelism': Field('number', 0.5, nullable=True),
     },
     'paths': {

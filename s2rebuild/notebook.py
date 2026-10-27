@@ -172,4 +172,6 @@ def blocks_for_run(ctx, items=None, grant_snapshot=None):
         blocks['O3-' + variant] = b
     blocks['O10'] = ownersql.block_for('O10', names, ctx.config, **inputs)
     blocks['O10-rollback'] = ownersql.block_for('O10', names, ctx.config, rollback=True, **inputs)
+    for variant, b in ownersql.companion_blocks('O10', names, ctx.config, rollback=True, **inputs):
+        blocks['O10-rollback-' + variant] = b
     return names, blocks, inputs

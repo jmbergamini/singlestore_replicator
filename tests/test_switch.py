@@ -238,85 +238,41 @@ def ownerlib():
     return ns
 
 
-def run_rollback_block(h):
-    """Run the rollback block as the notebook does (ownerlib on a plain cursor); returns the result dict."""
+def rollback_block_for(h, retained=False):
+    """The printed rollback block: R1 and R2a, or with retained=True the companion through the retained copy (R1, R2b, R2c)."""
     ctx = h.ctx()
-    block = ownersql.block_for('O10', ownersql.names_for(ctx), h.config, rollback=True, **ownersql.block_inputs(ctx))
+    names, inputs = ownersql.names_for(ctx), ownersql.block_inputs(ctx)
+    if retained:
+        return dict(ownersql.companion_blocks('O10', names, h.config, rollback=True, released=inputs['released'],
+                                              app_writes_seen=inputs['app_writes_seen'], grants=inputs['grants']))['retained']
+    return ownersql.block_for('O10', names, h.config, rollback=True, **inputs)
+
+
+def run_rollback_block(h, retained=False):
+    """Run the rollback block as the notebook does (ownerlib on a plain cursor); returns the result dict."""
+    block = rollback_block_for(h, retained)
     with contextlib.redirect_stdout(io.StringIO()):
         return ownerlib()['run_block'](h.fake.connect().cursor(), block.to_dict(), {'run_id': h.run_id})
 
 
-RELEASED_LONG_AGO = '2026-01-01T07:00:00Z'
-DROP_LABELS = {RET: 'drop the retained read-only branch', TGT: 'drop the replacement (the live branch is independent of it)'}
+def old_kit_switch(h):
+    """A switch made without S2b and S4 (an older kit): the machine's S1 and S2, then S3 by hand on the fake with the live record recorded.
 
-
-def cleanup_harness(test):
-    """A harness after the switch, O11 to C2 passed and released_utc far enough in the past that C3 is due."""
-    h = switched_harness(test)
-    # C3 drops the retained copy while it is attached READ ONLY, which Helios 10.8.0 refuses with 2720 (fact 28; W3 replaces this
-    # flow with the detach, re-attach read write by syntax, drop sequence); these tests cover the identity checks of the DROPs,
-    # which go by the branch record (name, STORAGE_ID, ATTACH_TYPE, COMPUTE_ID) on the shared STORAGE_ID of fact 27
-    h.fake.refuse_read_only_drop = False
-    machine, _ = machine_for(h)
-    assert machine.forward() == switch.SWITCHED, h.text()
-    for step_id in ('O7', 'O8', 'O9', 'O10', 'O11', 'C1', 'C2'):
-        h.journal.step_end(step_id, 'passed', 'test')
-    h.journal.set_meta('released_utc', RELEASED_LONG_AGO)
-    return h
-
-
-def drops(h, name):
-    """Every DROP DATABASE of name the fake saw (a DROP of a name that is not there counts too)."""
-    return [w for w in h.fake.writes if w == 'DROP DATABASE `%s`' % name]
-
-
-def arm_drop(test, h, name, point):
-    """Arm a failure at one of FAULT_POINTS around the C3 DROP of name; returns the exception run_step raises, or None for a refusal.
-
-    before: the server never sees the DROP. after: the DROP is applied and the reply is lost.
-    journal: the DROP is applied and the kit dies before its owner_statement event.
+    The workspace then holds four entries: the detached original and the live branch under the
+    live name, the replacement and the retained copy. Returns (machine, names) read afterwards.
     """
-    if point == 'journal':
-        crash_journal(test, h.journal, 'event', match=lambda kind, detail: kind == 'owner_statement' and detail == 'C3 ' + DROP_LABELS[name])
-        return SimulatedCrash
-    h.fake.fail_statement(r'^DROP DATABASE `%s`$' % name, point)
-    return None
-
-
-def run_cleanup_block(h):
-    """Run the C3 block as the notebook does (ownerlib on a plain cursor); returns the result dict."""
-    block = ownersql.block_for('C3', ownersql.names_for(h.ctx()))
-    with contextlib.redirect_stdout(io.StringIO()):
-        return ownerlib()['run_block'](h.fake.connect('ops_owner').cursor(), block.to_dict(), {'run_id': h.run_id})
-
-
-def reuse_name(h, name):
-    """Another actor drops the database under name and creates a new one there (a new STORAGE_ID, READWRITE)."""
-    cur = h.fake.connect('admin').cursor()
-    cur.execute('DROP DATABASE `%s`' % name)
-    cur.execute('CREATE DATABASE `%s` PARTITIONS 4 SUB_PARTITIONS 0' % name)
-
-
-# The skip_if query of a C3 DROP; change_before on it puts another actor between the identity checks and the DROP.
-SKIP_QUERY = r'^SELECT COUNT\(\*\) = 0 AS n FROM information_schema\.MV_CLOUD_BRANCHES WHERE DATABASE_NAME = %s'
-
-
-def move_attachment(fake, name, new_name):
-    """Another actor detaches the database under name and attaches the same STORAGE_ID under new_name, with the same attach type."""
-    att = dict(fake.attachment(name))
-    cur = fake.connect('admin').cursor()
-    cur.execute('DETACH DATABASE `%s`' % name)
-    cur.execute("ATTACH DATABASE `%s`%s STORAGEID %s" % (new_name, ' READ ONLY' if att['ATTACH_TYPE'] == 'READONLY' else '', att['STORAGE_ID']))
-
-
-def drift_name(h, **names):
-    """The configuration names another retained or replacement database than the run recorded (h.db with those names replaced)."""
-    h.db = dataclasses.replace(h.db, **names)
-
-
-def attachments(h):
-    """{name: attachment row} of the fake, for a before and after comparison."""
-    return {a['DATABASE_NAME']: dict(a) for a in h.fake.attachments}
+    machine, names = machine_for(h)
+    machine.s1()
+    machine.s2()
+    h.fake.connect('ops_owner').cursor().execute('ATTACH DATABASE `%s` AS `%s` STORAGEID %s' % (TGT, SRC, names['replacement_sid']))
+    session = h.sessions.runner(read_guard())
+    try:
+        switch.journal_record(h.journal, 'live', switch.identify(session, SRC))
+    finally:
+        session.close()
+    h.journal.set_meta('switched_utc', '2026-11-01T06:30:00Z')
+    h.journal.event('switch_statement', 'S3 ATTACH replacement AS source')
+    return machine_for(h)
 
 
 class ExpectAndBlockTests(unittest.TestCase):
@@ -387,33 +343,35 @@ class MachineTests(unittest.TestCase):
         h = switched_harness(self)
         machine, names = machine_for(h)
         self.assertEqual(machine.position(), switch.NOT_STARTED)
-        self.assertEqual(machine.forward(), switch.SWITCHED)
+        self.assertEqual(machine.forward(), switch.COMPLETE)
         live = h.fake.attachment(SRC)
         self.assertEqual(live['ATTACH_TYPE'], 'READWRITE')
         self.assertEqual(live['STORAGE_ID'], names['replacement_sid'], 'Helios keeps the replacement STORAGE_ID for the live branch')
-        self.assertNotEqual(live['COMPUTE_ID'], h.fake.attachment(TGT)['COMPUTE_ID'], 'the live name is its own branch record')
+        self.assertNotEqual(live['COMPUTE_ID'], h.journal.attachment('replacement')['compute_id'], 'the live name is its own branch record')
+        self.assertIsNone(h.fake.attachment(TGT), 'S4 dropped the replacement record')
         self.assertEqual(h.fake.attachment(RET)['ATTACH_TYPE'], 'READONLY')
         self.assertEqual(h.journal.attachment('live')['storage_id'], live['STORAGE_ID'])
         self.assertEqual(h.journal.attachment('retained')['database_name'], RET)
         self.assertEqual(h.fake.databases[SRC]['layout']['NUM_SUB_PARTITIONS'], 512, 'the live name has the target layout')
         self.assertIsNotNone(h.journal.get_meta('switched_utc'))
-        self.assertEqual(sum(1 for w in h.fake.writes if w.startswith(('DETACH', 'ATTACH'))), 3)
-        self.assertEqual(machine.forward(), switch.SWITCHED, 'a rerun at switched reruns the after-checks and issues nothing')
-        self.assertEqual(sum(1 for w in h.fake.writes if w.startswith(('DETACH', 'ATTACH'))), 3)
+        moves = [w for w in h.fake.writes if w.startswith(('DETACH', 'ATTACH', 'DROP DATABASE'))]
+        self.assertEqual(len(moves), 6, 'S1, S2, S2b attach and drop, S3, S4')
+        self.assertEqual(machine.forward(), switch.COMPLETE, 'a rerun at complete reruns the after-checks and the gate and issues nothing')
+        self.assertEqual([w for w in h.fake.writes if w.startswith(('DETACH', 'ATTACH', 'DROP DATABASE'))], moves)
 
     def test_forward_accepts_a_live_branch_on_the_replacement_storage_id(self):
         """Helios 10.8.0 (October 27, 2026): ATTACH replacement AS live keeps the replacement's STORAGE_ID; the live name is still its own branch."""
         h = switched_harness(self)
         h.fake.branch_keeps_storage_id = True
         machine, names = machine_for(h)
-        self.assertEqual(machine.forward(), switch.SWITCHED, h.text())
-        live, replacement = h.fake.attachment(SRC), h.fake.attachment(names['replacement'])
+        self.assertEqual(machine.forward(), switch.COMPLETE, h.text())
+        live, replacement = h.fake.attachment(SRC), h.journal.attachment('replacement')
         self.assertEqual(live['STORAGE_ID'], names['replacement_sid'], 'the fake keeps the storage id, as Helios does')
-        self.assertNotEqual(live['COMPUTE_ID'], replacement['COMPUTE_ID'])
+        self.assertNotEqual(live['COMPUTE_ID'], replacement['compute_id'])
         self.assertIn('the live name is its own branch of the replacement', h.text())
         self.assertEqual(h.journal.attachment('live')['storage_id'], names['replacement_sid'])
-        self.assertEqual(machine.position(), switch.SWITCHED)
-        self.assertEqual(machine.forward(), switch.SWITCHED, 'a rerun at switched reruns the after-checks and issues nothing')
+        self.assertEqual(machine.position(), switch.COMPLETE)
+        self.assertEqual(machine.forward(), switch.COMPLETE, 'a rerun at complete reruns the after-checks and issues nothing')
 
     def test_the_replacement_storage_id_without_a_branch_row_is_refused(self):
         h = switched_harness(self)
@@ -421,6 +379,7 @@ class MachineTests(unittest.TestCase):
         machine, names = machine_for(h)
         machine.s1()
         machine.s2()
+        machine.s2b()
         h.fake.branches.append({'STORAGE_ID': 'x', 'DATABASE_NAME': 'x', 'IS_DETACHED': 0, 'IS_ATTACHED_TO_THIS_COMPUTE': 1, 'IS_ATTACHABLE': 1,
                                 'IS_DROPPED': 0, 'PREV_DATABASE_NAME': None, 'LATEST_ATTACH_TIME': 'now'})
         real = switch.live_is_branch_of_replacement
@@ -450,8 +409,20 @@ class MachineTests(unittest.TestCase):
         self.assertEqual(machine.position(), switch.RETAINED)
         with self.assertRaisesRegex(KitError, 'S2 refused'):
             machine.s2()
+        with self.assertRaisesRegex(KitError, 'S3 refused: the switch is at "retained attached", not "original record dropped"'):
+            machine.s3()
+        with self.assertRaisesRegex(KitError, 'S4 refused'):
+            machine.s4()
+        machine.s2b()
+        self.assertEqual(machine.position(), switch.SOURCE_DROPPED)
+        with self.assertRaisesRegex(KitError, 'S2b refused'):
+            machine.s2b()
         machine.s3()
         self.assertEqual(machine.position(), switch.SWITCHED)
+        with self.assertRaisesRegex(KitError, 'S3 refused'):
+            machine.s3()
+        machine.s4()
+        self.assertEqual(machine.position(), switch.COMPLETE)
 
     def test_s3_preconditions_are_checked_before_the_source_is_detached(self):
         h = switched_harness(self)
@@ -530,14 +501,16 @@ class MachineTests(unittest.TestCase):
 
     def test_rollback_from_every_position_and_its_refusals(self):
         h = switched_harness(self)
-        h.fake.refuse_read_only_drop = False  # R3 drops the retained copy attached READ ONLY, which Helios 10.8.0 refuses with 2720 (W3 replaces R3 with the cleanup flow)
         machine, _ = machine_for(h)
         machine.forward()
-        self.assertEqual(machine.rollback(drop_retained=True), switch.NOT_STARTED)
+        self.assertEqual(machine.rollback(), switch.ROLLED_BACK, 'after S2b the rollback goes through the retained copy')
         src = h.fake.attachment(SRC)
         self.assertEqual((src['STORAGE_ID'], src['ATTACH_TYPE']), ('1028600672070281646:7367158985892520834', 'READWRITE'))
-        self.assertIsNone(h.fake.attachment(RET))
+        self.assertEqual(h.fake.attachment(RET)['ATTACH_TYPE'], 'READONLY', 'no rollback step drops the retained copy')
         self.assertIsNotNone(h.journal.get_meta('rolled_back_utc'))
+        self.assertEqual(machine.rollback(), switch.ROLLED_BACK, 'a second rollback issues nothing')
+        with self.assertRaisesRegex(KitError, 'a rollback ran through it'):
+            machine.forward()
         h2 = switched_harness(self)
         machine2, _ = machine_for(h2)
         machine2.s1()
@@ -562,7 +535,7 @@ class MachineTests(unittest.TestCase):
         self.assertEqual(machine2.position(), switch.LIVE_DETACHED)
         with self.assertRaisesRegex(KitError, 'a rollback is in progress'):
             machine2.forward()
-        self.assertEqual(machine2.rollback(), switch.NOT_STARTED)
+        self.assertEqual(machine2.rollback(), switch.ROLLED_BACK)
 
     def test_a_failed_statement_reports_the_position(self):
         h = switched_harness(self)
@@ -601,7 +574,7 @@ class PathBSwitchTests(unittest.TestCase):
             self.assertIn('FAILED', h.journal.events('switch_check')[-1])
         lockout.record_pass(h.journal, True)
         machine, names = machine_for(h)
-        self.assertEqual(machine.forward(), switch.SWITCHED, h.text())
+        self.assertEqual(machine.forward(), switch.COMPLETE, h.text())
         self.assertEqual(len(detaches(h)), 1)
         note = '-- NOTE: S1 before (Path B): the last lockout pass was quiet within 60 s (freeze.quiet_max_age_seconds).'
         self.assertIn(note, switch.forward_block(names).render())
@@ -786,7 +759,7 @@ class RollbackBoundaryTests(unittest.TestCase):
         machine2, _ = machine_for(h)
         self.assertEqual(machine2.position(), switch.SWITCHED)
         with self.assertRaisesRegex(KitError, 'reconcile first') as caught:
-            machine2.rollback(drop_retained=True)
+            machine2.rollback()
         self.assertIn('t_comp holds 301 rows, the copy had 300', str(caught.exception))
         self.assertNotIn('t_single', str(caught.exception), 'only the tables that differ are listed')
         self.assertEqual(h.fake.writes, before, 'nothing was issued')
@@ -809,7 +782,7 @@ class RollbackBoundaryTests(unittest.TestCase):
                     machine.forward()
                 self.assertEqual(len(s3_writes(h)), 0 if point == 'before' else 1)
                 rerun, _ = machine_for(h)
-                self.assertEqual(rerun.forward(), switch.SWITCHED, 'the rerun continues from the live position')
+                self.assertEqual(rerun.forward(), switch.COMPLETE, 'the rerun continues from the live position')
                 self.assertEqual(len(s3_writes(h)), 1, 'S3 is issued exactly once')
                 live_sid = h.journal.attachment('live')['storage_id']
                 app_write(h)
@@ -830,10 +803,10 @@ class RollbackBoundaryTests(unittest.TestCase):
                 with self.assertRaises(raised):
                     machine.forward()
                 if point == 'before':
-                    self.assertEqual(machine_for(h)[0].position(), switch.RETAINED, 'nothing is attached under the live name')
+                    self.assertEqual(machine_for(h)[0].position(), switch.SOURCE_DROPPED, 'nothing is attached under the live name')
                 else:
                     machine_for(h)[0].forward()
-                self.assertEqual(machine_for(h)[0].rollback(), switch.NOT_STARTED)
+                self.assertEqual(machine_for(h)[0].rollback(), switch.ROLLED_BACK)
                 src = h.fake.attachment(SRC)
                 self.assertEqual((src['STORAGE_ID'], src['ATTACH_TYPE']), ('1028600672070281646:7367158985892520834', 'READWRITE'))
                 proofs = h.journal.events('rollback_proof')
@@ -855,7 +828,7 @@ class RollbackBoundaryTests(unittest.TestCase):
             machine.rollback()
         self.assertEqual(h.fake.writes, before)
         h.fake.processlist = []
-        self.assertEqual(machine.rollback(), switch.NOT_STARTED, 'once the session is gone the proof passes')
+        self.assertEqual(machine.rollback(), switch.ROLLED_BACK, 'once the session is gone the proof passes')
 
     def test_f1_rollback_refused_when_a_planned_table_has_no_target_count(self):
         h = switched_harness(self)
@@ -872,11 +845,9 @@ class RollbackBoundaryTests(unittest.TestCase):
 
     def test_f1_rollback_block_carries_the_zero_change_proof_before_r1(self):
         h = switched_harness(self)
-        h.fake.refuse_read_only_drop = False  # R3 drops the retained copy attached READ ONLY, which Helios 10.8.0 refuses with 2720 (W3 replaces R3 with the cleanup flow)
         machine, _ = machine_for(h)
         machine.forward()
-        ctx = h.ctx()
-        text = ownersql.block_for('O10', ownersql.names_for(ctx), h.config, rollback=True, **ownersql.block_inputs(ctx)).render()
+        text = rollback_block_for(h, retained=True).render()
         detach_at = text.index('DETACH DATABASE `%s`;' % SRC)
         for table, count in (('t_comp', 300), ('t_empty', 0), ('t_nokey', 500), ('t_single', 700)):
             check = '-- CHECK R1 before (zero-change proof): %s holds the copied row count; expect n = %d' % (table, count)
@@ -888,9 +859,9 @@ class RollbackBoundaryTests(unittest.TestCase):
                         detach_at)
         self.assertNotIn('holds none of the write privileges', text, 'no lockout snapshot, so no privilege check')
         self.assertNotIn('-- STOP', text)
-        result = run_rollback_block(h)
+        result = run_rollback_block(h, retained=True)
         self.assertEqual(result['status'], 'passed', result)
-        self.assertEqual(result['statements'], 3, 'R1, R2 and R3')
+        self.assertEqual((result['statements'], len(result['skipped'])), (2, 2), 'R1 and R2b; the two R2c statements skipped')
         src = h.fake.attachment(SRC)
         self.assertEqual((src['STORAGE_ID'], src['ATTACH_TYPE']), ('1028600672070281646:7367158985892520834', 'READWRITE'))
 
@@ -903,7 +874,6 @@ class RollbackBoundaryTests(unittest.TestCase):
         for point in FAULT_POINTS:
             with self.subTest(point=point):
                 h = switched_harness(self)
-                h.fake.refuse_read_only_drop = False  # R3 drops the retained copy attached READ ONLY, which Helios 10.8.0 refuses with 2720 (W3 replaces R3 with the cleanup flow)
                 machine, _ = machine_for(h)
                 machine.forward()
                 if point == 'journal':
@@ -913,15 +883,15 @@ class RollbackBoundaryTests(unittest.TestCase):
                     h.fake.fail_statement(r'^DETACH DATABASE `%s`$' % SRC, point)
                     raised = KitError
                 with self.assertRaises(raised):
-                    machine.rollback(drop_retained=True)
+                    machine.rollback()
                 self.assertIsNotNone(h.journal.get_meta('rollback_started_utc'), 'the proof passed before R1')
-                self.assertEqual(machine_for(h)[0].position(), switch.SWITCHED if point == 'before' else switch.LIVE_DETACHED)
-                self.assertEqual(machine_for(h)[0].rollback(drop_retained=True), switch.NOT_STARTED)
+                self.assertEqual(machine_for(h)[0].position(), switch.COMPLETE if point == 'before' else switch.LIVE_DETACHED)
+                self.assertEqual(machine_for(h)[0].rollback(), switch.ROLLED_BACK)
                 self.assertEqual(len(h.journal.events('rollback_proof')), 2 if point == 'before' else 1)
                 self.assertEqual(len([w for w in h.fake.writes if w == 'DETACH DATABASE `%s`' % SRC]), 2, 'S1 and one R1, never R1 twice')
                 src = h.fake.attachment(SRC)
                 self.assertEqual((src['STORAGE_ID'], src['ATTACH_TYPE']), ('1028600672070281646:7367158985892520834', 'READWRITE'))
-                self.assertIsNone(h.fake.attachment(RET), 'R3 ran')
+                self.assertEqual(h.fake.attachment(RET)['ATTACH_TYPE'], 'READONLY', 'no rollback step drops the retained copy')
                 self.assertIsNotNone(h.journal.get_meta('rolled_back_utc'))
 
     def test_f1_behind_s3_the_notebook_block_stops_and_the_hand_route_finishes_from_r2(self):
@@ -933,13 +903,12 @@ class RollbackBoundaryTests(unittest.TestCase):
         for point in FAULT_POINTS:
             with self.subTest(point=point):
                 h = switched_harness(self)
-                h.fake.refuse_read_only_drop = False  # R3 drops the retained copy attached READ ONLY, which Helios 10.8.0 refuses with 2720 (W3 replaces R3 with the cleanup flow)
                 machine, _ = machine_for(h)
                 if point == 'before':
                     h.fake.fail_statement(S3_PATTERN, 'before')
                     with self.assertRaises(KitError):
                         machine.forward()
-                    expected = switch.RETAINED
+                    expected = switch.SOURCE_DROPPED
                 else:
                     machine.forward()
                     if point == 'journal':
@@ -950,21 +919,20 @@ class RollbackBoundaryTests(unittest.TestCase):
                         machine.rollback()
                     expected = switch.LIVE_DETACHED
                 self.assertEqual(machine_for(h)[0].position(), expected)
-                ctx = h.ctx()
-                block = ownersql.block_for('O10', ownersql.names_for(ctx), h.config, rollback=True, **ownersql.block_inputs(ctx))
+                block = rollback_block_for(h, retained=True)
                 self.assertIn('The notebook runs every item in order, so there the first proof check stops the block before any statement',
                               block.render())
                 before = list(h.fake.writes)
-                result = run_rollback_block(h)
+                result = run_rollback_block(h, retained=True)
                 self.assertNotEqual(result['status'], 'passed')
                 self.assertEqual(result['statements'], 0)
                 self.assertEqual(h.fake.writes, before, 'the notebook route issued nothing')
-                start = next(i for i, item in enumerate(block.items) if item.label.startswith('R2 before'))
-                tail = ownersql.Block('O10', 'Rollback from R2 (by hand)')
+                start = next(i for i, item in enumerate(block.items) if item.label.startswith('R2b before'))
+                tail = ownersql.Block('O10', 'Rollback from R2b (by hand)')
                 tail.items = block.items[start:]
                 with contextlib.redirect_stdout(io.StringIO()):
                     finished = ownerlib()['run_block'](h.fake.connect().cursor(), tail.to_dict(), {'run_id': h.run_id})
-                self.assertEqual((finished['status'], finished['statements']), ('passed', 2), 'R2 and R3')
+                self.assertEqual((finished['status'], finished['statements'], len(finished['skipped'])), ('passed', 1, 2), 'R2b; R2c skipped')
                 src = h.fake.attachment(SRC)
                 self.assertEqual((src['STORAGE_ID'], src['ATTACH_TYPE']), ('1028600672070281646:7367158985892520834', 'READWRITE'))
 
@@ -976,7 +944,7 @@ class PipelinesAcrossTheSwitchTests(unittest.TestCase):
                             {'PIPELINE_NAME': 'p1', 'STATE': 'Stopped', 'DATABASE_NAME': TGT}]
         machine, _ = machine_for(h)
         machine.counts['pipelines'] = 1
-        self.assertEqual(machine.forward(), switch.SWITCHED)
+        self.assertEqual(machine.forward(), switch.COMPLETE)
         visible = sorted((p['DATABASE_NAME'], p['PIPELINE_NAME'], p['STATE']) for p in h.fake.pipelines if p.get('DATABASE_NAME'))
         self.assertIn((SRC, 'p1', 'Stopped'), visible, 'the live name carries the pipeline replayed into the replacement')
         self.assertIn((RET, 'orig', 'Stopped'), visible, 'the retained copy keeps the original pipelines, stopped')
@@ -984,18 +952,20 @@ class PipelinesAcrossTheSwitchTests(unittest.TestCase):
 
 
 class CloseoutHandlerTests(unittest.TestCase):
-    def test_c3_waits_for_retain_days_and_c4_runs_its_block(self):
+    def test_c3_passes_on_two_entries_and_c4_runs_its_block(self):
+        """C3 End state: two entries after the switch, the write probe on the retained name refused, the listing recorded; then C4 drops the runner."""
         h = switched_harness(self)
+        machine, _ = machine_for(h)
+        self.assertEqual(machine.forward(), switch.COMPLETE, h.text())
         for step_id in ('O7', 'O8', 'O9', 'O10', 'O11', 'C1', 'C2'):
             h.journal.step_end(step_id, 'passed', 'test')
+        before = list(h.fake.writes)
         out = h.step('C3', redo=True)
-        self.assertEqual(out.status, steps.REFUSED)
-        self.assertIn('needs the release time', out.note)
-        h.journal.set_meta('released_utc', '2099-01-01T00:00:00Z')
-        out = h.step('C3', redo=True)
-        self.assertEqual(out.status, steps.REFUSED)
-        self.assertIn('C3 is due after 2099-01-08', out.note)
-        h.journal.step_end('C3', 'passed', 'test')
+        self.assertEqual(out.status, steps.PASSED, h.text())
+        self.assertEqual([w for w in h.fake.writes[len(before):] if not w.startswith('DELETE FROM `%s`' % RET)], [], 'C3 issues the write probe only')
+        self.assertEqual(len(h.journal.events('endstate_probe')), 1)
+        self.assertEqual(len(h.journal.events('endstate_listing')), 1)
+        self.assertEqual(len(h.fake.portal_entries()), 2)
         out = h.step('C4', redo=True)
         self.assertEqual(out.status, steps.PASSED, h.text())
         self.assertTrue(any(w.startswith("DROP USER 's2rebuild_runner'") for w in h.fake.writes))
@@ -1021,305 +991,6 @@ class CloseoutHandlerTests(unittest.TestCase):
         live['v_run'] = FakeView(live['v_run'], 'ops_owner@%')
         self.assertEqual(h.step('C4', redo=True).status, steps.PASSED, h.text())
         self.assertTrue(any(w.startswith("DROP USER 's2rebuild_runner'") for w in h.fake.writes))
-
-
-class CleanupIdentityTests(unittest.TestCase):
-    """F3: C3 drops a name only while it holds the database the run recorded, and a rerun skips a name already gone."""
-
-    def assert_cleaned_up(self, h):
-        """Both names are gone, each was dropped exactly once, and the live name still resolves to the live branch."""
-        self.assertIsNone(h.fake.attachment(RET))
-        self.assertIsNone(h.fake.attachment(TGT))
-        self.assertEqual(len(drops(h, RET)), 1, 'the retained branch is dropped exactly once')
-        self.assertEqual(len(drops(h, TGT)), 1, 'the replacement is dropped exactly once')
-        live = h.fake.attachment(SRC)
-        self.assertEqual((live['STORAGE_ID'], live['ATTACH_TYPE']), (h.journal.attachment('live')['storage_id'], 'READWRITE'))
-
-    def test_f3_cleanup_block_checks_identity_before_each_drop(self):
-        """The C3 block in order: the live record, then both identities before the first DROP.
-
-        Each identity is four checks on the branch record (name, STORAGE_ID, ATTACH_TYPE,
-        COMPUTE_ID): the name holds the recorded STORAGE_ID and attach type or nothing, no other
-        record is attached under the name, the recorded record is attached under no other name,
-        and it is not detached. The retained checks sit directly before its DROP and the
-        replacement is checked again just before its own DROP. Each DROP is skipped unless its
-        name holds the recorded record. After each DROP the name is free and the record is
-        dropped; the live record comes last. With no retained record recorded, C3 refuses before
-        any statement.
-        """
-        h = cleanup_harness(self)
-        names = ownersql.names_for(h.ctx())
-        rsid, tsid, lsid = names['retained_sid'], names['replacement_sid'], names['live_sid']
-        rcid, tcid, lcid = names['retained_cid'], names['replacement_cid'], names['live_cid']
-        self.assertEqual((rsid, rcid), (h.fake.attachment(RET)['STORAGE_ID'], h.fake.attachment(RET)['COMPUTE_ID']), 'S2 recorded the retained record')
-        self.assertEqual((tsid, tcid), (h.fake.attachment(TGT)['STORAGE_ID'], h.fake.attachment(TGT)['COMPUTE_ID']), 'O5 recorded the replacement record')
-        self.assertEqual((rsid, tsid, lsid), (SID, tsid, tsid), 'Helios 10.8.0: the retained copy shares the original storage, the live name the replacement storage')
-        self.assertEqual((names['retained_type'], names['replacement_type'], names['live_type']), ('resume', 'create', 'pitr'))
-        views = 'FROM information_schema.MV_CLOUD_ATTACHED_DATABASES WHERE '
-        branches = 'FROM information_schema.MV_CLOUD_BRANCHES WHERE '
-        row = 'SELECT DATABASE_NAME, ATTACH_TYPE, STORAGE_ID, COMPUTE_ID, ATTACH_SYNTAX ' + views + "DATABASE_NAME = '%s';"
-        record = ('SELECT DATABASE_NAME, STORAGE_ID, ATTACH_TYPE, LATEST_COMPUTE_ID, PREV_DATABASE_NAME, IS_DETACHED, IS_DROPPED, END_VERSION, ATTACH_SYNTAX '
-                  + branches + "DATABASE_NAME = '%s' AND STORAGE_ID = '%s' AND IS_DROPPED = 0 AND IS_DETACHED = 0;")
-        otherwise = 'SELECT COUNT(*) AS n ' + views + "DATABASE_NAME = '%s' AND (STORAGE_ID <> '%s' OR ATTACH_TYPE <> '%s');"
-        other_record = 'SELECT COUNT(*) AS n ' + branches + "DATABASE_NAME = '%s' AND IS_DROPPED = 0 AND IS_DETACHED = 0 AND LATEST_COMPUTE_ID <> '%s';"
-        elsewhere = 'SELECT COUNT(*) AS n ' + branches + "STORAGE_ID = '%s' AND LATEST_COMPUTE_ID = '%s' AND IS_DROPPED = 0 AND IS_DETACHED = 0 AND DATABASE_NAME <> '%s';"
-        detached = 'SELECT COUNT(*) AS n ' + branches + "STORAGE_ID = '%s' AND LATEST_COMPUTE_ID = '%s' AND IS_DROPPED = 0 AND IS_DETACHED = 1;"
-        state = ('SELECT DATABASE_NAME, STORAGE_ID, ATTACH_TYPE, LATEST_COMPUTE_ID, IS_DETACHED, IS_DROPPED, ATTACH_SYNTAX ' + branches
-                 + "DATABASE_NAME = '%s' AND STORAGE_ID = '%s' AND LATEST_COMPUTE_ID = '%s';")
-        skip = ('-- SKIP the next statement when this returns n > 0: SELECT COUNT(*) = 0 AS n ' + branches
-                + "DATABASE_NAME = '%s' AND STORAGE_ID = '%s' AND LATEST_COMPUTE_ID = '%s' AND IS_DROPPED = 0 AND IS_DETACHED = 0;")
-        live = '; expect STORAGE_ID = %s, COMPUTE_ID = %s' % (lsid, lcid)
-        expected = [
-            '-- CHECK live name resolves to the live record' + live, row % SRC,
-            '-- CHECK live record attached under the live name; expect LATEST_COMPUTE_ID = %s, ATTACH_TYPE = pitr' % lcid, record % (SRC, lsid),
-            '-- CHECK replacement name holds the recorded replacement READWRITE, or nothing; expect n = 0', otherwise % (TGT, tsid, 'READWRITE'),
-            '-- CHECK replacement name holds no other record; expect n = 0', other_record % (TGT, tcid),
-            '-- CHECK recorded replacement record attached under no other name; expect n = 0', elsewhere % (tsid, tcid, TGT),
-            '-- CHECK recorded replacement record not detached; expect n = 0', detached % (tsid, tcid),
-            '-- CHECK retained name holds the recorded retained branch READONLY, or nothing; expect n = 0', otherwise % (RET, rsid, 'READONLY'),
-            '-- CHECK retained name holds no other record; expect n = 0', other_record % (RET, rcid),
-            '-- CHECK recorded retained record attached under no other name; expect n = 0', elsewhere % (rsid, rcid, RET),
-            '-- CHECK recorded retained record not detached; expect n = 0', detached % (rsid, rcid),
-            '-- ' + DROP_LABELS[RET], skip % (RET, rsid, rcid), 'DROP DATABASE `%s`;' % RET,
-            '-- CHECK retained is gone; expect no rows', row % RET,
-            '-- CHECK recorded retained record dropped; expect IS_DROPPED = 1', state % (RET, rsid, rcid),
-            '-- CHECK replacement name still holds the recorded replacement READWRITE, or nothing; expect n = 0', otherwise % (TGT, tsid, 'READWRITE'),
-            '-- CHECK replacement name still holds no other record; expect n = 0', other_record % (TGT, tcid),
-            '-- ' + DROP_LABELS[TGT], skip % (TGT, tsid, tcid), 'DROP DATABASE `%s`;' % TGT,
-            '-- CHECK replacement is gone; expect no rows', row % TGT,
-            '-- CHECK recorded replacement record dropped; expect IS_DROPPED = 1', state % (TGT, tsid, tcid),
-            '-- CHECK live name still resolves to the live record' + live, row % SRC,
-        ]
-        lines = ownersql.cleanup_block(names).render().splitlines()
-        self.assertEqual([line for line in lines[2:] if not line.startswith('-- NOTE: ')], expected)
-        self.assertNotIn('retained attached;', '\n'.join(lines))
-        self.assertIn('never deleted in the Portal by STORAGE_ID', lines[-1])
-        h.journal.conn.execute("DELETE FROM attachments WHERE role = 'retained'")
-        before = list(h.fake.writes)
-        out = h.step('C3')
-        self.assertEqual(out.status, steps.REFUSED)
-        self.assertIn('C3 cannot run: retained not recorded', out.note)
-        self.assertEqual(h.fake.writes, before, 'nothing is dropped without the recorded identity')
-
-    def test_f3_another_database_under_the_retained_name_refuses_with_nothing_dropped(self):
-        """A reused retained or replacement name, the retained branch attached READWRITE or the replacement attached READONLY.
-
-        Both routes (kit step C3 and the notebook ownerlib run_block) stop at the identity check of
-        that name, before any DROP.
-        """
-        cases = {
-            'retained name reused': (lambda h: reuse_name(h, RET), 'retained name holds the recorded retained branch READONLY, or nothing'),
-            'retained attached READWRITE': (lambda h: h.fake.attachment(RET).update(ATTACH_TYPE='READWRITE'),
-                                            'retained name holds the recorded retained branch READONLY, or nothing'),
-            'replacement name reused': (lambda h: reuse_name(h, TGT), 'replacement name holds the recorded replacement READWRITE, or nothing'),
-            'replacement attached READONLY': (lambda h: h.fake.attachment(TGT).update(ATTACH_TYPE='READONLY'),
-                                              'replacement name holds the recorded replacement READWRITE, or nothing'),
-        }
-        for case, (change, label) in cases.items():
-            for route in ('kit', 'notebook'):
-                with self.subTest(case=case, route=route):
-                    h = cleanup_harness(self)
-                    change(h)
-                    other = {n: dict(h.fake.attachment(n)) for n in (RET, TGT)}
-                    before = list(h.fake.writes)
-                    if route == 'kit':
-                        out = h.step('C3')
-                        self.assertEqual(out.status, steps.REFUSED)
-                        self.assertIn('C3 stopped at check "%s": expected n = 0, observed n = 1' % label, out.note)
-                        self.assertEqual(h.journal.step_status('C3'), 'pending')
-                    else:
-                        result = run_cleanup_block(h)
-                        self.assertEqual(result['status'], 'FAILED at check ' + label)
-                        self.assertEqual(result['statements'], 0)
-                    self.assertEqual(h.fake.writes, before, 'nothing was dropped')
-                    self.assertEqual({n: h.fake.attachment(n) for n in (RET, TGT)}, other)
-
-    def test_f3_first_drop_done_second_failed_rerun_drops_only_the_replacement(self):
-        """The retained DROP succeeds and the replacement DROP fails: the rerun (kit or notebook) skips the retained name and finishes."""
-        for route in ('kit', 'notebook'):
-            with self.subTest(route=route):
-                h = cleanup_harness(self)
-                h.fake.fail_statement(r'^DROP DATABASE `%s`$' % TGT, 'before')
-                out = h.step('C3')
-                self.assertEqual(out.status, steps.REFUSED)
-                self.assertIn('C3 failed at "%s"' % DROP_LABELS[TGT], out.note)
-                self.assertIsNone(h.fake.attachment(RET))
-                self.assertIsNotNone(h.fake.attachment(TGT))
-                before = list(h.fake.writes)
-                if route == 'kit':
-                    out = h.step('C3')
-                    self.assertEqual(out.status, steps.PASSED, h.text())
-                    self.assertEqual(h.journal.events('owner_skipped'), ['C3 ' + DROP_LABELS[RET]])
-                else:
-                    result = run_cleanup_block(h)
-                    self.assertEqual((result['status'], result['statements']), ('passed', 1), result)
-                    self.assertEqual(result['skipped'], [DROP_LABELS[RET]])
-                self.assertEqual(h.fake.writes[len(before):], ['DROP DATABASE `%s`' % TGT], 'the rerun drops only the replacement')
-                self.assert_cleaned_up(h)
-
-    def test_f3_drop_fault_points_rerun_drops_each_name_once(self):
-        """Before, after and before-the-journal around each C3 DROP: the step is never left running and the rerun completes.
-
-        Kit route (s2rebuild step C3). before: the rerun checks the identity again and issues the
-        DROP. after and journal: the name no longer holds the recorded database, so the rerun's
-        identity checks pass and the DROP is skipped. Each name is dropped exactly once and the
-        live name is untouched.
-        """
-        for name in (RET, TGT):
-            for point in FAULT_POINTS:
-                with self.subTest(name=name, point=point):
-                    h = cleanup_harness(self)
-                    raised = arm_drop(self, h, name, point)
-                    if raised is None:
-                        out = h.step('C3')
-                        self.assertEqual(out.status, steps.REFUSED)
-                        self.assertIn('C3 failed at "%s"' % DROP_LABELS[name], out.note)
-                        self.assertEqual(h.journal.step_status('C3'), 'pending')
-                    else:
-                        with self.assertRaises(raised):
-                            h.step('C3')
-                        self.assertEqual(h.journal.step_status('C3'), 'failed', 'the crash is journaled, never left running')
-                    self.assertEqual(len(drops(h, name)), 0 if point == 'before' else 1)
-                    if name == TGT:
-                        self.assertIsNone(h.fake.attachment(RET), 'the retained DROP ran first')
-                    else:
-                        self.assertEqual(drops(h, TGT), [], 'nothing after the failed statement ran')
-                    out = h.step('C3')
-                    self.assertEqual(out.status, steps.PASSED, h.text())
-                    self.assertEqual(h.journal.step_status('C3'), 'passed')
-                    skipped = h.journal.events('owner_skipped')
-                    expected = [] if point == 'before' else ['C3 ' + DROP_LABELS[name]]
-                    if name == TGT:
-                        expected = ['C3 ' + DROP_LABELS[RET]] + expected
-                    self.assertEqual(skipped, expected)
-                    self.assert_cleaned_up(h)
-                    final = h.step('C3')
-                    self.assertEqual(final.status, steps.PASSED, 'a third run skips both DROPs and passes')
-                    self.assertEqual((len(drops(h, RET)), len(drops(h, TGT))), (1, 1))
-
-
-    def test_f3_notebook_drop_fault_points_rerun_drops_each_name_once(self):
-        """The three failure points around each DROP on the notebook route (ownerlib run_block), each followed by a notebook rerun.
-
-        before: the server never sees the DROP (lost connection). after: the DROP is applied and
-        the reply is lost. journal: the notebook keeps no kit journal; its record is the printed
-        result, so this point is the kernel killed after the DROP applied and before run_block
-        returns (fail_statement after with crash=True). The rerun skips each name already gone,
-        drops each name exactly once and passes with the live name on the live branch; a third
-        run issues nothing.
-        """
-        for name in (RET, TGT):
-            for point in FAULT_POINTS:
-                with self.subTest(name=name, point=point):
-                    h = cleanup_harness(self)
-                    h.fake.fail_statement(r'^DROP DATABASE `%s`$' % name, 'before' if point == 'before' else 'after', crash=point == 'journal')
-                    if point == 'journal':
-                        with self.assertRaises(SimulatedCrash):
-                            run_cleanup_block(h)
-                    else:
-                        result = run_cleanup_block(h)
-                        self.assertEqual(result['status'], 'ERROR FakeDisconnect', result)
-                        self.assertEqual(result['statements'], 0 if name == RET else 1)
-                    self.assertEqual(len(drops(h, name)), 0 if point == 'before' else 1)
-                    if name == RET:
-                        self.assertEqual(drops(h, TGT), [], 'nothing after the failed statement ran')
-                    gone = []
-                    if name == TGT or point != 'before':
-                        gone.append(RET)
-                    if name == TGT and point != 'before':
-                        gone.append(TGT)
-                    result = run_cleanup_block(h)
-                    self.assertEqual(result['status'], 'passed', result)
-                    self.assertEqual(result['skipped'], [DROP_LABELS[n] for n in gone])
-                    self.assertEqual(result['statements'], 2 - len(gone))
-                    self.assert_cleaned_up(h)
-                    final = run_cleanup_block(h)
-                    self.assertEqual((final['status'], final['statements'], final['skipped']), ('passed', 0, [DROP_LABELS[RET], DROP_LABELS[TGT]]))
-                    self.assertEqual((len(drops(h, RET)), len(drops(h, TGT))), (1, 1))
-
-    def test_f3_recorded_database_under_another_name_refuses_with_nothing_dropped(self):
-        """The recorded record detached or attached under another name, or a block built from names the run did not record, refuses.
-
-        Moved: another actor detached the retained branch or the replacement, whose record is
-        then detached, and attached its storage under another name. Drifted: the configuration
-        names another retained or replacement database after O10, and no O1 names are in the
-        journal for check_run_names to refuse (owner-sql and the notebook are built from the
-        configuration). A name-only check passes the absent name, skips its DROP and passes C3
-        with the recorded record still attached. Both routes (kit step C3 and the notebook
-        ownerlib run_block) stop at the "not detached" or "attached under no other name" check of
-        that record with nothing dropped.
-        """
-        cases = {
-            'retained branch moved': (lambda h: move_attachment(h.fake, RET, RET + '_moved'), 'recorded retained record not detached'),
-            'replacement moved': (lambda h: move_attachment(h.fake, TGT, TGT + '_moved'), 'recorded replacement record not detached'),
-            'retained name drifted': (lambda h: drift_name(h, retained=RET + '_drifted'), 'recorded retained record attached under no other name'),
-            'replacement name drifted': (lambda h: drift_name(h, replacement=TGT + '_drifted'), 'recorded replacement record attached under no other name'),
-        }
-        for case, (change, label) in cases.items():
-            for route in ('kit', 'notebook'):
-                with self.subTest(case=case, route=route):
-                    h = cleanup_harness(self)
-                    change(h)
-                    other = attachments(h)
-                    before = list(h.fake.writes)
-                    if route == 'kit':
-                        out = h.step('C3')
-                        self.assertEqual(out.status, steps.REFUSED)
-                        self.assertIn('C3 stopped at check "%s": expected n = 0, observed n = 1' % label, out.note)
-                        self.assertEqual(h.journal.step_status('C3'), 'pending')
-                    else:
-                        result = run_cleanup_block(h)
-                        self.assertEqual(result['status'], 'FAILED at check ' + label)
-                        self.assertEqual(result['statements'], 0)
-                    self.assertEqual(h.fake.writes, before, 'nothing was dropped')
-                    self.assertEqual(attachments(h), other)
-
-    def test_f3_database_appearing_after_the_identity_check_is_never_dropped(self):
-        """A DROP is skipped unless its name holds the recorded database, and the checks after the DROP refuse.
-
-        Another actor changes the retained name between the identity checks and the DROP's skip
-        query (FakeDB.change_before on the skip query). Rerun: after a first run dropped the
-        retained branch and failed before the replacement DROP, a new database appears under the
-        free retained name; the DROP is skipped (a skip on the name alone would drop it) and
-        "retained is gone" stops the block. Moved: on a first run the retained branch is detached
-        and its storage attached under another name; the DROP is skipped and "recorded retained
-        record dropped" stops the block. On both routes nothing more is dropped and the replacement stays.
-        """
-        def create_retained(db):
-            db.connect('admin').cursor().execute('CREATE DATABASE `%s` PARTITIONS 4 SUB_PARTITIONS 0' % RET)
-
-        cases = {
-            'new database under the free name on a rerun': (True, create_retained, 'retained is gone', 'expected no rows, observed 1 row(s)'),
-            'retained branch moved before its DROP': (False, lambda db: move_attachment(db, RET, RET + '_moved'),
-                                                      'recorded retained record dropped', 'expected IS_DROPPED = 1, observed IS_DROPPED = 0'),
-        }
-        for case, (rerun, action, label, observed) in cases.items():
-            for route in ('kit', 'notebook'):
-                with self.subTest(case=case, route=route):
-                    h = cleanup_harness(self)
-                    rsid = h.fake.attachment(RET)['STORAGE_ID']
-                    if rerun:
-                        h.fake.fail_statement(r'^DROP DATABASE `%s`$' % TGT, 'before')
-                        self.assertEqual(h.step('C3').status, steps.REFUSED)
-                        self.assertIsNone(h.fake.attachment(RET))
-                    dropped = len(drops(h, RET))
-                    h.fake.change_before(SKIP_QUERY, action)
-                    if route == 'kit':
-                        out = h.step('C3')
-                        self.assertEqual(out.status, steps.REFUSED)
-                        self.assertIn('C3 stopped at check "%s": %s' % (label, observed), out.note)
-                        self.assertIn('C3 ' + DROP_LABELS[RET], h.journal.events('owner_skipped'))
-                    else:
-                        result = run_cleanup_block(h)
-                        self.assertEqual(result['status'], 'FAILED at check ' + label)
-                        self.assertEqual((result['statements'], result['skipped']), (0, [DROP_LABELS[RET]]))
-                    self.assertEqual(len(drops(h, RET)), dropped, 'the retained DROP was skipped')
-                    self.assertEqual(drops(h, TGT), [], 'the replacement was not dropped')
-                    self.assertIsNotNone(h.fake.attachment(TGT))
-                    if rerun:
-                        self.assertNotEqual(h.fake.attachment(RET)['STORAGE_ID'], rsid, 'the new database under the name is still there')
-                    else:
-                        self.assertEqual(h.fake.attachment(RET + '_moved')['STORAGE_ID'], rsid, 'the moved branch is still attached')
 
 
 class DetachEscalationTests(unittest.TestCase):
@@ -2227,7 +1898,7 @@ class ExecuteBlockTests(unittest.TestCase):
         h = switched_harness(self)
         names = ownersql.names_for(h.ctx())
         names['live_sid'] = '<live_sid>'
-        block = ownersql.cleanup_block(names)
+        block = ownersql.endstate_block(names)
         with self.assertRaisesRegex(KitError, 'C3 cannot run: live, retained not recorded'):
             ownersql.refuse_placeholders(block)
 
@@ -2264,7 +1935,8 @@ class OwnerlibTests(unittest.TestCase):
         with contextlib.redirect_stdout(out):
             result = ns['run_block'](cursor, switch.forward_block(names, {'tables': 4, 'views': 0, 'pipelines': 0}).to_dict(), {'run_id': h.run_id})
         self.assertEqual(result['status'], 'passed', out.getvalue())
-        self.assertEqual(result['statements'], 3)
+        self.assertEqual(result['statements'], 6, 'S1, S2, S2b attach and drop, S3, S4')
+        self.assertEqual(len(h.fake.portal_entries()), 2, 'the notebook route ends with two entries too')
         roles = {a['role']: a['row']['STORAGE_ID'] for a in result['attachments']}
         self.assertEqual(set(roles), {'source', 'retained', 'live'}, 'S1 records the detached original, S2 and S3 the new records')
         self.assertEqual(roles['live'], h.fake.attachment(SRC)['STORAGE_ID'])

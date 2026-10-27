@@ -394,8 +394,10 @@ def _rehearse_switch(ctx, sub, spec, names, plans, data, journal, timed, timings
         owner.close()
         runner.close()
     created.append(names['retained'])
-    timings['portal_cleanup'] = ['detached original rehearsal storage %s: delete it in the Portal by STORAGE_ID' % sw_names['source_sid']]
-    ctx.log('rehearsal: the detached original storage %s stays after cleanup; delete it in the Portal by STORAGE_ID' % sw_names['source_sid'])
+    timings['portal_cleanup'] = ['the switch ended with two entries (the live rehearsal name and its retained copy on storage %s); cleanup drops '
+                                 'the names it created, and a READ ONLY copy it cannot drop is removed with s2rebuild cleanup --delete or in the '
+                                 'Portal by its record' % sw_names['source_sid']]
+    ctx.log('rehearsal: two entries after the switch; cleanup drops the rehearsal names it created')
     return 'live %s on STORAGE_ID %s' % (names['source'], sw_names.get('live_sid'))
 
 

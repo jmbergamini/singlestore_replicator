@@ -436,6 +436,19 @@ def final_summary_rows(inventory, plans, journal, config, db, run_id, name_map=N
             att['database_name'], att.get('storage_id'), att.get('attach_type') or '', att.get('record_type') or 'unknown', att.get('compute_id'),
             ' (not attached)' if att.get('is_detached') else '')) if att else 'not recorded'))
     rows.append((None, None))
+    rows.append(('Retention', None))
+    retained = journal.attachment('retained')
+    sizes = [float(t.get('size_gib') or 0) for t in journal.tables()]
+    rows.extend([('Retained copy', db.retained),
+                 ('Retained record', ('STORAGE_ID %s, ATTACH_TYPE %s, COMPUTE_ID %s' % (retained.get('storage_id'), retained.get('record_type') or 'unknown',
+                                                                                        retained.get('compute_id'))) if retained else 'not recorded'),
+                 ('Retained size GiB', round(sum(sizes), 3)),
+                 ('Switched', meta.get('switched_utc') or 'not recorded'),
+                 ('Retain until', meta.get('retain_until_utc') or 'not recorded (C2 records it)'),
+                 ('Delete later with', 's2rebuild cleanup --delete %s --run %s (the customer, after the date; the kit never deletes it)' % (db.retained, run_id))])
+    for listing in journal.events('endstate_listing')[-1:] or journal.events('switch_listing')[-1:]:
+        rows.append(('Entries', listing))
+    rows.append((None, None))
     rows.append(('Open items', None))
     pending = [s for s, r in board.items() if r.get('status') in ('pending', 'failed', 'running')]
     rows.append(('Steps not passed', ', '.join(pending) or 'none'))
@@ -591,6 +604,21 @@ def write_final_workbook(path, inventory, plans, journal, config, db, run_id, ba
     return path
 
 
+def record_retain_until(ctx):
+    """C2: retain_until_utc, the switch time plus closeout.retain_days, in the journal meta; returns it, or None before a switch time exists."""
+    import datetime as dt
+    from .common import iso, parse_utc
+    switched = ctx.journal.get_meta('switched_utc')
+    if not switched:
+        ctx.log('    retain_until_utc not recorded: no switch time in the journal')
+        return None
+    until = iso(parse_utc(switched, 'switched_utc') + dt.timedelta(days=ctx.config.closeout.retain_days))
+    ctx.journal.set_meta('retain_until_utc', until)
+    ctx.log('    retained copy %s kept until %s (closeout.retain_days %d); the customer deletes it later with s2rebuild cleanup --delete %s'
+            % (ctx.db.retained, until, ctx.config.closeout.retain_days, ctx.db.retained))
+    return until
+
+
 def handle_c2(step, ctx):
     """C2 handler: the baseline fitted from the run journal, the final workbook and the Markdown run report, then the fitted baseline written.
 
@@ -605,6 +633,7 @@ def handle_c2(step, ctx):
     if ctx.dry_run:
         return steps.Outcome(steps.PASSED, 'dry run: final.xlsx and run-report.md would be written to %s and the baseline recalibrated' % reports)
     baseline = copy_module.baseline_for(ctx.config)
+    record_retain_until(ctx)
     try:
         cal, kept = estimate.calibrate(ctx.journal_path, first_pass_only=True, workers=ctx.config.copy.workers,
                                        compute_size=ctx.config.workspace.compute_size, run_id=ctx.run_id), None

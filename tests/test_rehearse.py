@@ -97,7 +97,7 @@ class NotebookTests(unittest.TestCase):
         h.journal.record_attachment('source', SRC, '1028600672070281646:7367158985892520834', 'cid-1', 'READWRITE')
         write_o2(h, [ITEM])
         names, blocks, inputs = notebook.blocks_for_run(h.ctx())
-        self.assertEqual(sorted(blocks), ['C3', 'C4', 'O10', 'O10-rollback', 'O11', 'O2', 'O3', 'O3-reentry', 'O9'])
+        self.assertEqual(sorted(blocks), ['C3', 'C4', 'O10', 'O10-rollback', 'O10-rollback-retained', 'O11', 'O2', 'O3', 'O3-reentry', 'O9'])
         self.assertEqual(inputs['capture_step'], 'O2')
         path = notebook.generate(h.tmp / 'owner-steps.ipynb', names, h.config, blocks, inputs['grants'], items=inputs['pipelines'],
                                  capture_step=inputs['capture_step'])
@@ -179,13 +179,15 @@ class RehearsalRunTests(unittest.TestCase):
         self.assertIn('keyed_single', timings['bucketed_tables'], 'hash-bucket predicates are rehearsed')
         for label in ('create and fill', 'O4 capture', 'O5', 'O6 kill test', 'O6 resume', 'O7', 'O8', 'O3 freeze', 'O10 switch'):
             self.assertIn(label, timings['steps'])
-        self.assertIn('delete it in the Portal by STORAGE_ID', timings['portal_cleanup'][0])
+        self.assertIn('two entries', timings['portal_cleanup'][0])
         self.assertIn('refused as read only', h.text())
         names = rehearse.rehearsal_names(PREFIX)
         for name in names.values():
             self.assertNotIn(name, h.fake.databases, 'cleanup dropped %s' % name)
         dropped = [w for w in h.fake.writes if w.startswith('DROP DATABASE')]
-        self.assertEqual(len(dropped), 3, dropped)
+        # S2b drops the original rehearsal record and S4 the replacement; cleanup then drops the live rehearsal name and the retained copy
+        self.assertEqual(dropped, ['DROP DATABASE `%s`' % names['source'], 'DROP DATABASE `%s`' % names['replacement'],
+                                   'DROP DATABASE `%s`' % names['source'], 'DROP DATABASE `%s`' % names['retained']])
         self.assertIn(SRC, h.fake.databases, 'the configured source is untouched')
         self.assertFalse(any(w.startswith(('DETACH', 'ATTACH', 'DROP DATABASE')) and '`%s`' % SRC in w for w in h.fake.writes))
         self.assertTrue(steps._rehearsal_evidence(h.ctx()))
@@ -303,7 +305,8 @@ class M4CliTests(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600, step_id)
         code, text = self.cli('owner-sql', 'O10', '--rollback')
         self.assertEqual(code, EXIT_DONE)
-        self.assertIn('Rollback R1 to R3', text)
+        self.assertIn('Rollback R1 and R2a', text)
+        self.assertIn('Rollback R1 and R2b, R2c', text)
         code, text = self.cli('owner-sql', 'O6')
         self.assertEqual(code, EXIT_REFUSED)
         code, text = self.cli('owner-sql', 'O3', '--rollback')

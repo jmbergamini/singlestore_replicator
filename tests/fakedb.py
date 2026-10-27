@@ -645,6 +645,10 @@ class FakeCursor:
             self.rows = [{'n': int(not any(a['DATABASE_NAME'] == args[0] and a['STORAGE_ID'] == args[1] and a['ATTACH_TYPE'] == args[2]
                                            and self._sees_storage(a) for a in db.attachments))}]
             return
+        m = re.match(r'SELECT COUNT\(\*\) AS n FROM information_schema\.MV_CLOUD_ATTACHED_DATABASES WHERE DATABASE_NAME = %s$', s)
+        if m:
+            self.rows = [{'n': sum(1 for a in db.attachments if a['DATABASE_NAME'] == args[0] and self._sees_storage(a))}]
+            return
         m = re.match(r'SELECT COUNT\(\*\) AS n FROM information_schema\.MV_CLOUD_ATTACHED_DATABASES WHERE STORAGE_ID = %s( AND DATABASE_NAME <> %s)?$', s)
         if m:
             self.rows = [{'n': sum(1 for a in db.attachments if a['STORAGE_ID'] == args[0] and self._sees_storage(a)
@@ -1019,6 +1023,10 @@ class FakeCursor:
         if source_sid is None or source_sid not in db.storage:
             raise FakeDisconnect('unknown storage for ' + parent)
         parent_att = db.attachment(parent)
+        if alias and parent_att is not None and parent_att['ATTACH_TYPE'] == 'READONLY' and db.refuse_read_only_branch:
+            # the R2b question I0b answers: whether a branch of a READ ONLY attachment is refused; the number and text are the fake's
+            # placeholders until the live test records them in the error table
+            raise FakeDisconnect(2720, 'Cannot branch a database that is attached read only (fake placeholder; I0b records the real error)')
         if alias:
             new_sid = source_sid if db.branch_keeps_storage_id else db.new_sid()
             db.storage.setdefault(new_sid, name)
@@ -1097,6 +1105,7 @@ class FakeDB:
         self.refuse_sharded_counter = True  # ALTER TABLE ... AUTO_INCREMENT on a sharded table is error 1749
         self.branch_keeps_storage_id = True  # ATTACH x AS y keeps x's STORAGE_ID; y gets its own COMPUTE_ID and branch record
         self.refuse_read_only_drop = True  # DROP DATABASE of a READ ONLY attachment is error 2720
+        self.refuse_read_only_branch = False  # ATTACH ... AS from a READ ONLY attachment (rollback R2b): off until I0b decides; on means R2c runs
         self.lock_tables = set()
         self.lock_hits = 0
         self.lock_wait_settings = []

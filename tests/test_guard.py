@@ -326,9 +326,11 @@ class StepGuardTests(unittest.TestCase):
             o9.check('START PIPELINE `%s`.`p`' % TGT)
         o10 = steps.guard_for('O10', self.db, steps.OWNER)
         o10.check("ATTACH DATABASE `%s` AS `%s` READ ONLY STORAGEID sid" % (SRC, RET))
-        o10.check('DROP DATABASE `%s`' % RET)
+        # S2b drops the original record and S4 the replacement; the retained copy is never dropped by O10
+        o10.check('DROP DATABASE `%s`' % SRC)
+        o10.check('DROP DATABASE `%s`' % TGT)
         with self.assertRaises(GuardError):
-            o10.check('DROP DATABASE `%s`' % SRC)
+            o10.check('DROP DATABASE `%s`' % RET)
         o11 = steps.guard_for('O11', self.db, steps.OWNER)
         o11.check('START PIPELINE `%s`.`p`' % SRC)
         o11.check("GRANT INSERT ON *.* TO 'app'@'%'")
@@ -336,10 +338,18 @@ class StepGuardTests(unittest.TestCase):
         with self.assertRaises(GuardError):
             o11.check('START PIPELINE `%s`.`p`' % TGT)
         c3 = steps.guard_for('C3', self.db, steps.OWNER)
-        c3.check('DROP DATABASE `%s`' % RET)
         c3.check('DROP DATABASE `%s`' % TGT)
+        c3.check('DROP DATABASE `%s`' % SRC)
+        c3.check('DETACH DATABASE `%s`' % SRC)
         with self.assertRaises(GuardError):
-            c3.check('DROP DATABASE `%s`' % SRC)
+            c3.check('DROP DATABASE `%s`' % RET)
+        with self.assertRaises(GuardError):
+            c3.check('DETACH DATABASE `%s`' % RET)
+        c5 = steps.guard_for('cleanup', self.db, steps.OWNER)
+        c5.check('DROP DATABASE `%s`' % RET)
+        c5.check('DETACH DATABASE `%s`' % RET)
+        with self.assertRaises(GuardError):
+            c5.check('DROP DATABASE `%s`' % SRC)
         steps.guard_for('C4', self.db, steps.OWNER).check("DROP USER 's2rebuild_runner'@'%'")
         steps.guard_for('P1', self.db, steps.OWNER).check("CREATE USER 'u'@'%' IDENTIFIED BY '<password>'")
         lockout = steps.guard_for('lockout', self.db, steps.OWNER)
@@ -366,14 +376,15 @@ ALLOWANCES = {
     'watch.py': {'pipeline', 'drop', 'truncate', 'grant'},     # PIPELINES state query, the write regex (DROP, TRUNCATE), grantee lookup
     'report_md.py': set(),
     'ownersql.py': {'drop', 'grant', 'attach', 'pipeline', 'detach', 'kill'},  # account and cleanup blocks, attachment checks, pipeline block dispatch
-    'switch.py': {'detach', 'attach', 'drop', 'pipeline', 'kill'},     # the state machine's statements, DROP in R3, pipeline count, DETACH KILL
+    'switch.py': {'detach', 'attach', 'drop', 'pipeline', 'kill'},     # the state machine's statements, DROP at S2b and S4, pipeline count, DETACH KILL
+    'cleanup.py': {'detach', 'attach', 'drop'},  # C5: DETACH, ATTACH by syntax and DROP of the retained copy behind its record checks
     'freeze.py': {'detach', 'attach', 'kill', 'pipeline', 'grant', 'revoke'},  # the freeze block, DETACH KILL escalation, pipelines check, grants reference
     'grants.py': {'grant', 'revoke', 'drop', 'pipeline'},              # REVOKE and GRANT statements, the privilege names
     'lockout.py': {'grant', 'revoke', 'kill'},                         # the loop's REVOKE and KILL CONNECTION statements, grants module
     'pipelines.py': {'pipeline', 'grant', 'revoke'},                   # pipeline statements, grant restore at O11 (grants revoked by the lockout)
     'notebook.py': {'grant', 'revoke', 'kill', 'pipeline', 'detach'},  # the lockout cell text and the run payload
     'abandon.py': {'detach', 'attach', 'drop', 'kill', 'revoke'},  # the abandon block, detach_kill of the escalation, the Path B refusal text
-    'rehearse.py': {'drop', 'detach', 'kill', 'pipeline'},  # cleanup DROP DATABASE, the SIGKILL test, detached storage note
+    'rehearse.py': {'drop', 'kill', 'pipeline'},  # cleanup DROP DATABASE, the SIGKILL test, the pipelines count of the switch
     'config.py': {'pipeline', 'detach', 'kill'},  # pipelines section, detach_wait_seconds, detach_kill
     'journal.py': {'pipeline', 'grant', 'attach', 'revoke', 'detach'},  # pipelines, grants_snapshot (never overwritten by a revoked state), the attachments table and its is_detached column
     'connect.py': set(),
