@@ -1844,6 +1844,7 @@ class ExecuteBlockTests(unittest.TestCase):
         block = ownersql.Block('O9', 'test')
         block.statement('USE `%s`' % TGT, 'use', skip_if=('SELECT COUNT(*) AS n FROM information_schema.PIPELINES WHERE DATABASE_NAME = %s', (SRC,)))
         h.fake.pipelines = [{'PIPELINE_NAME': 'p', 'STATE': 'Stopped'}]
+        h.fake.attachment(SRC)['ATTACH_TYPE'] = 'READWRITE'  # the fake lists no pipeline on a READ ONLY attachment (fact 23)
         ownersql.execute_block(block, owner, h.log, h.journal)
         self.assertIn('owner_skipped', [e['kind'] for e in h.journal.events()])
         block = ownersql.Block('O9', 'test')
@@ -1876,6 +1877,8 @@ class ExecuteBlockTests(unittest.TestCase):
                 b.statement('START PIPELINE `%s`.`%s`' % (SRC, name), 'start ' + name, skip_if=(running, (SRC, name)))
             return b
         h.fake.pipelines = [{'PIPELINE_NAME': name, 'STATE': 'Stopped', 'DATABASE_NAME': SRC} for name in ('p1', 'p2')]
+        # an O11 block runs on the live name, which is read write; the fake lists no pipeline on a READ ONLY attachment (fact 23)
+        h.fake.attachment(SRC)['ATTACH_TYPE'] = 'READWRITE'
         with self.assertRaisesRegex(KitError, 'stopped at check "pipelines present"'):
             ownersql.execute_block(block(3), owner, h.log, h.journal, before_first_statement=hook)
         self.assertEqual(calls, [], 'a failed leading check never calls the hook')
@@ -1985,6 +1988,7 @@ class OwnerlibTests(unittest.TestCase):
         h.fake.pipelines = [{'PIPELINE_NAME': 'p1', 'STATE': 'Stopped', 'DATABASE_NAME': SRC}]
         h.fake.pipeline_offsets = [{'DATABASE_NAME': SRC, 'PIPELINE_NAME': 'p1', 'SOURCE_TYPE': 'KAFKA', 'SOURCE_PARTITION_ID': '0', 'EARLIEST_OFFSET': 1,
                                     'LATEST_OFFSET': 9, 'LATEST_LOADED_OFFSET': 9, 'LATEST_SUCCESSFUL_OFFSET': 9}]
+        h.fake.attachment(SRC)['ATTACH_TYPE'] = 'READWRITE'  # O2 runs before the freeze; PIPELINES is empty on a READ ONLY attachment (fact 23)
         block = ownersql.Block('O2', 'stop').capture(SRC, 'capture now')
         with contextlib.redirect_stdout(io.StringIO()):
             result = self.namespace()['run_block'](h.fake.connect().cursor(), block.to_dict(), {})

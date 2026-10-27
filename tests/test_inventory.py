@@ -432,6 +432,17 @@ class PipelineCaptureTests(unittest.TestCase):
     def capture(self, answers):
         return I.capture(FakeSession(answers), self.db, self.cfg, FakeSession(answers), sleep=lambda s: None)
 
+    def test_capture_on_a_read_only_attachment_lists_no_pipeline(self):
+        """W6: at O4 on Path A the source is READ ONLY, where PIPELINES is empty (fact 23): the capture reads no pipeline view and
+        records the note O9 and the drift report rely on, instead of 0 pipelines captured."""
+        answers = canned_answers()
+        answers['SELECT DATABASE_NAME, ATTACH_TYPE'] = [dict(answers['SELECT DATABASE_NAME, ATTACH_TYPE'][0], ATTACH_TYPE='READONLY')]
+        owner = FakeSession(answers)
+        inv = I.capture(FakeSession(answers), self.db, self.cfg, owner, step='O4', sleep=lambda s: None)
+        self.assertEqual(inv['pipelines'], {'captured': False, 'items': [], 'read_only': True, 'note': I.PIPELINES_READ_ONLY_NOTE})
+        self.assertFalse([s for s, _ in owner.statements if 'PIPELINES' in s], 'no pipeline view is read on a READ ONLY attachment')
+        self.assertTrue([s for s, _ in owner.statements if 'ROUTINES' in s], 'the routines are still read with the owner session')
+
     def test_f14_a_topic_table_or_column_named_credentials_is_captured(self):
         """The word credentials as a topic, a target table or a mapped column is no CREDENTIALS clause; an unreplaced clause still refuses."""
         definition = ("CREATE PIPELINE `p1` AS LOAD DATA KAFKA 'b:9092/credentials' BATCH_INTERVAL 1000 REPLACE INTO TABLE `credentials` "
@@ -485,6 +496,32 @@ class DriftTests(unittest.TestCase):
         self.assertIn('drift: 8 structural difference(s); row estimates changed on 1 table(s)', lines[-1])
         self.assertEqual(I.drift(before, before)['count'], 0)
         self.assertEqual(I.drift(before, json.loads(json.dumps(before)))['rows_changed'], [])
+
+    def test_drift_with_pipelines(self):
+        """W6: pipelines added, removed or changed are drift by name; a frozen source (no listing on a READ ONLY attachment) is a
+        note, never a drop to zero; offsets and states alone are not drift."""
+        before = I.load(FIXTURE_INVENTORY)
+        after = json.loads(json.dumps(before))
+        items = after['pipelines']['items']
+        items[0]['definition'] = items[0]['definition'].replace('BATCH_INTERVAL', 'BATCH_INTERVAL 5 ')
+        items[0]['state'] = 'Stopped'
+        items[1]['alter_statements'] = ["ALTER PIPELINE `imports` SET OFFSETS '{\"0\": 99}'"]
+        items.append(dict(items[1], name='late_feed'))
+        report = I.drift(before, after)
+        self.assertEqual(report['objects_added'], ['pipeline late_feed'])
+        self.assertEqual(report['definitions_changed'], ['pipeline orders_stream'], 'a state or an offset alone is not drift')
+        self.assertEqual((report['count'], report['pipelines_note']), (2, None))
+        gone = json.loads(json.dumps(before))
+        gone['pipelines']['items'] = gone['pipelines']['items'][:1]
+        self.assertEqual(I.drift(before, gone)['objects_removed'], ['pipeline imports'])
+        frozen = json.loads(json.dumps(before))
+        frozen['pipelines'] = {'captured': False, 'items': [], 'read_only': True, 'note': I.PIPELINES_READ_ONLY_NOTE}
+        report = I.drift(before, frozen)
+        self.assertEqual((report['count'], report['objects_removed']), (0, []), 'two pipelines to none is not reported as removed')
+        self.assertEqual(report['pipelines_note'], I.PIPELINES_READ_ONLY_NOTE)
+        lines = I.drift_lines(report)
+        self.assertEqual(lines[0], 'drift: pipelines not compared: ' + I.PIPELINES_READ_ONLY_NOTE)
+        self.assertIn('drift: 0 structural difference(s)', lines[-1])
 
 
 class SystemProfileTests(unittest.TestCase):

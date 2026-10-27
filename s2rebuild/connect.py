@@ -10,6 +10,7 @@ by this module: none of its own; it forwards the statements the steps hand to a 
 """
 import getpass
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -21,11 +22,31 @@ KEYCHAIN_TOOL = 'security'
 LOG_FILE_MODE = 0o600
 
 
+USER_FORMS = (
+    # user@host, 'user'@'host' and `user`@`host`: the name must stand alone before the @
+    r"(?<![\w.])(['`\"]?)%s\1(?=@)",
+    # USER = 'user', as in a PROCESSLIST condition or an account statement
+    r"(?i)(\bUSER\s*=\s*['`\"])%s(['`\"])",
+)
+
+
+def mask_user(text, name):
+    """Mask name where it stands as a SQL user: user@host, a quoted account ('user'@'host'), USER = 'user'.
+
+    Never inside a word or a label, so a step kind such as admin stays readable when the owner
+    user is admin.
+    """
+    escaped = re.escape(name)
+    text = re.sub(USER_FORMS[0] % escaped, r'\1<redacted>\1', text)
+    return re.sub(USER_FORMS[1] % escaped, r'\1<redacted>\2', text)
+
+
 class Redactor:
     """Replaces every connection setting value in text before it is printed.
 
     soft values (the SQL user names) are masked in log lines but kept in the admin blocks the
-    operator copies, since a block that names a user cannot run with the name masked.
+    operator copies, since a block that names a user cannot run with the name masked. A soft
+    value is masked only where it stands as a user (mask_user); a hard value everywhere.
     """
 
     def __init__(self, values=(), soft=()):
@@ -35,7 +56,9 @@ class Redactor:
     def __call__(self, text, soft=True):
         text = str(text)
         for v in self.values:
-            if not soft and v in self.soft:
+            if v in self.soft:
+                if soft and v in text:
+                    text = mask_user(text, v)
                 continue
             if v in text:
                 text = text.replace(v, '<redacted>')

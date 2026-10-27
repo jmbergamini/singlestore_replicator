@@ -29,6 +29,8 @@ from .sqlutil import ident, probe_guard, qualified, read_guard
 
 PIPELINES_RUNNING_SQL = "SELECT COUNT(*) AS n FROM information_schema.PIPELINES WHERE DATABASE_NAME = %s AND STATE = 'Running'"
 READ_ONLY_ERRNOS = (1290, 1836)
+PORTAL_ROWS_NOTE = ('the Portal may show 0 rows for the tables of %s while it is READ ONLY (fact 38); the counts the kit '
+                    'records in the journal and the capture are the reference')
 STRING_TYPES = ('char', 'varchar', 'text', 'tinytext', 'mediumtext', 'longtext')
 INTEGER_TYPES = ('tinyint', 'smallint', 'mediumint', 'int', 'integer', 'bigint')
 PROBE_NOTE = ('The kit then runs the write probe as the runner and records freeze_time. After a notebook or hand run, '
@@ -216,6 +218,7 @@ def finish_freeze(ctx):
     ctx.journal.set_meta('freeze_time', when)
     ctx.journal.event('freeze', 'Path A read-only attachment verified; freeze_time ' + when)
     ctx.log('freeze_time recorded: ' + when)
+    ctx.log(PORTAL_ROWS_NOTE % ctx.db.source)
     if ctx.owner_configured:
         from . import lockout
         owner = ctx.owner_session(read_guard('owner O3 grants reference'))

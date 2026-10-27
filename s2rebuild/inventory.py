@@ -362,6 +362,8 @@ def _pipelines(owner_session, db_name, app_managed, now):
 
 
 ROUTINES_NOT_CAPTURED = 'routines not captured: no owner profile; the runner sees none in ROUTINES'
+PIPELINES_READ_ONLY_NOTE = ('pipelines not listed: PIPELINES is empty on a READ ONLY attachment (fact 23); '
+                            'O9 replays the O2 capture taken after the stop')
 
 
 def capture(session, db, config, owner_session=None, exact_counts=False, log=None, step='P3', samples=3, sleep=time.sleep):
@@ -432,7 +434,11 @@ def capture(session, db, config, owner_session=None, exact_counts=False, log=Non
         'size_gib_total': round(sum(t['size_gib'] or 0.0 for t in tables), 3),
         'est_rows_total': sum(t['est_rows'] for t in tables),
     }
-    if owner_session is not None:
+    if owner_session is not None and attachment is not None and str(attachment.get('ATTACH_TYPE')).upper() == 'READONLY':
+        # fact 23: PIPELINES shows no rows on a READ ONLY attachment, so a listing now would read as every pipeline
+        # removed; O9 replays the O2 capture taken after the stop, and the drift report says so instead
+        inventory['pipelines'] = {'captured': False, 'items': [], 'read_only': True, 'note': PIPELINES_READ_ONLY_NOTE}
+    elif owner_session is not None:
         inventory['pipelines'] = _pipelines(owner_session, name, set(db.app_managed_pipelines), now)
     else:
         inventory['pipelines'] = {'captured': False, 'items': [],
@@ -669,17 +675,43 @@ def plan_summary(plans):
 # ---------------------------------------------------------------------------
 # Drift (O4 against P3)
 # ---------------------------------------------------------------------------
+def pipeline_drift(before, after):
+    """(added, removed, changed, note) pipeline labels between two captures; a change is a definition whose text differs.
+
+    Offsets and states are not drift (O2 stops the pipelines and their offsets move until then).
+    When either capture holds no pipeline listing (no owner profile, or a READ ONLY attachment,
+    fact 23) nothing is compared and note says why, so a frozen source never reads as every
+    pipeline removed. Issues nothing.
+    """
+    old_cap, new_cap = before.get('pipelines') or {}, after.get('pipelines') or {}
+    for cap in (new_cap, old_cap):
+        if not cap.get('captured'):
+            return [], [], [], cap.get('note') or 'pipelines not captured'
+    old = {p['name']: p for p in old_cap.get('items') or []}
+    new = {p['name']: p for p in new_cap.get('items') or []}
+    added = sorted('pipeline %s' % n for n in set(new) - set(old))
+    removed = sorted('pipeline %s' % n for n in set(old) - set(new))
+    changed = sorted('pipeline %s' % n for n in set(old) & set(new)
+                     if ' '.join(str(old[n].get('definition') or '').split()) != ' '.join(str(new[n].get('definition') or '').split()))
+    return added, removed, changed, None
+
+
 def drift(before, after):
-    """Objects added or removed, columns added or removed and definitions changed between two inventories."""
+    """Objects added or removed, columns added or removed and definitions changed between two inventories.
+
+    Routines and pipelines count as objects (labels 'kind name'); pipelines_note carries the reason
+    when the pipelines could not be compared.
+    """
     old_objects = {t['name']: t for t in before['tables']}
     new_objects = {t['name']: t for t in after['tables']}
     old_views = {v['name']: v for v in before.get('views', [])}
     new_views = {v['name']: v for v in after.get('views', [])}
     routines_added, routines_removed, routines_changed = routines.drift(before, after)
+    pipelines_added, pipelines_removed, pipelines_changed, pipelines_note = pipeline_drift(before, after)
     report = {
-        'objects_added': sorted((set(new_objects) | set(new_views)) - (set(old_objects) | set(old_views))) + routines_added,
-        'objects_removed': sorted((set(old_objects) | set(old_views)) - (set(new_objects) | set(new_views))) + routines_removed,
-        'columns_added': [], 'columns_removed': [], 'definitions_changed': [], 'rows_changed': [],
+        'objects_added': sorted((set(new_objects) | set(new_views)) - (set(old_objects) | set(old_views))) + routines_added + pipelines_added,
+        'objects_removed': sorted((set(old_objects) | set(old_views)) - (set(new_objects) | set(new_views))) + routines_removed + pipelines_removed,
+        'columns_added': [], 'columns_removed': [], 'definitions_changed': [], 'rows_changed': [], 'pipelines_note': pipelines_note,
     }
     for name in sorted(set(old_objects) & set(new_objects)):
         old_cols = {c['name'] for c in old_objects[name]['columns']}
@@ -693,19 +725,21 @@ def drift(before, after):
     for name in sorted(set(old_views) & set(new_views)):
         if ' '.join(str(old_views[name]['definition']).split()) != ' '.join(str(new_views[name]['definition']).split()):
             report['definitions_changed'].append(name)
-    report['definitions_changed'].extend(routines_changed)
+    report['definitions_changed'].extend(routines_changed + pipelines_changed)
     report['count'] = sum(len(report[k]) for k in ('objects_added', 'objects_removed', 'columns_added', 'columns_removed',
                                                    'definitions_changed'))
     return report
 
 
 def drift_lines(report):
-    """The drift report as log lines; structural differences first, row estimate changes summarized."""
+    """The drift report as log lines; structural differences first, the pipeline note, row estimate changes summarized."""
     lines = []
     for key, label in (('objects_added', 'object added'), ('objects_removed', 'object removed'), ('columns_added', 'column added'),
                        ('columns_removed', 'column removed'), ('definitions_changed', 'definition changed')):
         for item in report[key]:
             lines.append('DRIFT: %s: %s' % (label, item))
+    if report.get('pipelines_note'):
+        lines.append('drift: pipelines not compared: %s' % report['pipelines_note'])
     lines.append('drift: %d structural difference(s); row estimates changed on %d table(s)' % (report['count'], len(report['rows_changed'])))
     return lines
 

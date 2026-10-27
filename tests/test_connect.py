@@ -29,6 +29,18 @@ class RedactorTests(unittest.TestCase):
         self.assertNotIn('sasl', r('CREDENTIALS {"sasl.password":"k"}'))
         self.assertEqual(Redactor()('plain'), 'plain')
 
+    def test_user_names_are_masked_only_where_they_stand_as_a_user(self):
+        """W6: a soft value (a SQL user named admin) is masked as user@host, a quoted account and USER = 'admin', never in a label."""
+        r = Redactor([HOST], soft=['admin', 's2rebuild_runner'])
+        self.assertEqual(r('[O3] Freeze (admin; owner) database d'), '[O3] Freeze (admin; owner) database d', 'the step kind label stays')
+        self.assertEqual(r("Access denied for user 'admin'@'%' on " + HOST), "Access denied for user '<redacted>'@'%' on <redacted>")
+        self.assertEqual(r('owner: connected as admin@%; runner s2rebuild_runner@%'), 'owner: connected as <redacted>@%; runner <redacted>@%')
+        self.assertEqual(r("DEFINER=`admin`@`%` WHERE USER = 'admin' AND user='s2rebuild_runner'"),
+                         "DEFINER=`<redacted>`@`%` WHERE USER = '<redacted>' AND user='<redacted>'")
+        self.assertEqual(r('sysadmin@% and admin_user@% and administrator'), 'sysadmin@% and admin_user@% and administrator',
+                         'never inside a word')
+        self.assertEqual(r("GRANT SELECT TO 'admin'@'%'", soft=False), "GRANT SELECT TO 'admin'@'%'", 'kept in the blocks an operator copies')
+
 
 class SecretsTests(unittest.TestCase):
     def test_from_env_and_redacted_repr(self):

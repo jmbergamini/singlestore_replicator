@@ -346,8 +346,11 @@ class FakeCursor:
         return self.conn.is_admin or grantee == "'%s'@'%%'" % self.conn.user
 
     def _pipes(self, database=None):
-        """Visible pipelines: none for an account without pipeline privileges (Helios fact 10)."""
+        """Visible pipelines: none for an account without pipeline privileges (Helios fact 10), none on a READ ONLY attachment (fact 23; the offsets stay)."""
         if not self.conn.is_admin:
+            return []
+        att = self.db.attachment(database) if database is not None else None
+        if att is not None and att['ATTACH_TYPE'] == 'READONLY':
             return []
         return [p for p in self.db.pipelines if p.get('DATABASE_NAME', self.db.source) is not None
                 and (database is None or p.get('DATABASE_NAME', self.db.source) == database)]

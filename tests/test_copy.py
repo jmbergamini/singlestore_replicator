@@ -486,7 +486,8 @@ class SecretTests(unittest.TestCase):
         fake_cursors.DictCursor = object
 
         def connect(**kw):
-            raise RuntimeError('cannot reach %s as %s with %s' % (kw['host'], kw['user'], kw['password']))
+            # the driver's own shape: the user stands as a quoted account, which the redactor masks (W6)
+            raise RuntimeError("cannot reach %s for user '%s'@'%%' with %s" % (kw['host'], kw['user'], kw['password']))
         fake_pymysql.connect = connect
         fake_pymysql.cursors = fake_cursors
         saved = {k: sys.modules.get(k) for k in ('pymysql', 'pymysql.cursors')}
