@@ -190,15 +190,22 @@ class ReportAndCalibrateTests(unittest.TestCase):
 
     def test_reports_and_a_recalibrated_baseline(self):
         h = Harness(self, mutate=lambda d: d.update(estimate={'baseline': str('customer_baseline.json')}))
+        self.assertEqual(p2(h).status, steps.PASSED, h.text())
         self.ready(h)
         reference = estimate.calibrate(REFERENCE_JOURNAL, until='2026-10-24T08:00:00Z', workers=4)
-        original = estimate.calibrate
-        estimate.calibrate = lambda *a, **k: reference
+        original, given = estimate.calibrate, {}
+
+        def recorded(*args, **kwargs):
+            given.update(kwargs)
+            return reference
+        estimate.calibrate = recorded
         try:
             out = h.step('C2', redo=True)
         finally:
             estimate.calibrate = original
         self.assertEqual(out.status, steps.PASSED, h.text())
+        self.assertEqual(given.get('leaf_cores'), 16, 'C2 hands calibrate the leaf cores P2 recorded (W10)')
+        self.assertEqual(inventory.recorded_leaf_cores(h.journal), 16)
         reports = h.tmp / 'runs' / h.run_id / SRC / 'reports'
         self.assertTrue((reports / 'final.xlsx').is_file())
         self.assertTrue((reports / 'run-report.md').is_file())

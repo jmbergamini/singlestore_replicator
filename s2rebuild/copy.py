@@ -998,9 +998,10 @@ def baseline_for(config):
     return estimate.load_baseline(config.resolve(config.estimate.baseline) if config.estimate.baseline else None)
 
 
-def longest_chunk_seconds(plans, config):
-    """The longest modeled chunk of a plan list, the allowance the deadline subtracts."""
-    return estimate.estimate(plans, config, baseline_for(config)).schedule.longest_chunk_seconds
+def longest_chunk_seconds(plans, config, journal=None):
+    """The longest modeled chunk of a plan list, the allowance the deadline subtracts; the rates scaled by the leaf cores
+    P2 recorded in the journal (inventory.recorded_leaf_cores) when one is given."""
+    return estimate.estimate(plans, config, baseline_for(config), leaf_cores=inventory.recorded_leaf_cores(journal)).schedule.longest_chunk_seconds
 
 
 def stop_file_for(journal_path):
@@ -1108,7 +1109,7 @@ def handle_o6(step, ctx):
     if journal.is_empty():
         return steps.Outcome(steps.REFUSED, 'O5 has not written the plan into this journal; run O5 first', EXIT_REFUSED)
     journal.check_plan(plans, statements.source_db, statements.target_db)
-    abort_at = resolve_abort_at(journal, ctx.config, longest_chunk_seconds(plans, ctx.config))
+    abort_at = resolve_abort_at(journal, ctx.config, longest_chunk_seconds(plans, ctx.config, journal))
     stop_file = stop_file_for(ctx.journal_path)
     if fresh and abort_at is not None and utc_now() >= abort_at:
         return steps.Outcome(steps.REFUSED, 'Abort deadline %s UTC has passed; the fresh-table load of %s is one whole-table INSERT '

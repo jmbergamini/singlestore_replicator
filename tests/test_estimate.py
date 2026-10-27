@@ -10,7 +10,7 @@ from pathlib import Path
 
 from s2rebuild import estimate as E
 from s2rebuild import inventory as I
-from s2rebuild.common import KitError
+from s2rebuild.common import KitError, iso
 from tests.helpers import ROOT, Plan, config_from
 
 REFERENCE_JOURNAL = ROOT / 'tests' / 'fixtures' / 'reference-run' / 'copy-journal.sqlite'
@@ -159,7 +159,7 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(dict(E.estimate(plans, budgeted, E.DEFAULT_BASELINE).allowances)['O8 fingerprints (budget)'], 1800.0)
         self.assertAlmostEqual(E.fingerprint_seconds(plans, budgeted, E.DEFAULT_BASELINE, 8),
                                2 * (639003650 - 600_000_000 * 0.95) * E.DEFAULT_SCAN_S_PER_ROW / 8, msg='the table over the threshold at 5 percent')
-        self.assertAlmostEqual(by['O6 count proof'], 2 * 639003650 * E.DEFAULT_SCAN_S_PER_ROW / 4)
+        self.assertAlmostEqual(by['O6 count proof'], 2 * 639003650 * E.DEFAULT_SCAN_S_PER_ROW, msg='the count proof is serial, not divided by the workers')
         low, expected, high = est.copy_band
         self.assertAlmostEqual(low, expected * 0.85)
         self.assertAlmostEqual(high, expected * 1.15)
@@ -204,6 +204,108 @@ class ModelTests(unittest.TestCase):
         no_window = config_from(lambda d: d.pop('window'))
         text = '\n'.join(E.plan_sheet(no_window, no_window.databases[0], 'r', inv, E.estimate(plans, no_window), None))
         self.assertIn('Window     none configured: no abort deadline', text)
+
+
+class ScalingTests(unittest.TestCase):
+    """W10: the rates scaled by the leaf cores P2 recorded against the baseline's, the cap, the leaf cores in the baseline, one fit per run."""
+
+    BASE = E.Baseline(scan_s_per_row=1e-6, insert_s_per_row=1e-3, chunk_overhead_s=2.0, leaf_cores=240)
+    PLANS = [Plan('t', 1000, 1, size_gib=0.0)]
+
+    def test_w10_rates_scale_down_by_leaf_cores_without_limit(self):
+        """A workspace with a quarter of the baseline's leaf cores gets rates four times slower; the overhead stays; the count proof
+        follows the scaled scan rate; no scaling when P2 or the baseline recorded no leaf cores."""
+        cfg = config_from()
+        est = E.estimate(self.PLANS, cfg, self.BASE, leaf_cores=60)
+        self.assertEqual((est.scale, est.leaf_cores), (0.25, 60))
+        self.assertAlmostEqual(est.rates.scan_s_per_row, 4e-6)
+        self.assertAlmostEqual(est.rates.insert_s_per_row, 4e-3)
+        self.assertEqual(est.rates.chunk_overhead_s, 2.0)
+        self.assertIs(est.baseline, self.BASE, 'the Estimate keeps the baseline as read; the scaled rates are separate')
+        self.assertAlmostEqual(est.copy_seconds, 2.0 + 0.004 + 4.0)
+        self.assertAlmostEqual(dict(est.allowances)['O6 count proof'], 2 * 1000 * 4e-6)
+        self.assertEqual(est.scale_note, "rates scaled by 0.25 for 60 leaf cores against the baseline's 240")
+        line = E.fit_lines(est, None)[-1]
+        self.assertTrue(line.startswith('           planning estimate: rates scaled by 0.25'), line)
+        self.assertIn(E.PLANNING_NOTE, line)
+        no_cores = E.estimate(self.PLANS, cfg, self.BASE, leaf_cores=None)
+        self.assertEqual(no_cores.scale, 1.0)
+        self.assertIn('P2 recorded no leaf cores', no_cores.scale_note)
+        default = E.estimate(self.PLANS, cfg, E.DEFAULT_BASELINE, leaf_cores=60)
+        self.assertEqual(default.scale, 1.0, 'the shipped constants carry no leaf cores, so nothing scales')
+        self.assertIn('the baseline records no leaf cores', default.scale_note)
+        self.assertIs(E.scaled(self.BASE, 1.0), self.BASE)
+
+    def test_w10_scale_up_is_capped_by_the_configuration(self):
+        """Twice the baseline's leaf cores gets no credit at the default cap of 1.0, 1.5 at a cap of 1.5; the cap is 1.0 to 4.0."""
+        est = E.estimate(self.PLANS, config_from(), self.BASE, leaf_cores=480)
+        self.assertEqual(est.scale, 1.0)
+        self.assertEqual(est.scale_note, "rates scaled by 1.00 for 480 leaf cores against the baseline's 240 (estimate.scale_up_cap 1.0 gives no more credit)")
+        self.assertAlmostEqual(est.copy_seconds, 2.0 + 0.001 + 1.0, msg='the baseline rates as they are')
+        cap = config_from(lambda d: d.update(estimate={'scale_up_cap': 1.5}))
+        est = E.estimate(self.PLANS, cap, self.BASE, leaf_cores=480)
+        self.assertEqual(est.scale, 1.5)
+        self.assertIn('(estimate.scale_up_cap 1.5 gives no more credit)', est.scale_note)
+        self.assertAlmostEqual(est.rates.insert_s_per_row, 1e-3 / 1.5)
+        under = E.estimate(self.PLANS, cap, self.BASE, leaf_cores=300)
+        self.assertEqual(under.scale, 1.25, 'under the cap the ratio applies')
+        self.assertIn('(within estimate.scale_up_cap 1.5)', under.scale_note)
+        with self.assertRaisesRegex(KitError, 'scale_up_cap'):
+            config_from(lambda d: d.update(estimate={'scale_up_cap': 0.5}))
+        with self.assertRaisesRegex(KitError, 'scale_up_cap'):
+            config_from(lambda d: d.update(estimate={'scale_up_cap': 5}))
+
+    def test_w10_calibrate_records_leaf_cores_with_the_baseline(self):
+        """calibrate keeps the leaf cores it is given with the compute label; the file round trip keeps them; an older file
+        without the key loads None; the shipped default carries none."""
+        cal = E.calibrate(REFERENCE_JOURNAL, until='2026-10-24T08:00:00Z', leaf_cores=240, compute_size='S-8')
+        self.assertEqual((cal.baseline.leaf_cores, cal.baseline.compute_size), (240, 'S-8'))
+        self.assertEqual(E.calibration_lines(cal)[4], 'recorded with the baseline: 4 workers, compute S-8, leaf cores 240')
+        plain = E.calibrate(REFERENCE_JOURNAL, until='2026-10-24T08:00:00Z')
+        self.assertIsNone(plain.baseline.leaf_cores)
+        self.assertIn('leaf cores not recorded by P2 (no scaling from this baseline)', E.calibration_lines(plain)[4])
+        self.assertIsNone(E.DEFAULT_BASELINE.leaf_cores)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'baseline.json'
+            E.write_baseline(path, cal.baseline)
+            data = json.loads(path.read_text())
+            self.assertEqual(data['leaf_cores'], 240)
+            self.assertEqual(E.load_baseline(path).leaf_cores, 240)
+            del data['leaf_cores']
+            path.write_text(json.dumps(data))
+            self.assertIsNone(E.load_baseline(path).leaf_cores, 'a file written before W10 loads without scaling')
+            path.write_text(json.dumps(dict(data, leaf_cores=0)))
+            with self.assertRaisesRegex(KitError, 'leaf_cores'):
+                E.load_baseline(path)
+
+    def test_w10_window_fit_is_one_for_the_run(self):
+        """Two databases in sequence: the copy and the allowances add up, the longest chunk is the largest, the fit line says so,
+        and a window that fits one database does not fit two."""
+        cfg = config_from()
+        inv = I.load(FIXTURE_INVENTORY)
+        plans = I.plan_tables(inv, cfg, cfg.databases[0])
+        est = E.estimate(plans, cfg, E.DEFAULT_BASELINE, pipeline_count=2)
+        self.assertIs(E.combine([est]), est)
+        run = E.combine([est, est])
+        self.assertEqual((run.databases, run.tables, run.rows), (2, 2 * est.tables, 2 * est.rows))
+        self.assertAlmostEqual(run.copy_seconds, 2 * est.copy_seconds)
+        self.assertEqual([label for label, _ in run.allowances], [label for label, _ in est.allowances])
+        self.assertAlmostEqual(run.allowance_seconds, 2 * est.allowance_seconds)
+        self.assertEqual(run.schedule.longest_chunk_seconds, est.schedule.longest_chunk_seconds)
+        self.assertIsNone(E.run_fit([est, est], None))
+        with self.assertRaisesRegex(KitError, 'No estimate'):
+            E.combine([])
+        fit = E.run_fit([est, est], cfg.window)
+        self.assertEqual(fit.databases, 2)
+        self.assertEqual(fit.deadline, E.window_fit(est, cfg.window).deadline)
+        self.assertEqual(E.window_fit(est, cfg.window).databases, 1)
+        self.assertIn('(the run: 2 databases in sequence)', E.fit_lines(est, fit)[2])
+        self.assertNotIn('the run:', E.fit_lines(est, E.window_fit(est, cfg.window))[2])
+        # a window of one high-band total plus the longest chunk and a minute, without restart or buffer allowance
+        end = cfg.window.start + dt.timedelta(seconds=int(est.total_band[2] + est.schedule.longest_chunk_seconds) + 60)
+        short = config_from(lambda d: d['window'].update(end=iso(end), restart_allowance_minutes=0, buffer_minutes=0))
+        self.assertTrue(E.run_fit([est], short.window).fits, 'one database fits the shortened window')
+        self.assertFalse(E.run_fit([est, est], short.window).fits, 'two in sequence do not')
 
 
 if __name__ == '__main__':

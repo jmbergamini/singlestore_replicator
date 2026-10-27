@@ -457,7 +457,8 @@ def handle_o7(step, ctx):
                 recopies += 1
                 ctx.log('stale check: %d table(s) marked for re-copy (round %d): %s' % (len(targets), recopies, ', '.join(tables)))
                 runner = copy_module.Runner(plans, statements, ctx.journal, ctx.runner_connector(), ctx.log, ctx.config.copy,
-                                            abort_at=copy_module.resolve_abort_at(ctx.journal, ctx.config, copy_module.longest_chunk_seconds(plans, ctx.config)),
+                                            abort_at=copy_module.resolve_abort_at(ctx.journal, ctx.config,
+                                                                                  copy_module.longest_chunk_seconds(plans, ctx.config, ctx.journal)),
                                             stop_file=copy_module.stop_file_for(ctx.journal_path), retry_failed=True)
                 complete = runner.copy()
             if not complete:

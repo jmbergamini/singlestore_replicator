@@ -924,6 +924,26 @@ def preflight(runner, db, config, owner=None):
     return ok, lines, facts
 
 
+def recorded_leaf_cores(journal):
+    """The leaf cores P2 recorded in the journal's preflight record (meta preflight, key leaf_cores), or None.
+
+    None when there is no journal, P2 has not run in it, or MV_NODES was not readable. The
+    estimate scales its rates with it (estimate.scale_factor) and calibrate stores it with the
+    baseline. Reads the journal only.
+    """
+    if journal is None:
+        return None
+    raw = journal.get_meta('preflight')
+    if not raw:
+        return None
+    try:
+        facts = json.loads(raw)
+    except ValueError:
+        return None
+    cores = facts.get('leaf_cores') if isinstance(facts, dict) else None
+    return int(cores) if cores is not None else None
+
+
 def workspace_check(ctx):
     """The workspace part of P2: (ok, lines, facts) through the Management API when a key is configured, else the three questions.
 

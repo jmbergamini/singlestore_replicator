@@ -381,7 +381,7 @@ def o1_start(step, ctx):
         try:
             from . import copy as copy_module
             _, plans, _ = copy_module.load_plans(ctx)
-            longest = copy_module.longest_chunk_seconds(plans, config)
+            longest = copy_module.longest_chunk_seconds(plans, config, ctx.journal)
             longest_note = 'longest modeled chunk %s' % format_duration(longest)
         except KitError:
             pass

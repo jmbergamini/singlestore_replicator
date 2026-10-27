@@ -7,8 +7,11 @@ chunk_seconds = chunk_overhead_s + scan_s_per_row * N + insert_s_per_row * N / B
 table is one bucket through a staging table, so its rows are inserted twice at the insert rate:
 reference_seconds = chunk_overhead_s + scan_s_per_row * N + 2 * insert_s_per_row * N. The default
 constants come from the reference run (4 workers, S-16 compute at 2x) and calibrate refits
-them from a journal. Statements issued: none (calibrate reads a journal file with sqlite3,
-read-only).
+them from a journal, recording the leaf cores of the workspace it ran on. The estimate scales
+the scan and insert rates by the leaf cores P2 recorded against the baseline's (scale_factor:
+downward without limit, upward at most estimate.scale_up_cap); a baseline without leaf cores
+scales nothing. Window fit is one per run (combine, run_fit): every database in sequence.
+Statements issued: none (calibrate reads a journal file with sqlite3, read-only).
 """
 import dataclasses
 import datetime as dt
@@ -26,6 +29,10 @@ DEFAULT_INSERT_S_PER_ROW = 2.95e-6
 DEFAULT_CHUNK_OVERHEAD_S = 2.0
 DEFAULT_WORKERS = 4
 DEFAULT_COMPUTE_SIZE = 'S-16'
+# The shipped constants carry no leaf core count, so no scaling applies until calibrate records one (section 10.6).
+DEFAULT_LEAF_CORES = None
+# What the October 27 refit showed: client concurrency is not the limit (LESSONS fact 42).
+PLANNING_NOTE = 'from 4 to 12 workers the reference workspace stayed near 3.5 B rows per hour'
 
 # Fixed allowances per step, in minutes (section 10.6).
 ALLOWANCE_MINUTES = {'freeze': 10, 'create_replacement': 2, 'post_copy': 5, 'switch': 10, 'release': 10}
@@ -48,6 +55,7 @@ class Baseline:
     source: str = 'default'
     chunks: int = 349
     fitted_overhead_s: float = None
+    leaf_cores: int = DEFAULT_LEAF_CORES
 
     @property
     def scan_rows_per_second(self):
@@ -78,6 +86,9 @@ class Baseline:
             value = getattr(baseline, name)
             if not isinstance(value, (int, float)) or value <= 0 and name != 'chunk_overhead_s' or value < 0:
                 raise KitError('Baseline %s must be a positive number' % name)
+        cores = baseline.leaf_cores
+        if cores is not None and (isinstance(cores, bool) or not isinstance(cores, int) or cores <= 0):
+            raise KitError('Baseline leaf_cores must be a positive integer or null')
         return baseline
 
 
@@ -113,6 +124,36 @@ def write_baseline(path, baseline):
 # ---------------------------------------------------------------------------
 # Model
 # ---------------------------------------------------------------------------
+def scale_factor(baseline, leaf_cores, cap=1.0):
+    """(factor, note) for the rates of a workspace with leaf_cores against the baseline's leaf cores.
+
+    The factor is leaf_cores / baseline.leaf_cores: downward without limit, upward at most cap
+    (estimate.scale_up_cap, default 1.0: no credit for a larger workspace until a performance test
+    shows more). 1.0 with the reason when the baseline or P2 recorded no leaf cores.
+    """
+    if baseline.leaf_cores is None:
+        return 1.0, 'rates not scaled: the baseline records no leaf cores (calibrate at C2 records them)'
+    if leaf_cores is None:
+        return 1.0, 'rates not scaled: P2 recorded no leaf cores for this workspace (MV_NODES not readable)'
+    raw = float(leaf_cores) / float(baseline.leaf_cores)
+    cap = float(cap)
+    if raw <= 1.0:
+        return raw, 'rates scaled by %.2f for %d leaf cores against the baseline\'s %d' % (raw, leaf_cores, baseline.leaf_cores)
+    factor = min(raw, cap)
+    if factor < raw:
+        return factor, 'rates scaled by %.2f for %d leaf cores against the baseline\'s %d (estimate.scale_up_cap %.1f gives no more credit)' % (
+            factor, leaf_cores, baseline.leaf_cores, cap)
+    return factor, 'rates scaled by %.2f for %d leaf cores against the baseline\'s %d (within estimate.scale_up_cap %.1f)' % (
+        factor, leaf_cores, baseline.leaf_cores, cap)
+
+
+def scaled(baseline, factor):
+    """The baseline with its scan and insert seconds per row divided by factor; the chunk overhead stays."""
+    if factor == 1.0:
+        return baseline
+    return dataclasses.replace(baseline, scan_s_per_row=baseline.scan_s_per_row / factor, insert_s_per_row=baseline.insert_s_per_row / factor)
+
+
 def chunk_seconds(baseline, rows, buckets):
     """Modeled seconds for one chunk of a table with rows rows split into buckets buckets."""
     return baseline.chunk_overhead_s + baseline.scan_s_per_row * rows + baseline.insert_s_per_row * rows / float(buckets)
@@ -228,6 +269,13 @@ class Estimate:
     tables: int
     rows: int
     size_gib: float
+    # the leaf cores P2 recorded, the rate scale against the baseline (scale_factor) and the rates the schedule used
+    leaf_cores: int = None
+    scale: float = 1.0
+    scale_note: str = ''
+    rates: Baseline = None
+    # the databases this estimate covers in sequence (combine); 1 for one database
+    databases: int = 1
 
     @property
     def copy_seconds(self):
@@ -293,12 +341,15 @@ def fingerprint_allowance(config, plans, baseline, workers):
 
 
 def allowances(config, plans, baseline, workers, pipeline_count=0):
-    """The fixed allowances of section 10.6 as (label, seconds), in step order."""
+    """The fixed allowances of section 10.6 as (label, seconds), in step order.
+
+    The count proof is serial: one count on each side of every table at the scan rate, not divided by the workers.
+    """
     total_rows = sum(p.est_rows for p in plans)
     items = [
         ('O3 freeze', ALLOWANCE_MINUTES['freeze'] * 60.0),
         ('O5 create replacement', ALLOWANCE_MINUTES['create_replacement'] * 60.0),
-        ('O6 count proof', 2.0 * total_rows * baseline.scan_s_per_row / max(1, workers)),
+        ('O6 count proof', 2.0 * total_rows * baseline.scan_s_per_row),
         ('O7 post-copy', ALLOWANCE_MINUTES['post_copy'] * 60.0),
         fingerprint_allowance(config, plans, baseline, workers),
         ('O9 pipelines', PIPELINE_MINUTES_EACH * 60.0 * pipeline_count),
@@ -308,15 +359,47 @@ def allowances(config, plans, baseline, workers, pipeline_count=0):
     return items
 
 
-def estimate(plans, config, baseline=None, pipeline_count=0, workers=None):
-    """Build the Estimate for a plan list under the configured copy settings."""
+def estimate(plans, config, baseline=None, pipeline_count=0, workers=None, leaf_cores=None):
+    """Build the Estimate for a plan list under the configured copy settings.
+
+    leaf_cores is what P2 recorded for the workspace (inventory.recorded_leaf_cores); the scan and
+    insert rates are scaled against the baseline's leaf cores (scale_factor) before the schedule
+    and the allowances are computed. The Estimate keeps the baseline, the factor and its note.
+    """
     baseline = baseline or DEFAULT_BASELINE
     workers = int(workers or config.copy.workers)
-    schedule = simulate(plans, workers, baseline)
+    factor, note = scale_factor(baseline, leaf_cores, config.estimate.scale_up_cap)
+    rates = scaled(baseline, factor)
+    schedule = simulate(plans, workers, rates)
     return Estimate(workers=workers, baseline=baseline, schedule=schedule,
-                    allowances=allowances(config, plans, baseline, workers, pipeline_count),
+                    allowances=allowances(config, plans, rates, workers, pipeline_count),
                     band_percent=config.estimate.band_percent, tables=len(plans), rows=sum(p.est_rows for p in plans),
-                    size_gib=sum(p.size_gib or 0.0 for p in plans))
+                    size_gib=sum(p.size_gib or 0.0 for p in plans), leaf_cores=leaf_cores, scale=factor, scale_note=note, rates=rates)
+
+
+def combine(estimates):
+    """One Estimate for the databases of a run in sequence: copy wall and worker seconds and the allowances summed by label,
+    the longest chunk the largest, the counts summed; the baseline, workers, band and scale of the first. One estimate is itself."""
+    estimates = list(estimates)
+    if not estimates:
+        raise KitError('No estimate to combine; capture a database first')
+    if len(estimates) == 1:
+        return estimates[0]
+    first = estimates[0]
+    labels, sums = [], {}
+    for est in estimates:
+        for label, seconds in est.allowances:
+            if label not in sums:
+                labels.append(label)
+                sums[label] = 0.0
+            sums[label] += seconds
+    schedule = Schedule(wall_seconds=sum(e.schedule.wall_seconds for e in estimates),
+                        worker_seconds=sum(e.schedule.worker_seconds for e in estimates),
+                        longest_chunk_seconds=max(e.schedule.longest_chunk_seconds for e in estimates), per_table={})
+    return Estimate(workers=first.workers, baseline=first.baseline, schedule=schedule, allowances=[(label, sums[label]) for label in labels],
+                    band_percent=first.band_percent, tables=sum(e.tables for e in estimates), rows=sum(e.rows for e in estimates),
+                    size_gib=sum(e.size_gib for e in estimates), leaf_cores=first.leaf_cores, scale=first.scale, scale_note=first.scale_note,
+                    rates=first.rates, databases=len(estimates))
 
 
 @dataclasses.dataclass
@@ -329,6 +412,8 @@ class WindowFit:
     copy_end: tuple
     total_end: tuple
     longest_chunk_seconds: float
+    # the databases the fit covers in sequence (one fit per run, section 10.6)
+    databases: int = 1
 
     @property
     def fits(self):
@@ -347,11 +432,19 @@ def window_fit(est, window):
     before_copy = sum(s for label, s in est.allowances if label.startswith(('O3', 'O5')))
     copy_end = tuple(window.start + dt.timedelta(seconds=before_copy + s) for s in est.copy_band)
     total_end = tuple(window.start + dt.timedelta(seconds=s) for s in est.total_band)
-    return WindowFit(window.start, window.end, deadline, copy_end, total_end, est.schedule.longest_chunk_seconds)
+    return WindowFit(window.start, window.end, deadline, copy_end, total_end, est.schedule.longest_chunk_seconds, databases=est.databases)
+
+
+def run_fit(estimates, window):
+    """The one window fit of a run: every database's estimate in sequence (combine); None without a window."""
+    if window is None:
+        return None
+    return window_fit(combine(estimates), window)
 
 
 def fit_lines(est, fit):
-    """Human lines for the plan sheet and the profile output."""
+    """Human lines for the plan sheet and the profile output: the estimate, the run's fit when a window is configured,
+    and the planning line (the rate scale against the baseline's leaf cores, PLANNING_NOTE)."""
     low, expected, high = est.copy_band
     tl, te, th = est.total_band
     lines = ['Estimate   copy %s expected (%s low, %s high) for %d tables, %s rows, %.0f GiB, %d workers' % (
@@ -360,9 +453,11 @@ def fit_lines(est, fit):
     if fit is not None:
         verdict = 'FITS' if fit.fits else 'DOES NOT FIT'
         spare = fit.spare_seconds
-        lines.append('           copy ends %s expected, %s at high; deadline %s: %s, %s %s at high' % (
+        lines.append('           copy ends %s expected, %s at high; deadline %s: %s, %s %s at high%s' % (
             iso(fit.copy_end[1]), iso(fit.copy_end[2]), iso(fit.deadline), verdict,
-            format_duration(abs(spare)), 'spare' if spare >= 0 else 'short'))
+            format_duration(abs(spare)), 'spare' if spare >= 0 else 'short',
+            (' (the run: %d databases in sequence)' % fit.databases) if fit.databases > 1 else ''))
+    lines.append('           planning estimate: %s; %s' % (est.scale_note or 'rates as in the baseline', PLANNING_NOTE))
     return lines
 
 
@@ -462,13 +557,16 @@ def read_chunks(journal_path, until=None, first_pass_only=True):
 
 
 def calibrate(journal_path, until=None, first_pass_only=True, workers=None, compute_size=None, run_id=None,
-              default_overhead=DEFAULT_CHUNK_OVERHEAD_S):
+              default_overhead=DEFAULT_CHUNK_OVERHEAD_S, leaf_cores=None):
     """Fit scan, insert and overhead by least squares on a journal's first-pass chunks.
 
     duration = overhead + scan * table_rows + insert * rows_inserted, three free parameters.
     The stored chunk_overhead_s is the larger of the shipped default and the fitted value, so
     the model never gets less conservative than the default; the fitted value is kept as
-    fitted_overhead_s. Returns a Calibration. Reads the journal file only.
+    fitted_overhead_s. leaf_cores is what P2 recorded for the workspace the run copied on
+    (inventory.recorded_leaf_cores); the baseline keeps it with the compute label, so a later
+    estimate on another workspace scales the rates (scale_factor). Returns a Calibration.
+    Reads the journal file only.
     """
     points = read_chunks(journal_path, until, first_pass_only)
     if len(points) < 4:
@@ -489,7 +587,8 @@ def calibrate(journal_path, until=None, first_pass_only=True, workers=None, comp
     baseline = Baseline(scan_s_per_row=scan, insert_s_per_row=insert, chunk_overhead_s=max(default_overhead, overhead),
                         workers=int(workers or DEFAULT_WORKERS), compute_size=compute_size or DEFAULT_COMPUTE_SIZE,
                         run_id=run_id or Path(journal_path).parent.name or 'journal', fitted_utc=iso(utc_now()),
-                        source='calibrate', chunks=len(points), fitted_overhead_s=overhead)
+                        source='calibrate', chunks=len(points), fitted_overhead_s=overhead,
+                        leaf_cores=int(leaf_cores) if leaf_cores is not None else None)
     first = min(s for _, _, _, s, _, _ in points)
     last = max(e for _, _, _, _, e, _ in points)
     return Calibration(baseline=baseline, chunks=len(points), tables=len({t for *_, t in points}),
@@ -511,6 +610,8 @@ def calibration_lines(cal, size_gib=None):
             cal.fitted_overhead_s, b.chunk_overhead_s, cal.residual_rms_s),
         'observed: %.2f billion rows per hour%s' % (cal.rows_per_hour / 1e9, (
             ', about %.0f GiB per hour' % cal.gib_per_hour(size_gib)) if size_gib else ', GiB per hour needs --size-gib or table sizes'),
+        'recorded with the baseline: %d workers, compute %s, leaf cores %s' % (
+            b.workers, b.compute_size, b.leaf_cores if b.leaf_cores is not None else 'not recorded by P2 (no scaling from this baseline)'),
     ]
     return lines
 

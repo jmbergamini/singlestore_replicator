@@ -171,6 +171,8 @@ SCHEMA = {
     'estimate': {
         'baseline': Field('str', 'customer/baseline.json', nullable=True),
         'band_percent': Field('int', 15, minimum=0, maximum=100),
+        # the most credit a workspace with more leaf cores than the baseline's gets on the rates; 1.0 is none (section 10.6)
+        'scale_up_cap': Field('number', 1.0, minimum=1.0, maximum=4.0),
     },
     'closeout': {
         'retain_days': Field('int', 90, minimum=1),

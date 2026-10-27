@@ -123,8 +123,10 @@ def summary_rows(inventory, plans, est, fit, config, db, run_id, baseline, steps
     tl, te, th = est.total_band
     rows.append((None, None))
     rows.append(('Estimate', None))
-    rows.extend([('Baseline', '%s (scan %.3e s/row, insert %.3e s/row, overhead %.1f s, %d workers, %s)' % (
-                  baseline.source, baseline.scan_s_per_row, baseline.insert_s_per_row, baseline.chunk_overhead_s, baseline.workers, baseline.compute_size)),
+    rows.extend([('Baseline', '%s (scan %.3e s/row, insert %.3e s/row, overhead %.1f s, %d workers, %s, leaf cores %s)' % (
+                  baseline.source, baseline.scan_s_per_row, baseline.insert_s_per_row, baseline.chunk_overhead_s, baseline.workers,
+                  baseline.compute_size, baseline.leaf_cores if baseline.leaf_cores is not None else 'not recorded')),
+                 ('Planning estimate', '%s; %s' % (est.scale_note, estimate.PLANNING_NOTE)),
                  ('Copy wall expected', format_duration(expected)), ('Copy wall low', format_duration(low)), ('Copy wall high', format_duration(high)),
                  ('Copy worker seconds', round(est.schedule.worker_seconds)), ('Longest chunk', format_duration(est.schedule.longest_chunk_seconds)),
                  ('Modeled rows per hour', round(est.rows_per_hour)),
@@ -373,6 +375,7 @@ def _latest(results, tier):
 
 def final_summary_rows(inventory, plans, journal, config, db, run_id, name_map=None, baseline=None, calibration=None):
     """The (label, value) rows of the final workbook's Summary tab; calibration, when given, is the C2 Calibration line."""
+    from . import inventory as inventory_module
     board = journal.steps_board()
     per_table, total = copy_stats(journal)
     meta = journal.meta()
@@ -395,7 +398,7 @@ def final_summary_rows(inventory, plans, journal, config, db, run_id, name_map=N
                  ('Copy wall time', format_duration(total['wall_seconds'])), ('Copy worker seconds', round(total['worker_seconds'])),
                  ('Rows per hour', round(total['rows'] / hours) if hours else 0), ('GiB per hour', round(size_gib / hours, 1) if hours else 0),
                  ('Lock waits', sum(e['lock_waits'] for e in per_table.values())), ('Re-copies', sum(e['recopies'] for e in per_table.values()))])
-    est = estimate.estimate(plans, config, baseline or estimate.DEFAULT_BASELINE)
+    est = estimate.estimate(plans, config, baseline or estimate.DEFAULT_BASELINE, leaf_cores=inventory_module.recorded_leaf_cores(journal))
     rows.append((None, None))
     rows.append(('Estimate against actual', None))
     rows.extend([('Copy wall expected', format_duration(est.copy_seconds)), ('Copy wall actual', format_duration(total['wall_seconds'])),
@@ -658,7 +661,7 @@ def handle_c2(step, ctx):
     Calibration line that says so, and the step passes with that note. calibrate only reads the
     journal, so it runs before the reports; the baseline file is the last write.
     """
-    from . import copy as copy_module, estimate, report_md
+    from . import copy as copy_module, estimate, inventory as inventory_module, report_md
     data, plans, _ = copy_module.load_plans(ctx)
     reports = ctx.config.runs_dir() / ctx.run_id / ctx.db.source / 'reports'
     if ctx.dry_run:
@@ -667,7 +670,8 @@ def handle_c2(step, ctx):
     record_retain_until(ctx)
     try:
         cal, kept = estimate.calibrate(ctx.journal_path, first_pass_only=True, workers=ctx.config.copy.workers,
-                                       compute_size=ctx.config.workspace.compute_size, run_id=ctx.run_id), None
+                                       compute_size=ctx.config.workspace.compute_size, run_id=ctx.run_id,
+                                       leaf_cores=inventory_module.recorded_leaf_cores(ctx.journal)), None
     except KitError as exc:
         cal, kept = None, 'baseline not recalibrated (%s); the baseline in use stays: %s' % (
             exc, 'the shipped default' if baseline.source == 'default' else baseline.source)

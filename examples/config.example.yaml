@@ -77,6 +77,7 @@ pipelines:
 estimate:
   baseline: customer/baseline.json      # optional; defaults ship in s2rebuild/estimate.py
   band_percent: 15
+  scale_up_cap: 1.0                     # credit for more leaf cores than the baseline's: 1.0 none, up to 4.0; fewer cores always slow the estimate
 closeout:
   retain_days: 7
   flexible_parallelism: 0.5             # SET GLOBAL query_parallelism_per_leaf_core; null to skip

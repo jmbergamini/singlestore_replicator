@@ -73,6 +73,7 @@ One YAML file, default `customer/config.yaml`, selected with `--config` or `S2RE
 | `pipelines.retention_hours` | mapping | `{}` | P4 plan sheet |
 | `estimate.baseline` | path or null | `customer/baseline.json` | P3, P4, C2 |
 | `estimate.band_percent` | integer | `15` | P3, P4 |
+| `estimate.scale_up_cap` | number 1.0 to 4.0 | `1.0` | P3, P4, O4: the most the scan and insert rates are scaled up for a workspace with more leaf cores than the baseline's (1.0 is no credit); fewer leaf cores always scale them down in proportion; no scaling while the baseline records no leaf cores |
 | `closeout.retain_days` | integer | `90` (minimum 1) | C2 records `retain_until_utc`, the switch time plus this; C5 (`s2rebuild cleanup --delete`) refuses before it; a value under 90 prints a line on the plan sheet; no key makes a run delete the retained copy |
 | `closeout.flexible_parallelism` | number or null | `0.5` | O11 |
 | `paths.runs_dir` | path | `customer/runs` | every command (everything a run writes stays under its parent folder) |

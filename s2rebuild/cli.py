@@ -789,16 +789,18 @@ def cmd_profile(args, env, out, state):
         if inv.dry_run and inv.run_id == DRY_RUN_ID and not args.out:
             raise KitError('No run exists yet; a dry run needs --out FILE for the workbook')
         exit_code = EXIT_DONE
-        for db in inv.databases:
-            journal = inv.journals[db.source]
-            target_dir = inventory.inventory_dir(inv.config, inv.run_id, db, step_id)
-            if args.out:
-                out_path = _inside_customer(inv.config, args.out)
-            else:
-                name = ('profile' if step_id == 'P3' else 'freeze-capture') + ('-dry-run' if inv.dry_run else '') + '.xlsx'
-                out_path = inv.config.runs_dir() / inv.run_id / db.source / 'reports' / name
-            runner_session = owner_session = None
-            try:
+        captured, sessions = [], []
+        try:
+            # every capture and its estimate first, so the window fit is one for the run: the databases in sequence (section 10.6)
+            for db in inv.databases:
+                journal = inv.journals[db.source]
+                target_dir = inventory.inventory_dir(inv.config, inv.run_id, db, step_id)
+                if args.out:
+                    out_path = _inside_customer(inv.config, args.out)
+                else:
+                    name = ('profile' if step_id == 'P3' else 'freeze-capture') + ('-dry-run' if inv.dry_run else '') + '.xlsx'
+                    out_path = inv.config.runs_dir() / inv.run_id / db.source / 'reports' / name
+                runner_session = None
                 if args.inventory:
                     data = inventory.load(args.inventory)
                     log('%s: using the saved capture at %s' % (db.source, args.inventory))
@@ -807,6 +809,7 @@ def cmd_profile(args, env, out, state):
                     log('%s: dry run, using the capture at %s' % (db.source, target_dir))
                 else:
                     runner_session, owner_session = _open_sessions(inv, env)
+                    sessions.extend([runner_session, owner_session])
                     data = inventory.capture(runner_session, db, inv.config, owner_session, exact_counts=args.exact_counts, log=log, step=step_id)
                     if step_id == 'P3':
                         _ask_pipeline_credentials(inv, db, data, log, env)
@@ -823,8 +826,10 @@ def cmd_profile(args, env, out, state):
                         inventory.write(data, target_dir, plans)
                         raise
                 pipeline_count = len(data['pipelines']['items']) if data.get('pipelines', {}).get('captured') else 0
-                est = estimate.estimate(plans, inv.config, baseline, pipeline_count)
-                fit = estimate.window_fit(est, inv.config.window) if inv.config.window is not None else None
+                est = estimate.estimate(plans, inv.config, baseline, pipeline_count, leaf_cores=inventory.recorded_leaf_cores(journal))
+                captured.append((db, journal, target_dir, out_path, data, plans, est, runner_session))
+            fit = estimate.run_fit([c[6] for c in captured], inv.config.window)
+            for db, journal, target_dir, out_path, data, plans, est, runner_session in captured:
                 if not inv.dry_run:
                     journal.step_start(step_id)
                 try:
@@ -852,10 +857,10 @@ def cmd_profile(args, env, out, state):
                     journal.step_end(step_id, 'passed', '%s captured %d tables; workbook %s' % (step_id, len(plans), out_path), str(out_path))
                 if fit is not None and not fit.fits:
                     exit_code = EXIT_GATE
-            finally:
-                for s in (runner_session, owner_session):
-                    if s is not None:
-                        s.close()
+        finally:
+            for s in sessions:
+                if s is not None:
+                    s.close()
         if inv.dry_run:
             log('No connection was opened and nothing was written under inventory/; the workbook was written from the saved capture.')
         return exit_code
@@ -949,8 +954,9 @@ def handle_o4(step, ctx):
             inventory.write(data, target_dir, plans)  # kept for review, as profile does
             return steps.Outcome(steps.FAILED, str(exc), EXIT_GATE)
     pipeline_count = len(data['pipelines']['items']) if data.get('pipelines', {}).get('captured') else 0
-    est = estimate.estimate(plans, config, baseline, pipeline_count)
-    fit = estimate.window_fit(est, config.window) if config.window is not None else None
+    cores = inventory.recorded_leaf_cores(journal)
+    est = estimate.estimate(plans, config, baseline, pipeline_count, leaf_cores=cores)
+    fit = _o4_run_fit(config, ctx.run_id, db, est, baseline, cores, log)
     _write_profile(config, ctx.run_id, journal, False, db, 'O4', data, plans, est, fit, baseline, target_dir, out_path, None, log, env)
     journal.set_meta('inventory_dir_O4', str(target_dir))
     if data.get('attachment'):
@@ -961,36 +967,72 @@ def handle_o4(step, ctx):
     return steps.Outcome(steps.PASSED, note)
 
 
+def _o4_run_fit(config, run_id, db, est, baseline, leaf_cores, log):
+    """The run's window fit at O4: this database's fresh estimate with the other configured databases from their newest capture
+    (O4, else P3); a database without a capture is left out with a log line. None without a window."""
+    if config.window is None:
+        return None
+    estimates = [est]
+    for other in config.databases:
+        if other.source == db.source:
+            continue
+        source = next((d for d in (inventory.inventory_dir(config, run_id, other, s) for s in ('O4', 'P3'))
+                       if (d / inventory.INVENTORY_FILE).is_file()), None)
+        if source is None:
+            log('    fit: %s has no capture yet; the run fit leaves it out' % other.source)
+            continue
+        data = inventory.load(source)
+        count = len(data['pipelines']['items']) if data.get('pipelines', {}).get('captured') else 0
+        estimates.append(estimate.estimate(inventory.plan_tables(data, config, other), config, baseline, count, leaf_cores=leaf_cores))
+    return estimate.run_fit(estimates, config.window)
+
+
 def _journal_facts(inv, db):
-    """(workspace facts, skipped pipeline source types) from the run's journal for db, read only; (None, set()) without a journal.
+    """(workspace facts, skipped pipeline source types, leaf cores) from the run's journal for db, read only; (None, set(), None)
+    without a journal.
 
     The plan sheet prints the Workspace line P2 recorded and the pipelines the operator skipped
-    at the P3 credential prompt.
+    at the P3 credential prompt; the estimate scales its rates by the leaf cores P2 recorded.
     """
     from . import workspace
     path = inv.journal_path(db)
     if inv.dry_run or not path.exists():
-        return None, set()
+        return None, set(), None
     journal = Journal(path, read_only=True)
     try:
-        return workspace.recorded(journal), pipelines.skipped_types(journal)
+        return workspace.recorded(journal), pipelines.skipped_types(journal), inventory.recorded_leaf_cores(journal)
+    finally:
+        journal.close()
+
+
+def _leaf_cores_at(journal_path):
+    """The leaf cores P2 recorded in the journal at journal_path, read only; None when the file is not a kit journal."""
+    try:
+        journal = Journal(journal_path, read_only=True)
+    except KitError:
+        return None
+    try:
+        return inventory.recorded_leaf_cores(journal)
     finally:
         journal.close()
 
 
 def cmd_plan(args, env, out, state):
-    """plan: print the P4 plan sheet from the run's P3 inventory (or --inventory DIR)."""
+    """plan: print the P4 plan sheet from the run's P3 inventory (or --inventory DIR); the window fit is one for the run."""
     inv = Invocation(args, env, out, state, run_mode=RUN_EXISTING, dry_run=bool(args.inventory) or args.dry_run)
     try:
         baseline = _baseline_for(inv.config, args.baseline)
+        sheets = []
         for db in inv.databases:
             source = Path(args.inventory) if args.inventory else inventory.inventory_dir(inv.config, inv.run_id, db, 'P3')
             data = inventory.load(source)
             plans = inventory.plan_tables(data, inv.config, db)
             pipeline_count = len(data['pipelines']['items']) if data.get('pipelines', {}).get('captured') else 0
-            est = estimate.estimate(plans, inv.config, baseline, pipeline_count)
-            fit = estimate.window_fit(est, inv.config.window) if inv.config.window is not None else None
-            facts, skipped = _journal_facts(inv, db)
+            facts, skipped, cores = _journal_facts(inv, db)
+            est = estimate.estimate(plans, inv.config, baseline, pipeline_count, leaf_cores=cores)
+            sheets.append((db, data, est, facts, skipped))
+        fit = estimate.run_fit([s[2] for s in sheets], inv.config.window)
+        for db, data, est, facts, skipped in sheets:
             for line in estimate.plan_sheet(inv.config, db, inv.run_id, data, est, fit, _rehearsal_note(inv.config), env,
                                             workspace=facts, skipped=skipped):
                 print(line, file=out)
@@ -1017,7 +1059,7 @@ def cmd_calibrate(args, env, out, state):
         finally:
             inv.close()
     cal = estimate.calibrate(journal_path, until=args.until, first_pass_only=not args.all_attempts, workers=config.copy.workers,
-                             compute_size=config.workspace.compute_size, run_id=run_id)
+                             compute_size=config.workspace.compute_size, run_id=run_id, leaf_cores=_leaf_cores_at(journal_path))
     size = args.size_gib
     if size is None:
         try:

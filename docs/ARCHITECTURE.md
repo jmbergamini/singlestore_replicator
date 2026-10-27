@@ -261,6 +261,7 @@ pipelines:
 estimate:
   baseline: customer/baseline.json      # optional; defaults ship in s2rebuild/estimate.py
   band_percent: 15
+  scale_up_cap: 1.0                     # credit for more leaf cores than the baseline's: 1.0 none, up to 4.0
 closeout:
   retain_days: 7
   flexible_parallelism: 0.5             # SET GLOBAL query_parallelism_per_leaf_core; null to skip
@@ -395,13 +396,15 @@ reference_seconds = chunk_overhead_s + scan_s_per_row * N + 2 * insert_s_per_row
 
 Default constants (reference run, 4 workers, S-16 compute at 2x, October 24, 2026): `scan_s_per_row = 7.62e-8` (13.1 million rows scanned per second per worker), `insert_s_per_row = 2.95e-6` (339 thousand rows inserted per second per worker), `chunk_overhead_s = 2`. The fit reproduces the reference run's 23,867 worker-seconds exactly and predicts the largest table within 1 percent. Row width did not change the fit (tables with 5 and 257 columns both landed within 10 percent).
 
-Wall time: a list-scheduling simulation. Chunks sorted by table rows descending, W workers, per-table concurrency limits honored, each chunk takes its modeled seconds. The result is the expected copy wall time. Fixed allowances are added per step from config defaults: freeze 10 minutes, create replacement 2 minutes, count proof `2 * sum(N) * scan_s_per_row / W`, fingerprints up to the budget, post-copy 5 minutes, pipelines 1 minute per pipeline, switch 10 minutes, release 10 minutes.
+Scaled to the workspace: the baseline records the leaf cores of the workspace it was fitted on (`leaf_cores`, with the compute label; the shipped constants carry none). P2 records the leaf cores of the workspace in hand (`MV_NODES`, leaf nodes times cores per node) in the preflight record, and the estimate scales the scan and insert rates by `leaf_cores / baseline.leaf_cores` (`estimate.scale_factor`): downward without limit, upward at most `estimate.scale_up_cap` (default 1.0, no credit for a larger workspace until a performance test shows more; fact 42). A baseline without leaf cores, or a P2 that could not read them, scales nothing and the planning line says why. The chunk overhead is not scaled. The abort deadline's longest chunk (O1, O6, O7) uses the same scaled rates.
+
+Wall time: a list-scheduling simulation. Chunks sorted by table rows descending, W workers, per-table concurrency limits honored, each chunk takes its modeled seconds. The result is the expected copy wall time. Fixed allowances are added per step from config defaults: freeze 10 minutes, create replacement 2 minutes, count proof `2 * sum(N) * scan_s_per_row` (serial: one count on each side of every table, not divided by the workers), fingerprints up to the budget, post-copy 5 minutes, pipelines 1 minute per pipeline, switch 10 minutes, release 10 minutes.
 
 Bands: low = expected times (1 minus band/100), high = expected times (1 plus band/100), band default 15 percent.
 
-Window fit: `abort_deadline = window.end minus restart_allowance minus buffer minus longest_chunk_seconds`. The plan sheet prints expected, low and high finish times against the deadline and says fits or does not fit.
+Window fit: `abort_deadline = window.end minus restart_allowance minus buffer minus longest_chunk_seconds`. The fit is one per run, not per database: `estimate.combine` adds the copy wall time and the allowances of every configured database in sequence and takes the largest longest chunk, and `run_fit` places that in the window (`profile`, `plan` and the O4 capture, which takes the other databases from their newest capture). The plan sheet and the profile print expected, low and high finish times against the deadline, say fits or does not fit (with "the run: N databases in sequence" for more than one), and end with the planning line: the rate scale against the baseline's leaf cores and the note that from 4 to 12 workers the reference workspace stayed near 3.5 B rows per hour.
 
-`calibrate` (C2) refits the two constants by least squares from a journal (duration against table rows and rows inserted per chunk, first-pass chunks only) and writes `customer/baseline.json` with the constants, workers, compute label, run id and date. `profile` uses the baseline file when present.
+`calibrate` (C2) refits the two constants by least squares from a journal (duration against table rows and rows inserted per chunk, first-pass chunks only) and writes `customer/baseline.json` with the constants, workers, compute label, the leaf cores P2 recorded, run id and date. `profile` uses the baseline file when present.
 
 Bucket count: `B = 1` when `N < min_rows_for_chunking`, otherwise `B = min(max_buckets_per_table, ceil(N / chunk_rows))`. The cap matters: every hash-bucket chunk scans the whole table, so worker time grows with B × N. On the reference run the 134-bucket largest table spent 77 percent of its time scanning; a cap of 32 cuts the modeled copy from 105 to 61 minutes of wall time.
 
@@ -629,7 +632,7 @@ Create `<prefix>_src` with synthetic tables that exercise: a single-column key, 
 
 ### 10.19 calibrate.py (C2)
 
-Section 10.6. Also prints observed rows per hour and GiB per hour for the human summary. Calibration is advisory: when the journal cannot be fitted (fewer than 4 first-pass chunks, a singular or non-positive fit), the baseline in use stays, the Summary of the final workbook and of the run report carries a Calibration line that says so, and C2 passes with that note. C1 and C2 are python steps; `gate` records them by hand only with `--override NOTE`.
+Section 10.6 (`estimate.calibrate`; the command and the C2 handler pass the leaf cores P2 recorded, `inventory.recorded_leaf_cores`, so the baseline carries them). Also prints observed rows per hour and GiB per hour for the human summary. Calibration is advisory: when the journal cannot be fitted (fewer than 4 first-pass chunks, a singular or non-positive fit), the baseline in use stays, the Summary of the final workbook and of the run report carries a Calibration line that says so, and C2 passes with that note. C1 and C2 are python steps; `gate` records them by hand only with `--override NOTE`.
 
 ### 10.20 bundle.py
 
@@ -697,6 +700,7 @@ Verified on the reference run or in the documentation. `docs/LESSONS.md` carries
 39. Engine 10.8.0, tpcds3tb, October 27: a sampled fingerprint with `CRC32(key) MOD 100 < p` reads every row, so a 5 percent sample cost as much as a full fingerprint, and one session fingerprinted one side of one table at a time. Tier 3 samples a contiguous range on the first sort key column or the time column (`MIN` and `MAX` from the source, the same predicate on both sides), so segment elimination skips the rest, and runs on `verify.sessions` connections, largest table first with its two sides at once (`Verifier.tier3_all`); `--yes` accepts the recorded result without a rerun when no chunk was copied since (`verify.recorded_state`).
 40. Helios, run 20261026-1301, October 26: autoscale replaces nodes one at a time (MV_EVENTS: SYSTEM_VAR_CHANGED, NEW_MASTER_AGGREGATOR, NODE_DETACHED, NODE_OFFLINE per leaf) and every chunk in flight fails with error 1997 "transaction was already in its commit phase"; 28 chunks were lost that way, and P3 once failed at a connection reset while the workspace was scaling. Run with autoscale off: P2 reads the setting through the Management API when a key is configured and O1 refuses while it is on (`--accept-autoscale NOTE` overrides, recorded). The copy treats 1997 as a transient (`copy.is_commit_phase`: reconciled and requeued without an attempt), `copy.max_consecutive_failures` failures in a row trip the breaker and end O6 INCOMPLETE, and a driver reset (2003, 2004, 2006, 2013) ends a command with one plain line and exit 2.
 41. Helios, October 25: auto-suspend counts queries from connections as activity, not load batches; a workspace suspended while loads ran with no connection open. The kit's own keep-alive (`connect.KeepAlive`) sends `SELECT 1` on its own runner connection every `workspace.keepalive_minutes` while a step runs; between commands the plan (P4) records that auto-suspend is off for the window, or that a notebook job of the customer runs the same query every 15 minutes. The Management API field names the kit reads for the workspace (`GET /v1/workspaces/<id>`: `state`, `autoSuspend`, `autoScale`) are a best guess to confirm in the live ladder (I4); P2 records the raw fields, so a wrong name shows as "not reported" in the journal and on the plan sheet.
+42. Helios, S-8 at 4X (240 leaf cores), tpcds3tb, October 27: 270 M row chunks into 16 partitions took about 18 minutes at 4 workers (3.5 B rows per hour, leaf CPU about 17 percent) and 50 to 53 minutes at 12 workers (3.7 B rows per hour, CPU about 26 percent); client concurrency is not the limit. The estimate therefore scales its rates by the leaf cores P2 reads from `MV_NODES` against the baseline's (`estimate.scale_factor`), downward without limit and upward at most `estimate.scale_up_cap` (default 1.0), and the plan sheet carries the note as the planning line (section 10.6).
 
 ## 12. Documentation and branding
 
@@ -891,6 +895,7 @@ Deadline   10:58Z abort for the copy (end minus 60 m restart, 30 m buffer, 4 m l
 Freeze     Path A read-only attachment; application stop owner: <name>
 Estimate   copy 61 m expected (52 m low, 70 m high) for 95 tables, 3.05 B rows, 938 GiB
            total O2 to O11: 2 h 05 m expected (1 h 47 m low, 2 h 24 m high)   FITS, 3 h 03 m spare at high
+           planning estimate: rates scaled by 0.50 for 120 leaf cores against the baseline's 240; from 4 to 12 workers the reference workspace stayed near 3.5 B rows per hour
 Pipelines  33 captured (31 KAFKA, 2 S3); route 1 (kit replays); credentials: KAFKA env set, S3 env not set
            retention stated by customer: KAFKA 7 d; window plus release 3 h; margin OK
 Accounts   write-capable: app_user, app_user_2, retention_job (Path B would revoke these on every database)
