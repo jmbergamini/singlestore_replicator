@@ -35,7 +35,7 @@ Identity is the branch record, never a STORAGE_ID alone (Helios 10.8.0, October 
 STORAGE_ID names a storage, and a branch keeps its parent's). identify(session, name) joins
 MV_CLOUD_ATTACHED_DATABASES with MV_CLOUD_BRANCHES into one record (name, STORAGE_ID,
 ATTACH_TYPE create, resume or pitr, COMPUTE_ID, ACCESS, IS_DETACHED, IS_DROPPED, END_VERSION,
-ATTACH_SYNTAX); the key is name, STORAGE_ID, ATTACH_TYPE and COMPUTE_ID (records_match), and
+ATTACH_SYNTAX); the key is name, STORAGE_ID and ATTACH_TYPE (records_match; COMPUTE_ID changes on every attach, fact 44), and
 ROW_NUMBER is never read. The journal stores the whole record per role; every DETACH, ATTACH and
 DROP of the machine and of the rollback runs behind a comparison with the recorded record and
 refuses with both records printed when they differ. S1 records the original's detached record,
@@ -125,10 +125,13 @@ STORAGE_ONLY_LABELS = {'source': 'S1 before (for S2b): the original storage hold
 # COUNT of attached databases under a name (parameter: the name): the skip_if of the printed R2c statements
 NAME_ATTACHED_COUNT_SQL = 'SELECT COUNT(*) AS n FROM information_schema.MV_CLOUD_ATTACHED_DATABASES WHERE DATABASE_NAME = %s'
 # the state of one record (parameters: name, STORAGE_ID, COMPUTE_ID): IS_DROPPED = 1 after a DROP
-RECORD_STATE_SQL = ('SELECT %s FROM information_schema.MV_CLOUD_BRANCHES WHERE DATABASE_NAME = %%s AND STORAGE_ID = %%s AND LATEST_COMPUTE_ID = %%s'
-                    % RECORD_COLUMNS)
-KEY_FIELDS = ('DATABASE_NAME', 'STORAGE_ID', 'ATTACH_TYPE', 'COMPUTE_ID')
-JOURNAL_KEY_FIELDS = ('database_name', 'storage_id', 'record_type', 'compute_id')
+# the records of a name on a STORAGE_ID (parameters: name, STORAGE_ID), one not dropped first and an attached one before a detached one, so
+# the state checks read the record that matters; never by COMPUTE_ID, which every attach changes (fact 44)
+RECORD_STATE_SQL = ('SELECT %s FROM information_schema.MV_CLOUD_BRANCHES WHERE DATABASE_NAME = %%s AND STORAGE_ID = %%s '
+                    'ORDER BY IS_DROPPED, IS_DETACHED' % RECORD_COLUMNS)
+# COMPUTE_ID is not part of the key: Helios gives a record a new one on every attach, a re-attach by its own syntax included (fact 44)
+KEY_FIELDS = ('DATABASE_NAME', 'STORAGE_ID', 'ATTACH_TYPE')
+JOURNAL_KEY_FIELDS = ('database_name', 'storage_id', 'record_type')
 SYNTAX_COMPUTE = re.compile(r' COMPUTEID ([A-Za-z0-9_:-]+)\s*;?\s*$')
 
 
@@ -152,20 +155,31 @@ def _record(branch_row, attachment=None):
 
 
 def record_key(record):
-    """(name, STORAGE_ID, ATTACH_TYPE, COMPUTE_ID) as strings for a live record (identify) or a journal attachment row; None when a part is unknown."""
+    """(name, STORAGE_ID, ATTACH_TYPE) as strings for a live record (identify) or a journal attachment row; ATTACH_TYPE None when unknown.
+
+    None when the name or the STORAGE_ID is unknown. A journal row taken from MV_CLOUD_ATTACHED_DATABASES
+    alone carries no ATTACH_TYPE; records_match then compares name and STORAGE_ID.
+    """
     if record is None:
         return None
     fields = JOURNAL_KEY_FIELDS if 'record_type' in record or 'database_name' in record else KEY_FIELDS
     values = [record.get(f) for f in fields]
-    if any(v is None or (isinstance(v, str) and ownersql.placeholders(v)) for v in values):
+    if any(v is None or (isinstance(v, str) and ownersql.placeholders(v)) for v in values[:2]):
         return None
-    return tuple(str(v).lower() if i == 2 else str(v) for i, v in enumerate(values))
+    kind = values[2]
+    kind = None if kind is None or ownersql.placeholders(str(kind)) else str(kind).lower()
+    return (str(values[0]), str(values[1]), kind)
 
 
 def records_match(a, b):
-    """True when two records (live or journal rows) carry the same name, STORAGE_ID, ATTACH_TYPE and COMPUTE_ID; an unknown part never matches."""
+    """True when two records (live or journal rows) carry the same name and STORAGE_ID, and the same ATTACH_TYPE where both know it.
+
+    An unknown name or STORAGE_ID never matches. COMPUTE_ID is not compared: every attach changes it (fact 44).
+    """
     ka, kb = record_key(a), record_key(b)
-    return ka is not None and ka == kb
+    if ka is None or kb is None:
+        return False
+    return ka[:2] == kb[:2] and (ka[2] is None or kb[2] is None or ka[2] == kb[2])
 
 
 def record_text(record):
@@ -237,10 +251,10 @@ def all_records(session, name):
 
 
 def original_state(source_records, names):
-    """'attached', 'detached', 'dropped' or None: the state of the original record (the recorded source STORAGE_ID and COMPUTE_ID) among records."""
-    sid, cid = str(names.get('source_sid')), names.get('source_cid')
+    """'attached', 'detached', 'dropped' or None: the state of the original record (the recorded source STORAGE_ID and ATTACH_TYPE) among records."""
+    sid, kind = str(names.get('source_sid')), names.get('source_type')
     for r in source_records:
-        if str(r['STORAGE_ID']) != sid or (_known(cid) and str(r['COMPUTE_ID']) != str(cid)):
+        if str(r['STORAGE_ID']) != sid or (_known(kind) and str(r['ATTACH_TYPE']).lower() != str(kind).lower()):
             continue
         if r['IS_DROPPED']:
             return 'dropped'
@@ -249,15 +263,15 @@ def original_state(source_records, names):
 
 
 def original_record(source_records, names):
-    """The original record that is not dropped (the source name, the recorded source STORAGE_ID and COMPUTE_ID) among records, or None.
+    """The original record that is not dropped (the source name, the recorded source STORAGE_ID and ATTACH_TYPE) among records, or None.
 
     The position reads the source by this record, never by the first row of its storage: a
     branch of the source and a dropped record of an earlier attempt share the STORAGE_ID
     (facts 27 and 35), and the server lists them in no fixed order (fact 33).
     """
-    sid, cid = str(names.get('source_sid')), names.get('source_cid')
+    sid, kind = str(names.get('source_sid')), names.get('source_type')
     return next((r for r in source_records if str(r['STORAGE_ID']) == sid and not r['IS_DROPPED']
-                 and (not _known(cid) or str(r['COMPUTE_ID']) == str(cid))), None)
+                 and (not _known(kind) or str(r['ATTACH_TYPE']).lower() == str(kind).lower())), None)
 
 
 def entry_key(record):
@@ -364,7 +378,8 @@ class Position:
                     return UNKNOWN
                 cid = str(self.source_att.get('COMPUTE_ID'))
                 attached = next((r for r in self.source_records if str(r['STORAGE_ID']) == sid and str(r['COMPUTE_ID']) == cid and not r['IS_DROPPED']), None)
-                if self.original(names) == 'attached' and (not _known(names.get('source_cid')) or cid == str(names['source_cid'])):
+                # the original record attached again (S2b or R2a) carries a new COMPUTE_ID (fact 44); a branch of the retained copy names it as parent
+                if self.original(names) == 'attached' and (attached is None or attached.get('PREV_DATABASE_NAME') != names['retained']):
                     return ORIGINAL_ATTACHED
                 if attached is not None and attached.get('PREV_DATABASE_NAME') == names['retained']:
                     return ROLLED_BACK
@@ -527,7 +542,7 @@ def s2b_block(block, names):
         block.note('S2b: the AT MILESTONE value is the ATTACH_SYNTAX of the detached original record, recorded at S1. Generate this block again '
                    'after S1 (s2rebuild owner-sql O10) to fill it in, or copy the ATTACH_SYNTAX from the row of the S2b before check.')
     block.check('S2b after: the original record is attached READWRITE under the live name', ATTACHED_SQL, (names['source'],),
-                ownersql.Expect('columns_equal', value={'STORAGE_ID': names['source_sid'], 'ATTACH_TYPE': 'READWRITE', 'COMPUTE_ID': names['source_cid']}))
+                ownersql.Expect('columns_equal', value={'STORAGE_ID': names['source_sid'], 'ATTACH_TYPE': 'READWRITE'}))
     block.note('S2b zero-change proof: every check below must pass before the DROP. A failed check leaves the original attached read write '
                'under the live name, which is the rollback state: reconcile, or record the go again; never run the DROP.')
     for table, count in (names.get('source_counts') or [])[:3]:
@@ -537,7 +552,7 @@ def s2b_block(block, names):
     block.check('S2b proof: no non-idle session on the live name other than ours', SESSIONS_SQL, _sessions_params(names),
                 ownersql.Expect('column_equals', 'n', 0))
     block.statement('DROP DATABASE %s' % ident(names['source']), 'S2b: drop the original record (its data stays in the retained copy)')
-    block.check('S2b after: the original record is dropped', RECORD_STATE_SQL, (names['source'], names['source_sid'], names['source_cid']),
+    block.check('S2b after: the original record is dropped', RECORD_STATE_SQL, (names['source'], names['source_sid']),
                 ownersql.Expect('column_equals', 'IS_DROPPED', 1))
     block.check('S2b after: no attached database named source', ATTACHED_SQL, (names['source'],), ownersql.Expect('no_rows'))
     block.check('S2b after: the original storage holds one entry, the retained record', STORAGE_ENTRY_COUNT_SQL, (names['source_sid'],),
@@ -554,7 +569,7 @@ def s4_block(block, names):
     block.check('S4 before: the live name is its own branch record of the replacement', BRANCH_OF_SQL,
                 (names['source'], names['replacement_sid'], names['replacement']), ownersql.Expect('column_at_least', 'n', 1))
     block.statement('DROP DATABASE %s' % ident(names['replacement']), 'S4: drop the replacement record (the live branch is independent of it)')
-    block.check('S4 after: the replacement record is dropped', RECORD_STATE_SQL, (names['replacement'], names['replacement_sid'], names['replacement_cid']),
+    block.check('S4 after: the replacement record is dropped', RECORD_STATE_SQL, (names['replacement'], names['replacement_sid']),
                 ownersql.Expect('column_equals', 'IS_DROPPED', 1))
     block.check('S4 after: no attached database named replacement', ATTACHED_SQL, (names['replacement'],), ownersql.Expect('no_rows'))
     block.check('S4 after: the live name still holds its pitr record of the replacement', NAME_RECORD_SQL, (names['source'],),
@@ -565,13 +580,11 @@ def s4_block(block, names):
 def gate_block(block, names, label, recorded=False):
     """The two-entry gate as checks: one entry on the original storage (the retained record), one on the replacement storage (the live record).
 
-    recorded=True (C3, after the switch recorded both records) compares the records with the
-    journal; the O10 block, generated before the switch, checks their type and parent.
+    The records are checked by STORAGE_ID, type and parent, never by COMPUTE_ID (fact 44: a C3 repair
+    re-attaches the live record); recorded is kept for the callers.
     """
     retained = {'ATTACH_TYPE': 'resume', 'PREV_DATABASE_NAME': names['source'], 'STORAGE_ID': names['source_sid']}
     live = {'ATTACH_TYPE': 'pitr', 'PREV_DATABASE_NAME': names['replacement'], 'STORAGE_ID': names['replacement_sid']}
-    if recorded:
-        retained['LATEST_COMPUTE_ID'], live['LATEST_COMPUTE_ID'] = names['retained_cid'], names['live_cid']
     block.check('%s: the original storage holds one entry' % label, STORAGE_ENTRY_COUNT_SQL, (names['source_sid'],), ownersql.Expect('column_equals', 'n', 1))
     block.check('%s: that entry is the retained record' % label, NAME_RECORD_SQL, (names['retained'],), ownersql.Expect('columns_equal', value=retained))
     block.check('%s: the replacement storage holds one entry' % label, STORAGE_ENTRY_COUNT_SQL, (names['replacement_sid'],),
@@ -671,7 +684,7 @@ def _r2a_items(block, names):
         block.note('R2a: the AT MILESTONE value is the ATTACH_SYNTAX of the detached original record, recorded at S1. Generate this block again '
                    'after S1 (s2rebuild owner-sql O10 --rollback) to fill it in, or copy the ATTACH_SYNTAX from the row of the R2a check.')
     block.check('R2a after: source attached READWRITE with the original STORAGE_ID', ATTACHED_SQL, (names['source'],),
-                ownersql.Expect('columns_equal', value={'STORAGE_ID': names['source_sid'], 'ATTACH_TYPE': 'READWRITE', 'COMPUTE_ID': names['source_cid']}))
+                ownersql.Expect('columns_equal', value={'STORAGE_ID': names['source_sid'], 'ATTACH_TYPE': 'READWRITE'}))
 
 
 def retained_branch_sql(names):
@@ -695,7 +708,7 @@ def retained_resume_sql(names, syntax=None):
 
 def _r2b_items(block, names):
     """R2b, then R2c as the fallback: the live name takes a branch of the retained copy, or the retained record itself when a branch is refused."""
-    block.check('R2b before: the original record is dropped', RECORD_STATE_SQL, (names['source'], names['source_sid'], names['source_cid']),
+    block.check('R2b before: the original record is dropped', RECORD_STATE_SQL, (names['source'], names['source_sid']),
                 ownersql.Expect('column_equals', 'IS_DROPPED', 1))
     block.check('R2b before: the retained name holds the recorded record READONLY', ATTACHED_SQL, (names['retained'],),
                 ownersql.Expect('columns_equal', value={'STORAGE_ID': names['retained_sid'], 'COMPUTE_ID': names['retained_cid'], 'ATTACH_TYPE': 'READONLY'}))
@@ -997,7 +1010,7 @@ class SwitchMachine:
         self._identify('S2b before: the live name holds the original record READWRITE', n['source'], self._recorded('source'), ACCESS='READWRITE')
         self.s2b_proof()
         self._run('DROP DATABASE %s' % ident(n['source']), 'S2b DROP source')
-        self._expect('S2b after: the original record is dropped', RECORD_STATE_SQL, (n['source'], n['source_sid'], n['source_cid']),
+        self._expect('S2b after: the original record is dropped', RECORD_STATE_SQL, (n['source'], n['source_sid']),
                      ownersql.Expect('column_equals', 'IS_DROPPED', 1))
         self._expect('S2b after: no attached database named source', ATTACHED_SQL, (n['source'],), ownersql.Expect('no_rows'))
         entries = [_record(r) for r in _rows(self.session, STORAGE_ENTRIES_SQL, (n['source_sid'],))]
@@ -1070,7 +1083,7 @@ class SwitchMachine:
         self._expect('S4 before: the live name is its own branch record of the replacement', BRANCH_OF_SQL,
                      (n['source'], n['replacement_sid'], n['replacement']), ownersql.Expect('column_at_least', 'n', 1))
         self._run('DROP DATABASE %s' % ident(n['replacement']), 'S4 DROP replacement')
-        self._expect('S4 after: the replacement record is dropped', RECORD_STATE_SQL, (n['replacement'], n['replacement_sid'], n['replacement_cid']),
+        self._expect('S4 after: the replacement record is dropped', RECORD_STATE_SQL, (n['replacement'], n['replacement_sid']),
                      ownersql.Expect('column_equals', 'IS_DROPPED', 1))
         self._expect('S4 after: no attached database named replacement', ATTACHED_SQL, (n['replacement'],), ownersql.Expect('no_rows'))
         self._identify('S4 after: the live record is unchanged', n['source'], self._recorded('live'), ACCESS='READWRITE')
@@ -1306,7 +1319,7 @@ class SwitchMachine:
                                'name and the live record stays detached. Reconcile, then rerun s2rebuild step C3, which continues at the proof. '
                                'Differences: %s' % str(exc).split('Differences: ', 1)[-1]) from exc
             self._run('DROP DATABASE %s' % ident(n['source']), 'repair DROP original record')
-            self._expect('repair: the original record is dropped', RECORD_STATE_SQL, (n['source'], n['source_sid'], n['source_cid']),
+            self._expect('repair: the original record is dropped', RECORD_STATE_SQL, (n['source'], n['source_sid']),
                          ownersql.Expect('column_equals', 'IS_DROPPED', 1))
             held = None
         if held is None:
@@ -1324,7 +1337,7 @@ class SwitchMachine:
             self._identify('repair: the replacement name holds the recorded replacement record', n['replacement'], self._recorded('replacement'),
                            ACCESS='READWRITE', ATTACH_TYPE='create')
             self._run('DROP DATABASE %s' % ident(n['replacement']), 'repair DROP replacement')
-            self._expect('repair: the replacement record is dropped', RECORD_STATE_SQL, (n['replacement'], n['replacement_sid'], n['replacement_cid']),
+            self._expect('repair: the replacement record is dropped', RECORD_STATE_SQL, (n['replacement'], n['replacement_sid']),
                          ownersql.Expect('column_equals', 'IS_DROPPED', 1))
         self.gate()
 

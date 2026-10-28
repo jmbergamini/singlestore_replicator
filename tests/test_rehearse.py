@@ -219,8 +219,8 @@ class RehearsalRunTests(unittest.TestCase):
         self.assertEqual(writes[:4], ['DETACH DATABASE `%s`' % src, 'ATTACH DATABASE `%s` READ ONLY STORAGEID %s' % (src, sid),
                                       'DETACH DATABASE `%s`' % src, 'ATTACH DATABASE `%s` AS `%s` READ ONLY STORAGEID %s' % (src, retained, sid)],
                          'O3 freezes the throwaway source; S1 and S2 follow')
-        self.assertTrue(writes[4].startswith("ATTACH DATABASE `%s` AT MILESTONE '" % src) and writes[4].endswith('STORAGEID %s COMPUTEID %s' % (
-            sid, j.attachment('source')['compute_id'])), 'R2a: the original record by its own ATTACH_SYNTAX')
+        self.assertTrue(writes[4].startswith("ATTACH DATABASE `%s` AT MILESTONE '" % src) and ' STORAGEID %s COMPUTEID ' % sid in writes[4],
+                        'R2a: the original record by its own ATTACH_SYNTAX')
         self.assertEqual(writes[5], 'DROP DATABASE `%s`' % src, 'S2b from the rollback state')
         self.assertEqual(writes[6], 'ATTACH DATABASE `%s` AS `%s` STORAGEID %s' % (rebuild, src, j.attachment('live')['storage_id']), 'S3')
         self.assertEqual(writes[7], 'DROP DATABASE `%s`' % rebuild, 'S4')
@@ -275,7 +275,7 @@ class RehearsalRunTests(unittest.TestCase):
             sid = next(a['STORAGE_ID'] for a in db.attachments if a['DATABASE_NAME'] == names['retained'])
             db.branches.append(dict(db.record('stray_entry_of_another_run', sid, db.new_cid(), 'resume', names['retained']),
                                     IS_DETACHED=1, IS_ATTACHED_TO_THIS_COMPUTE=0))
-        h.fake.change_before(r'AND LATEST_COMPUTE_ID <> %s$', stray_entry)  # the first C3 check that reads no other step
+        h.fake.change_before(r'AND STORAGE_ID <> %s$', stray_entry)  # the first C3 check that reads no other step
         outcome = run_fake_rehearsal(self, h)
         self.assertEqual((outcome.status, outcome.exit_code), (steps.FAILED, EXIT_GATE), h.text())
         self.assertIn('Rehearsal C3 refused', outcome.note)

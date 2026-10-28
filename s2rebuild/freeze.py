@@ -82,13 +82,13 @@ def reentry_block(names):
 
 
 def _detached_check(b, names):
-    """The gate ahead of every ATTACH: MV_CLOUD_BRANCHES shows the recorded source record (name, STORAGE_ID, COMPUTE_ID) IS_DETACHED = 1.
+    """The gate ahead of every ATTACH: MV_CLOUD_BRANCHES shows the recorded source record (name, STORAGE_ID, ATTACH_TYPE) IS_DETACHED = 1.
 
     The source's own record, never the first row of its storage: a branch of the source and a
     record of an earlier attempt that left the Portal list share the STORAGE_ID (facts 27 and
     35), in no fixed order (fact 33).
     """
-    b.check('source storage detached', switch.RECORD_STATE_SQL, (names['source'], names['source_sid'], names['source_cid']),
+    b.check('source storage detached', switch.RECORD_STATE_SQL, (names['source'], names['source_sid']),
             ownersql.Expect('column_equals', 'IS_DETACHED', 1))
 
 
@@ -99,7 +99,7 @@ def _attach(b, names):
 def _after_checks(b, names):
     b.check('source attached READONLY', switch.ATTACHED_SQL, (names['source'],), ownersql.Expect('column_equals', 'ATTACH_TYPE', 'READONLY'), record='source')
     b.check('source STORAGE_ID unchanged', switch.ATTACHED_SQL, (names['source'],), ownersql.Expect('column_equals', 'STORAGE_ID', names['source_sid']))
-    # the branch record of the source (name, STORAGE_ID, ATTACH_TYPE, COMPUTE_ID) is recorded whole: the switch and the rollback go by it
+    # the branch record of the source is recorded whole (the COMPUTE_ID of this attach included, for the report): the switch and the rollback go by it
     b.check('source record attached on the recorded storage', switch.ATTACHED_RECORD_SQL, (names['source'], names['source_sid']),
             ownersql.Expect('columns_equal', value=ownersql.record_expect(names, 'source')), record='source')
     b.check('source reported by the workspace', switch.LAYOUT_SQL, (names['source'],), ownersql.Expect('some_rows'))
@@ -201,7 +201,7 @@ def storage_detached(session, names, log=None, identity='runner'):
     """
     storage_id = names['source_sid']
     try:
-        rows = session.query(switch.RECORD_STATE_SQL, (names['source'], storage_id, names['source_cid']))
+        rows = session.query(switch.RECORD_STATE_SQL, (names['source'], storage_id))
     except Exception as exc:  # noqa: BLE001 - the whole block's first check reports the state instead
         args = getattr(exc, 'args', ())
         number = args[0] if args and isinstance(args[0], int) else 'unknown'

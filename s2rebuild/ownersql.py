@@ -425,8 +425,11 @@ def record_names(role, att):
 
 
 def record_expect(names, role, **more):
-    """The columns_equal values of a MV_CLOUD_BRANCHES record check for a role: LATEST_COMPUTE_ID, ATTACH_TYPE when recorded, and more."""
-    value = {'LATEST_COMPUTE_ID': names[role + '_cid']}
+    """The columns_equal values of a MV_CLOUD_BRANCHES record check for a role: STORAGE_ID, ATTACH_TYPE when recorded, and more.
+
+    Never LATEST_COMPUTE_ID: Helios gives a record a new one on every attach (fact 44).
+    """
+    value = {'STORAGE_ID': names[role + '_sid']}
     if not placeholders(str(names.get(role + '_type') or '')):
         value['ATTACH_TYPE'] = names[role + '_type']
     value.update(more)
@@ -586,63 +589,63 @@ def recorded_absent_sql():
 
 
 def other_record_sql():
-    """COUNT of attached, not dropped branch records under a name with another COMPUTE_ID (parameters: name, COMPUTE_ID).
+    """COUNT of attached, not dropped branch records under a name on another STORAGE_ID (parameters: name, STORAGE_ID).
 
-    0 when the name holds the recorded record or nothing. A COMPUTE_ID belongs to one record,
-    so another one means another database under the name. Issues nothing (reads only).
+    0 when the name holds a record of the recorded storage or nothing; a name is attached once,
+    and the record checks beside it compare the ATTACH_TYPE. Issues nothing (reads only).
     """
     return ('SELECT COUNT(*) AS n FROM information_schema.MV_CLOUD_BRANCHES WHERE DATABASE_NAME = %s AND IS_DROPPED = 0 AND IS_DETACHED = 0 '
-            'AND LATEST_COMPUTE_ID <> %s')
+            'AND STORAGE_ID <> %s')
 
 
 def record_elsewhere_sql():
-    """COUNT of attached records with a STORAGE_ID and COMPUTE_ID under any other name (parameters: STORAGE_ID, COMPUTE_ID, name).
+    """COUNT of attached records with a STORAGE_ID and ATTACH_TYPE under any other name (parameters: STORAGE_ID, ATTACH_TYPE, name).
 
     0 when the recorded record is attached under its own name, detached or dropped. A positive
     count means the name in the block is not the recorded one. Issues nothing (reads only).
     """
-    return ('SELECT COUNT(*) AS n FROM information_schema.MV_CLOUD_BRANCHES WHERE STORAGE_ID = %s AND LATEST_COMPUTE_ID = %s AND IS_DROPPED = 0 '
+    return ('SELECT COUNT(*) AS n FROM information_schema.MV_CLOUD_BRANCHES WHERE STORAGE_ID = %s AND ATTACH_TYPE = %s AND IS_DROPPED = 0 '
             'AND IS_DETACHED = 0 AND DATABASE_NAME <> %s')
 
 
 def record_detached_sql():
-    """COUNT of detached, not dropped records with a STORAGE_ID and COMPUTE_ID (parameters: STORAGE_ID, COMPUTE_ID).
+    """COUNT of detached, not dropped records of a name on a STORAGE_ID (parameters: name, STORAGE_ID).
 
     0 unless the recorded record was detached, which means someone moved it: the DROP would be
     skipped and the record left behind, so the block stops first. Issues nothing (reads only).
     """
-    return ('SELECT COUNT(*) AS n FROM information_schema.MV_CLOUD_BRANCHES WHERE STORAGE_ID = %s AND LATEST_COMPUTE_ID = %s AND IS_DROPPED = 0 '
-            'AND IS_DETACHED = 1')
+    return ('SELECT COUNT(*) AS n FROM information_schema.MV_CLOUD_BRANCHES WHERE DATABASE_NAME = %s AND STORAGE_ID = %s '
+            'AND IS_DROPPED = 0 AND IS_DETACHED = 1')
 
 
 def record_absent_sql():
-    """1 unless a name holds the recorded record attached, else 0 (parameters: name, STORAGE_ID, COMPUTE_ID): the skip_if of a C3 DROP DATABASE.
+    """1 unless a name holds a record of the recorded STORAGE_ID attached, else 0 (parameters: name, STORAGE_ID): the skip_if of a C3 DROP DATABASE.
 
     The DROP is skipped when its name holds nothing or another record, so a database that
     appears under the name after the identity check is never dropped; the checks after the
     DROP then refuse. Issues nothing (reads only).
     """
     return ('SELECT COUNT(*) = 0 AS n FROM information_schema.MV_CLOUD_BRANCHES WHERE DATABASE_NAME = %s AND STORAGE_ID = %s '
-            'AND LATEST_COMPUTE_ID = %s AND IS_DROPPED = 0 AND IS_DETACHED = 0')
+            'AND IS_DROPPED = 0 AND IS_DETACHED = 0')
 
 
 def record_state_sql():
-    """The branch record of a name, STORAGE_ID and COMPUTE_ID with its IS_DETACHED, IS_DROPPED and ATTACH_SYNTAX (parameters: name, STORAGE_ID, COMPUTE_ID)."""
+    """The branch records of a name on a STORAGE_ID with IS_DETACHED, IS_DROPPED and ATTACH_SYNTAX, one not dropped first (parameters: name, STORAGE_ID)."""
     return ('SELECT DATABASE_NAME, STORAGE_ID, ATTACH_TYPE, LATEST_COMPUTE_ID, IS_DETACHED, IS_DROPPED, ATTACH_SYNTAX '
-            'FROM information_schema.MV_CLOUD_BRANCHES WHERE DATABASE_NAME = %s AND STORAGE_ID = %s AND LATEST_COMPUTE_ID = %s')
+            'FROM information_schema.MV_CLOUD_BRANCHES WHERE DATABASE_NAME = %s AND STORAGE_ID = %s ORDER BY IS_DROPPED, IS_DETACHED')
 
 
 def record_identity_checks(block, names, role, label, again=False):
     """The identity checks of one recorded role before its DROP: the name holds the recorded record or nothing, no other record under the
     name, the recorded record attached under no other name and not detached (the last two once; again=True leaves them out)."""
-    name, sid, cid, kind = names[role], names[role + '_sid'], names[role + '_cid'], CLEANUP_ATTACH_TYPES[role]
+    name, sid, rtype, kind = names[role], names[role + '_sid'], names[role + '_type'], CLEANUP_ATTACH_TYPES[role]
     still = 'still ' if again else ''
     block.check('%s name %sholds the recorded %s %s, or nothing' % (role, still, label, kind), attached_otherwise_sql(), (name, sid, kind),
                 Expect('column_equals', 'n', 0))
-    block.check('%s name %sholds no other record' % (role, still), other_record_sql(), (name, cid), Expect('column_equals', 'n', 0))
+    block.check('%s name %sholds no other record' % (role, still), other_record_sql(), (name, sid), Expect('column_equals', 'n', 0))
     if not again:
-        block.check('recorded %s record attached under no other name' % role, record_elsewhere_sql(), (sid, cid, name), Expect('column_equals', 'n', 0))
-        block.check('recorded %s record not detached' % role, record_detached_sql(), (sid, cid), Expect('column_equals', 'n', 0))
+        block.check('recorded %s record attached under no other name' % role, record_elsewhere_sql(), (sid, rtype, name), Expect('column_equals', 'n', 0))
+        block.check('recorded %s record not detached' % role, record_detached_sql(), (name, sid), Expect('column_equals', 'n', 0))
 
 
 REPAIR_OUTAGE_NOTE = ('The repair detaches the live name for about 30 seconds on a 3 TB database (Helios fact 34): the application cannot '
@@ -657,7 +660,7 @@ def endstate_block(names):
     block carries it as a note. Issues no statement.
     """
     from . import switch
-    live = {'STORAGE_ID': names['live_sid'], 'COMPUTE_ID': names['live_cid']}
+    live = {'STORAGE_ID': names['live_sid']}
     block = Block('C3', 'End state')
     block.note('After C2. Expected: exactly two entries on the workspace for this run, the live database %s (a pitr record of the replacement) and '
                'the retained copy %s (a resume record of the original storage, read only). The kit never deletes the retained copy; the customer '
@@ -666,10 +669,10 @@ def endstate_block(names):
     block.check('live name resolves to the live record', inventory_attachment_sql(), (names['source'],), Expect('columns_equal', value=live))
     block.check('live record attached under the live name', switch.ATTACHED_RECORD_SQL, (names['source'], names['live_sid']),
                 Expect('columns_equal', value=record_expect(names, 'live')))
-    block.check('live name holds no other record', other_record_sql(), (names['source'], names['live_cid']), Expect('column_equals', 'n', 0))
+    block.check('live name holds no other record', other_record_sql(), (names['source'], names['live_sid']), Expect('column_equals', 'n', 0))
     block.check('retained name holds the recorded retained record READONLY', inventory_attachment_sql(), (names['retained'],),
-                Expect('columns_equal', value={'STORAGE_ID': names['retained_sid'], 'COMPUTE_ID': names['retained_cid'], 'ATTACH_TYPE': 'READONLY'}))
-    block.check('retained name holds no other record', other_record_sql(), (names['retained'], names['retained_cid']), Expect('column_equals', 'n', 0))
+                Expect('columns_equal', value={'STORAGE_ID': names['retained_sid'], 'ATTACH_TYPE': 'READONLY'}))
+    block.check('retained name holds no other record', other_record_sql(), (names['retained'], names['retained_sid']), Expect('column_equals', 'n', 0))
     switch.gate_block(block, names, 'end state', recorded=True)
     block.note('The kit then runs the write probe on the retained name as the runner: a DELETE of a value that cannot exist must be refused as '
                'read only. By hand: run the O3 write probe statement against %s and expect the read-only refusal.' % names['retained'])
@@ -706,11 +709,11 @@ def repair_block(names):
     block.check('repair: no attached database named source', inventory_attachment_sql(), (names['source'],), Expect('no_rows'))
     block.statement(switch.original_syntax(names), 'repair: attach the original record read write by its own ATTACH_SYNTAX')
     block.check('repair: the original record is attached READWRITE under the live name', inventory_attachment_sql(), (names['source'],),
-                Expect('columns_equal', value={'STORAGE_ID': names['source_sid'], 'ATTACH_TYPE': 'READWRITE', 'COMPUTE_ID': names['source_cid']}))
+                Expect('columns_equal', value={'STORAGE_ID': names['source_sid'], 'ATTACH_TYPE': 'READWRITE'}))
     for table, count in (names.get('source_counts') or [])[:3]:
         block.check('repair proof: %s holds the source row count' % table, switch.count_sql(names['source'], table), (), Expect('column_equals', 'n', count))
     block.statement('DROP DATABASE %s' % ident(names['source']), 'repair: drop the original record (its data stays in the retained copy)')
-    block.check('repair: the original record is dropped', switch.RECORD_STATE_SQL, (names['source'], names['source_sid'], names['source_cid']),
+    block.check('repair: the original record is dropped', switch.RECORD_STATE_SQL, (names['source'], names['source_sid']),
                 Expect('column_equals', 'IS_DROPPED', 1))
     block.check('repair: the live record is detached with its ATTACH_SYNTAX', switch.DETACHED_RECORD_SQL, (names['source'], names['live_sid']),
                 Expect('columns_equal', value=record_expect(names, 'live')))
@@ -718,11 +721,11 @@ def repair_block(names):
                     'repair: re-attach the live record read write by its own ATTACH_SYNTAX')
     block.note('repair: the AT MILESTONE value is the ATTACH_SYNTAX of the detached live record; copy it from the row of the check above.')
     block.check('repair: the live name holds the live record READWRITE again', inventory_attachment_sql(), (names['source'],),
-                Expect('columns_equal', value={'STORAGE_ID': names['live_sid'], 'ATTACH_TYPE': 'READWRITE', 'COMPUTE_ID': names['live_cid']}))
+                Expect('columns_equal', value={'STORAGE_ID': names['live_sid'], 'ATTACH_TYPE': 'READWRITE'}))
     record_identity_checks(block, names, 'replacement', 'replacement')
     block.statement('DROP DATABASE %s' % ident(names['replacement']), 'repair: drop the replacement record (the live branch is independent of it)',
-                    skip_if=(record_absent_sql(), (names['replacement'], names['replacement_sid'], names['replacement_cid'])))
-    block.check('repair: the replacement record is dropped', switch.RECORD_STATE_SQL, (names['replacement'], names['replacement_sid'], names['replacement_cid']),
+                    skip_if=(record_absent_sql(), (names['replacement'], names['replacement_sid'])))
+    block.check('repair: the replacement record is dropped', switch.RECORD_STATE_SQL, (names['replacement'], names['replacement_sid']),
                 Expect('column_equals', 'IS_DROPPED', 1))
     switch.gate_block(block, names, 'end state', recorded=True)
     return block

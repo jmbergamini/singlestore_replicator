@@ -55,13 +55,12 @@ def _source_back(b, names, position):
         b.statement('DETACH DATABASE %s' % ident(source), 'detach the read-only source',
                     detach={'wait': names['detach_wait_seconds'], 'kill': bool(names['detach_kill'])})
     if position in ('frozen', 'detached'):
-        b.check('source storage detached', switch.RECORD_STATE_SQL, (source, sid, names['source_cid']), ownersql.Expect('column_equals', 'IS_DETACHED', 1))
+        b.check('source storage detached', switch.RECORD_STATE_SQL, (source, sid), ownersql.Expect('column_equals', 'IS_DETACHED', 1))
         b.check('source record detached', switch.DETACHED_RECORD_SQL, (source, sid), ownersql.Expect('columns_equal', value=ownersql.record_expect(names, 'source')))
         b.check('no attached database named source', switch.ATTACHED_SQL, (source,), ownersql.Expect('no_rows'))
         b.statement('ATTACH DATABASE %s STORAGEID %s' % (ident(source), sid), 'attach the same storage read write')
     b.check('source attached READWRITE', switch.ATTACHED_SQL, (source,), ownersql.Expect('column_equals', 'ATTACH_TYPE', 'READWRITE'), record='source')
-    b.check('source STORAGE_ID and COMPUTE_ID unchanged', switch.ATTACHED_SQL, (source,),
-            ownersql.Expect('columns_equal', value={'STORAGE_ID': sid, 'COMPUTE_ID': names['source_cid']}))
+    b.check('source STORAGE_ID unchanged', switch.ATTACHED_SQL, (source,), ownersql.Expect('column_equals', 'STORAGE_ID', sid))
     b.check('source record attached', switch.ATTACHED_RECORD_SQL, (source, sid), ownersql.Expect('columns_equal', value=ownersql.record_expect(names, 'source')),
             record='source')
 
@@ -76,7 +75,7 @@ def _replacement_identity(b, names):
     recorded = (replacement, rsid, ownersql.CLEANUP_ATTACH_TYPES['replacement'])
     b.check('replacement name holds the recorded replacement %s, or nothing' % recorded[2], ownersql.attached_otherwise_sql(), recorded,
             ownersql.Expect('column_equals', 'n', 0))
-    b.check('replacement name holds no other record', ownersql.other_record_sql(), (replacement, names['replacement_cid']), ownersql.Expect('column_equals', 'n', 0))
+    b.check('replacement name holds no other record', ownersql.other_record_sql(), (replacement, rsid), ownersql.Expect('column_equals', 'n', 0))
     # a branch of the replacement means the switch attached the live name from it (fact 27): abandon never drops its parent
     b.check('the replacement has no branch', branches_of_sql(), (replacement, rsid), ownersql.Expect('column_equals', 'n', 0))
     b.check('recorded replacement attached under no other name', ownersql.attached_elsewhere_sql(), (rsid, replacement),
@@ -93,7 +92,7 @@ def _replacement_dropped(b, names):
     b.statement('DROP DATABASE %s' % ident(replacement), 'drop the partly copied replacement', skip_if=(ownersql.recorded_absent_sql(), recorded))
     b.check('replacement is gone', switch.ATTACHED_SQL, (replacement,), ownersql.Expect('no_rows'))
     b.check('recorded replacement attached nowhere', ownersql.storage_attached_sql(), (rsid,), ownersql.Expect('column_equals', 'n', 0))
-    b.check('recorded replacement record dropped', ownersql.record_state_sql(), (replacement, rsid, names['replacement_cid']),
+    b.check('recorded replacement record dropped', ownersql.record_state_sql(), (replacement, rsid),
             ownersql.Expect('column_equals', 'IS_DROPPED', 1))
 
 

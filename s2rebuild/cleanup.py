@@ -130,7 +130,7 @@ def delete(ctx, name):
         machine._run(syntax, 'cleanup ATTACH retained by its ATTACH_SYNTAX')
         machine._identify('cleanup: the retained record is attached READWRITE', name, recorded, ACCESS='READWRITE', IS_DETACHED=0)
         machine._run('DROP DATABASE %s' % ident(name), 'cleanup DROP retained')
-        machine._expect('cleanup: the retained record is dropped', switch.RECORD_STATE_SQL, (name, recorded['storage_id'], recorded['compute_id']),
+        machine._expect('cleanup: the retained record is dropped', switch.RECORD_STATE_SQL, (name, recorded['storage_id']),
                         ownersql.Expect('column_equals', 'IS_DROPPED', 1))
         machine._expect('cleanup: no attached database named retained', switch.ATTACHED_SQL, (name,), ownersql.Expect('no_rows'))
         machine._identify('cleanup: the live name still resolves to the live record', ctx.db.source, ctx.journal.attachment('live'), ACCESS='READWRITE')

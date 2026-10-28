@@ -219,8 +219,10 @@ class BranchRecordTests(unittest.TestCase):
         self.assertIn(' AT MILESTONE ', syntax)
         cur.execute(syntax)
         att = fake.attachment(SRC)
-        self.assertEqual((att['ATTACH_TYPE'], att['STORAGE_ID'], att['COMPUTE_ID']), ('READWRITE', SID, 'cid-1'), 'the record itself is back, read write')
-        self.assertEqual((original['IS_DETACHED'], original['ATTACH_SYNTAX']), (0, 'ATTACH DATABASE `%s` STORAGEID %s COMPUTEID cid-1' % (SRC, SID)))
+        self.assertEqual((att['ATTACH_TYPE'], att['STORAGE_ID']), ('READWRITE', SID), 'the record itself is back, read write')
+        self.assertNotEqual(att['COMPUTE_ID'], 'cid-1', 'with a new COMPUTE_ID, as on Helios (fact 44)')
+        self.assertEqual((original['IS_DETACHED'], original['LATEST_COMPUTE_ID'], original['ATTACH_SYNTAX']),
+                         (0, att['COMPUTE_ID'], 'ATTACH DATABASE `%s` STORAGEID %s COMPUTEID %s' % (SRC, SID, att['COMPUTE_ID'])))
         self.assertEqual(len(fake.rows(SRC, 't_comp')), rows_before)
         self.assertEqual(len(fake.portal_entries()), 2, 're-attaching adds no record')
         cur.execute('DETACH DATABASE `%s`' % SRC)
@@ -232,7 +234,7 @@ class BranchRecordTests(unittest.TestCase):
         cur.execute('DETACH DATABASE `%s`' % SRC)
         cur.execute(original['ATTACH_SYNTAX'])
         cur.execute('DROP DATABASE `%s`' % SRC)
-        self.assertEqual((original['IS_DROPPED'], original['ATTACH_SYNTAX']), (1, 'ATTACH DROPPED DATABASE `%s` STORAGEID %s COMPUTEID cid-1' % (SRC, SID)))
+        self.assertEqual((original['IS_DROPPED'], original['ATTACH_SYNTAX']), (1, 'ATTACH DROPPED DATABASE `%s` STORAGEID %s COMPUTEID %s' % (SRC, SID, original['LATEST_COMPUTE_ID'])))
         self.assertEqual([e['DATABASE_NAME'] for e in fake.portal_entries()], ['src_retained'], 'the resume branch is whole')
         self.assertEqual(len(fake.rows('src_retained', 't_comp')), rows_before)
 

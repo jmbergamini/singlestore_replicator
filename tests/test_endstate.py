@@ -93,6 +93,21 @@ class TwoEntrySwitchTests(unittest.TestCase):
         labels = [i.label for i in block.items]
         self.assertLess(labels.index(switch.STORAGE_ONLY_LABELS['source']), labels.index(block.statements[0].label), 'the printed block checks it before S1')
 
+    def test_s2b_passes_when_the_original_comes_back_with_a_new_compute_id(self):
+        """Helios gives a record a new COMPUTE_ID on every attach, its own ATTACH_SYNTAX included (I0b, October 27, 2026): S2b matches the
+        original by name, STORAGE_ID and ATTACH_TYPE, drops it, and the state check after the DROP finds it by name and STORAGE_ID."""
+        h = switched_harness(self)
+        machine, _ = machine_for(h)
+        machine.s1()
+        at_s1 = h.journal.attachment('source')['compute_id']
+        machine.s2()
+        seen = []
+        h.fake.change_before(r'^DROP DATABASE `%s`$' % SRC, lambda db: seen.append(db.attachment(SRC)['COMPUTE_ID']))
+        machine.s2b()
+        self.assertEqual(len(seen), 1)
+        self.assertNotEqual(seen[0], at_s1, 'the original record came back with a new COMPUTE_ID')
+        self.assertEqual(machine.position(), switch.SOURCE_DROPPED)
+
     def test_s2b_refuses_the_drop_when_the_zero_change_proof_fails_and_leaves_the_original_attached(self):
         """A foreign session on the original attached under the live name: no DROP, the original stays attached read write (the rollback state),
         the rollback has nothing to do, and the forward continues at the proof once the session is gone."""
@@ -105,7 +120,7 @@ class TwoEntrySwitchTests(unittest.TestCase):
             machine.s2b()
         self.assertNotIn('DROP DATABASE `%s`' % SRC, h.fake.writes)
         src = h.fake.attachment(SRC)
-        self.assertEqual((src['STORAGE_ID'], src['ATTACH_TYPE'], src['COMPUTE_ID']), (SID, 'READWRITE', 'cid-1'))
+        self.assertEqual((src['STORAGE_ID'], src['ATTACH_TYPE']), (SID, 'READWRITE'))
         self.assertEqual(machine.position(), switch.ORIGINAL_ATTACHED)
         self.assertEqual(machine.rollback(), switch.ORIGINAL_ATTACHED, 'nothing to roll back')
         self.assertEqual(h.fake.attachment(RET)['ATTACH_TYPE'], 'READONLY')
@@ -173,7 +188,7 @@ class TwoEntrySwitchTests(unittest.TestCase):
         h.fake.branches.reverse()
         self.assertEqual([b['DATABASE_NAME'] for b in h.fake.branches if b['STORAGE_ID'] == SID][0], RET, 'the retained record comes first')
         self.assertEqual(machine.rollback(), switch.ORIGINAL_ATTACHED)
-        self.assertEqual(h.fake.attachment(SRC)['COMPUTE_ID'], 'cid-1')
+        self.assertEqual(h.fake.attachment(SRC)['STORAGE_ID'], SID, 'the original record is back (with a new COMPUTE_ID, fact 44)')
 
     def test_a_default_run_issues_no_drop_of_the_retained_name_from_o1_through_c4(self):
         """O10 with the owner profile, then C3 and C4: the retained copy is attached read only at the end and no DROP of its name was issued."""
@@ -261,12 +276,12 @@ class EndStateTests(unittest.TestCase):
         continues at the proof with the original attached, not at the live record check, and ends at two entries."""
         h = repair_ready(self)
         session = {'ID': 9, 'USER': 'app', 'HOST': 'h', 'DB': SRC, 'COMMAND': 'Query', 'TIME': 1, 'INFO': 'INSERT INTO t VALUES (1)'}
-        h.fake.change_before(r"^ATTACH DATABASE `%s` AT MILESTONE .* COMPUTEID cid-1$" % SRC, lambda db: db.processlist.append(session))
+        h.fake.change_before(r"^ATTACH DATABASE `%s` AT MILESTONE .* STORAGEID %s COMPUTEID \S+$" % (SRC, SID), lambda db: db.processlist.append(session))
         before = attach_writes(h)
         out = h.step('C3', yes=True)
         self.assertEqual(out.status, steps.REFUSED, h.text())
         self.assertIn('rerun s2rebuild step C3, which continues at the proof', out.note)
-        self.assertEqual(h.fake.attachment(SRC)['COMPUTE_ID'], 'cid-1', 'the original is attached under the live name')
+        self.assertEqual(h.fake.attachment(SRC)['STORAGE_ID'], SID, 'the original is attached under the live name')
         h.fake.processlist = []
         self.assertEqual(h.step('C3', yes=True).status, steps.PASSED, h.text())
         writes = attach_writes(h)[len(before):]

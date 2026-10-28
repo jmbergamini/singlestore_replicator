@@ -736,6 +736,8 @@ class FakeCursor:
         m = re.match(r'SELECT (.+?) FROM information_schema\.MV_CLOUD_BRANCHES(?: WHERE (.+?))?(?: ORDER BY .+)?$', s)
         if m:
             self.rows = self._branch_listing(m.group(1), m.group(2), args)
+            if s.endswith(' ORDER BY IS_DROPPED, IS_DETACHED'):
+                self.rows = sorted(self.rows, key=lambda r: (int(r.get('IS_DROPPED') or 0), int(r.get('IS_DETACHED') or 0)))
             return
         m = re.match(r'DETACH DATABASE `([^`]+)`( KILL)?$', s)
         if m:
@@ -1163,9 +1165,14 @@ class FakeCursor:
                 (db.pipelines if 'STATE' in p else db.pipeline_offsets).append(copy_)
         else:
             if record is not None:
-                record.update(IS_DETACHED=0, IS_DROPPED=0, IS_ATTACHED_TO_THIS_COMPUTE=1,
-                              ATTACH_SYNTAX=attached_syntax(record['DATABASE_NAME'], record['STORAGE_ID'], record['LATEST_COMPUTE_ID']))
-                compute = record['LATEST_COMPUTE_ID']
+                # every attach gives the record a new COMPUTE_ID, a re-attach by its own syntax included (Helios 10.8.0, I0b, October 27, 2026)
+                old = record['LATEST_COMPUTE_ID']
+                compute = db.new_cid() if db.new_compute_on_attach else old
+                for p in db.pipelines + db.pipeline_offsets:
+                    if p.get('_storage') == source_sid and p.get('_compute') == old:
+                        p['_compute'] = compute
+                record.update(LATEST_COMPUTE_ID=compute, IS_DETACHED=0, IS_DROPPED=0, IS_ATTACHED_TO_THIS_COMPUTE=1,
+                              ATTACH_SYNTAX=attached_syntax(record['DATABASE_NAME'], record['STORAGE_ID'], compute))
                 content = record.pop('_content', None) or db.storage_content.get(source_sid)
             else:  # rows a test appended without a compute id
                 for b in db.branches:
@@ -1218,6 +1225,7 @@ class FakeDB:
         self.refuse_other_definer = True  # another account as DEFINER needs SUPER (error 1227)
         self.refuse_sharded_counter = True  # ALTER TABLE ... AUTO_INCREMENT on a sharded table is error 1749
         self.branch_keeps_storage_id = True  # ATTACH x AS y keeps x's STORAGE_ID; y gets its own COMPUTE_ID and branch record
+        self.new_compute_on_attach = True  # a re-attach of a record (its own syntax, or by STORAGEID) gives it a new COMPUTE_ID
         self.refuse_read_only_drop = True  # DROP DATABASE of a READ ONLY attachment is error 2720
         self.refuse_read_only_branch = False  # ATTACH ... AS from a READ ONLY attachment (rollback R2b): off until I0b decides; on means R2c runs
         self.lock_tables = set()

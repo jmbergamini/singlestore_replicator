@@ -1350,7 +1350,7 @@ class FreezeTests(unittest.TestCase):
         names = names_of(h)
         detach = 'DETACH DATABASE `%s`' % SRC
         attach = "ATTACH DATABASE `%s` READ ONLY STORAGEID 1028600672070281646:7367158985892520834" % SRC
-        gate = ('check', 'source storage detached', switch.RECORD_STATE_SQL, [SRC, '1028600672070281646:7367158985892520834', 'cid-1'])
+        gate = ('check', 'source storage detached', switch.RECORD_STATE_SQL, [SRC, '1028600672070281646:7367158985892520834'])
         for form, items in (('kit', [i.to_dict() for i in freeze.block(names).items]), ('notebook', block_now(h, 'O3')['items'])):
             with self.subTest(form=form):
                 self.assertEqual((items[0]['kind'], items[0]['label']), ('note', freeze.REENTRY_NOTE), 'the re-entry note comes before the first check')
