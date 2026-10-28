@@ -1227,7 +1227,7 @@ class FakeDB:
         self.branch_keeps_storage_id = True  # ATTACH x AS y keeps x's STORAGE_ID; y gets its own COMPUTE_ID and branch record
         self.new_compute_on_attach = True  # a re-attach of a record (its own syntax, or by STORAGEID) gives it a new COMPUTE_ID
         self.refuse_read_only_drop = True  # DROP DATABASE of a READ ONLY attachment is error 2720
-        self.refuse_read_only_branch = False  # ATTACH ... AS from a READ ONLY attachment (rollback R2b): off until I0b decides; on means R2c runs
+        self.refuse_read_only_branch = False  # ATTACH ... AS from a READ ONLY attachment (rollback R2b): Helios accepts it (I0b); on means R2c runs
         self.lock_tables = set()
         self.lock_hits = 0
         self.lock_wait_settings = []
