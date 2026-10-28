@@ -76,7 +76,14 @@ ERROR_TABLE = {
     '1997': {'when': 'a chunk in flight while autoscale replaces a node', 'message': 'Transaction was already in its commit phase',
              'source': 'LESSONS fact 30 (work order appendix), wording from the log'},
     '2720': {'when': 'DROP DATABASE of a READ ONLY attachment; detach it and attach it read write first',
-             'message': 'Cannot drop a database that is attached read only', 'source': 'kit wording from fact 39; confirm the text live'},
+             'message': 'Cannot drop a database that is attached read only',
+             'source': 'kit wording; the live text of October 27, 2026 reads "is attached as a readonly database ... cannot be dropped. Please try '
+                       'DETACH DATABASE instead or DROP from the primary copy"'},
+    '2719': {'when': 'an INSERT on a READ ONLY attachment (the retained copy); the write probe accepts it by its message (readonly)',
+             'message': 'Leaf Error (<leaf>): Database `<db>` is not attached or is attached as a readonly database on workspace `<workspace>` '
+                        'and is unavailable for write operations', 'source': 'live, I0b, October 28, 2026, engine 10.8.0'},
+    '1008': {'when': 'DROP DATABASE of a detached record', 'message': "Forwarding Error (<master>): Can't drop database '<db>'; database doesn't exist",
+             'source': 'live, I0b, October 28, 2026, engine 10.8.0'},
     '2003': {'when': 'the server is unreachable as a session opens', 'message': "Can't connect to MySQL server", 'source': 'driver'},
     '2004': {'when': 'the client cannot create a socket', 'message': "Can't create TCP/IP socket", 'source': 'driver'},
     '2006': {'when': 'the connection was closed by the server between two statements', 'message': 'MySQL server has gone away',
