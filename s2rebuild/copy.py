@@ -1060,7 +1060,7 @@ def handle_o5(step, ctx):
         create_replacement(session, statements, ctx.journal, ctx.log, plans, data.get('layout'), ctx.db.target, directory)
         ctx.journal.set_meta('plan_dir', str(directory))
         from . import switch as switch_module
-        storage_id = switch_module.record_replacement(ctx, session)
+        storage_id = switch_module.record_replacement(ctx, session, refresh=True)
         if storage_id:
             ctx.log('replacement %s recorded on STORAGE_ID %s for the switch' % (ctx.db.replacement, storage_id))
         else:

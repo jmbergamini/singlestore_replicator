@@ -1502,15 +1502,21 @@ def _typed_live_name(ctx, live):
     return None
 
 
-def record_replacement(ctx, session):
-    """Record the replacement's attached record (identify) when the journal has none; returns the storage id or None."""
+def record_replacement(ctx, session, refresh=False):
+    """Record the replacement's attached record (identify) when the journal has none; returns the storage id or None.
+
+    refresh=True (O5, right after it created or verified the replacement) also records the live record when the
+    journal holds another one: a replacement dropped and created again (an abandon, or a failed rehearsal whose
+    cleanup dropped it) leaves a stale record that O10 would refuse (live P5, October 28, 2026).
+    """
     current = ctx.journal.attachment('replacement')
-    if current and current.get('storage_id'):
+    if current and current.get('storage_id') and not refresh:
         return current['storage_id']
     live = identify(session, ctx.db.replacement)
     if live is None or live.get('ACCESS') is None:
-        return None
-    journal_record(ctx.journal, 'replacement', live)
+        return current['storage_id'] if current and current.get('storage_id') else None
+    if not (current and records_match(current, live)):
+        journal_record(ctx.journal, 'replacement', live)
     return live['STORAGE_ID']
 
 
