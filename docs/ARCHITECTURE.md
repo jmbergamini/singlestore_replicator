@@ -88,7 +88,7 @@ Rules:
 
 ## 4. Flow diagram
 
-Source for `docs/flow.mmd`. Three columns: Prepare, Outage window, Close-out. `docs/flow.svg` (README) is an earlier mermaid render with the C3 and rollback labels corrected by hand, and `docs/flow.png` (PDF) is converted from it. Both still show P5 and the Path B branch, which the final pass removed; render both again from `docs/flow.mmd` with mermaid-cli when one is available (none on the build Mac on October 28, 2026), then rebuild the guide.
+Source for `docs/flow.mmd`. Three columns: Prepare, Outage window, Close-out. `docs/flow.svg` (README) and `docs/flow.png` (PDF) are drawn from the same layout as `docs/flow.mmd` (October 28, 2026, with Pillow, since no mermaid renderer was on the build Mac); when the flow changes, update all three, then rebuild the guide.
 
 ```mermaid
 flowchart LR
@@ -117,7 +117,7 @@ flowchart LR
     C1[C1 Verify after release] --> C2[C2 Report<br/>retain-until date recorded]
     C2 --> C3[C3 End state<br/>two entries]
     C3 --> C4[C4 Remove migration account]
-    C4 -.->|optional, after retain-until,<br/>the customer| C5[C5 cleanup --delete<br/>the retained original]
+    C4 -.->|optional, after retain-until| C5[C5 Delete the retained original<br/>later, by the customer (s2rebuild cleanup)]
   end
   P4 --> O1
   O11 --> C1

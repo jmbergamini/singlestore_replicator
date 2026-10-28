@@ -177,9 +177,10 @@ class Secrets:
                 if not retryable_connect_error(exc):
                     raise
                 if attempt == CONNECT_RETRIES:
-                    raise KitError('Cannot connect to %s: %s after %d attempts over %d s; check name resolution (dig %s, then flush the resolver '
-                                   'cache) and that the workspace is ACTIVE' % (self.host, _connect_reason(exc), attempt + 1,
-                                                                                 CONNECT_RETRIES * CONNECT_RETRY_SECONDS, self.host)) from exc
+                    # the redactor masks the host in printed lines, so the text also names the key that holds it
+                    raise KitError('Cannot connect to %s (workspace.host): %s after %d attempts over %d s; check name resolution (dig the '
+                                   'workspace.host of the configuration, then flush the resolver cache) and that the workspace is ACTIVE' % (
+                                       self.host, _connect_reason(exc), attempt + 1, CONNECT_RETRIES * CONNECT_RETRY_SECONDS)) from exc
                 sleep(CONNECT_RETRY_SECONDS)
         enable_tcp_keepalive(conn)
         return conn

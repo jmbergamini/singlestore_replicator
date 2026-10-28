@@ -179,7 +179,7 @@ class ConnectionTests(unittest.TestCase):
             def never(**kw):
                 calls.append(1)
                 raise lost
-            with self.assertRaisesRegex(KitError, 'Cannot connect to %s: name resolution failed after 4 attempts over 60 s' % s.host):
+            with self.assertRaisesRegex(KitError, r'Cannot connect to %s \(workspace\.host\): name resolution failed after 4 attempts over 60 s' % s.host):
                 s.connect(connector=never, sleep=sleeps.append)
             self.assertEqual((len(calls), sleeps), (4, [20, 20, 20]))
             denied = RuntimeError(1045, 'Access denied')
