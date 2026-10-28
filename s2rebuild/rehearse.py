@@ -312,16 +312,54 @@ def kill_inprocess(spec, plans, journal, connector, log, copy_config):
     return _started_chunks(journal)
 
 
-def kill_sigkill(spec, plans, journal, connector, log, copy_config, wait_seconds=KILL_WAIT_SECONDS):
-    """Fork a copy process, SIGKILL it while a chunk is started, and return the started chunks (section 10.18)."""
+def _copy_until_killed(config, spec, plans, journal_path, copy_config):
+    """The kill test's copy process in a fresh interpreter: its own runner connections from the Keychain, its own journal handle."""
+    import io
+    from .connect import Log, SessionFactory
+    secrets = SessionFactory(config, {}, None, dry_run=False).secrets('runner')
+    journal = Journal(journal_path)
+    copy_module.Runner(plans, copy_module.statements_for(spec), journal, lambda: secrets.connect(None), Log(stream=io.StringIO()), copy_config,
+                       workers=1).copy()
+
+
+def kill_sigkill(spec, plans, journal, connector, log, copy_config, wait_seconds=KILL_WAIT_SECONDS, config=None):
+    """Start a copy process, SIGKILL it while a chunk is started, and return the started chunks (section 10.18).
+
+    With config (a live rehearsal) the copy process is a fresh interpreter (multiprocessing spawn) that opens
+    its own runner connections: on macOS a forked child that opens a network connection crashes in the system
+    resolver before it copies (live P5, October 28, 2026). Without config (the fake) it is a fork that copies
+    through connector.
+    """
     path = journal.path
-    pid = os.fork()
-    if pid == 0:  # the child copies until it is killed
-        try:
-            child_journal = Journal(path)
-            copy_module.Runner(plans, copy_module.statements_for(spec), child_journal, connector, log, copy_config, workers=1).copy()
-        finally:
-            os._exit(0)
+    if config is not None:
+        import multiprocessing
+        proc = multiprocessing.get_context('spawn').Process(target=_copy_until_killed, args=(config, spec, plans, str(path), copy_config), daemon=True)
+        proc.start()
+        pid = proc.pid
+
+        def alive():
+            return proc.is_alive()
+
+        def reap():
+            proc.join()
+    else:
+        pid = os.fork()
+        if pid == 0:  # the child copies until it is killed
+            try:
+                child_journal = Journal(path)
+                copy_module.Runner(plans, copy_module.statements_for(spec), child_journal, connector, log, copy_config, workers=1).copy()
+            finally:
+                os._exit(0)
+
+        def alive():
+            done, _ = os.waitpid(pid, os.WNOHANG)
+            return not done
+
+        def reap():
+            try:
+                os.waitpid(pid, 0)
+            except ChildProcessError:
+                pass
     deadline = time.monotonic() + wait_seconds
     killed = False
     try:
@@ -330,8 +368,7 @@ def kill_sigkill(spec, plans, journal, connector, log, copy_config, wait_seconds
                 os.kill(pid, signal.SIGKILL)
                 killed = True
                 break
-            done, _ = os.waitpid(pid, os.WNOHANG)
-            if done:
+            if not alive():
                 break
             time.sleep(KILL_POLL_SECONDS)
     finally:
@@ -340,10 +377,7 @@ def kill_sigkill(spec, plans, journal, connector, log, copy_config, wait_seconds
                 os.kill(pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-        try:
-            os.waitpid(pid, 0)
-        except ChildProcessError:
-            pass
+        reap()
     if not killed:
         raise KitError('Rehearsal kill test inconclusive: the copy ended before a chunk could be interrupted; raise --rows (or --percent with --from-database)')
     started = _started_chunks(journal)
@@ -428,6 +462,10 @@ def run(ctx, prefix, rows=SEED_ROWS, keep=False, kill_test='sigkill', from_datab
     if ctx.dry_run:
         return _dry_run(ctx, prefix, names, spec, rows, from_database, percent)
     run_dir = ctx.config.runs_dir() / ctx.run_id / 'rehearsal'
+    if run_dir.exists():
+        # an earlier attempt's journal and captures would carry its records and done chunks into this one (live P5, October 28, 2026);
+        # they stay beside it as evidence
+        run_dir.rename(run_dir.with_name('rehearsal-' + utc_now().strftime('%Y%m%dT%H%M%SZ')))
     run_dir.mkdir(parents=True, exist_ok=True)
     config = rehearsal_config(ctx.config, None if from_database is not None else rows, run_dir, start_pipelines)
     guard = rehearsal_guard(prefix)
@@ -544,7 +582,8 @@ def _copy_steps(ctx, sub, names, spec, kill_test, created, timed, timings):
     timed('O5', lambda: _step(sub, 'O5'))
     created.append(names['replacement'])
     killer = KILL_STRATEGIES[kill_test]
-    interrupted = timed('O6 kill test', lambda: killer(spec, plans, journal, ctx.runner_connector(), ctx.log, config.copy))
+    extra = {'config': config} if killer is kill_sigkill else {}
+    interrupted = timed('O6 kill test', lambda: killer(spec, plans, journal, ctx.runner_connector(), ctx.log, config.copy, **extra))
     if not interrupted:
         raise _RehearsalFailed('the kill test left no started chunk; the resume would prove nothing')
     before = len(journal.events('reconcile_delete'))

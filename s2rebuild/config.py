@@ -297,6 +297,8 @@ class Section:
                                            for k, v in data.items()})
 
     def __getattr__(self, name):
+        if name == '_data':  # unpickling (the rehearsal's spawned copy process) asks before _data exists
+            raise AttributeError(name)
         try:
             return self._data[name]
         except KeyError:
