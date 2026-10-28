@@ -132,10 +132,12 @@ def probe_target(plans, inventory_tables):
 
     The smallest non-empty table with a string column wins (its first string key column, else
     its first string column). Without any string column, the smallest non-empty table with an
-    integer key column, probed with MIN minus one. Raises KitError when no column suits.
+    integer key column, probed with MIN minus one. Reference tables are never probed: a write to
+    one on a READ ONLY source fails with 1777 (no master instance, fact 24), not a read-only
+    refusal (live I1 O3, October 28, 2026). Raises KitError when no column suits.
     """
     types = _column_types(inventory_tables)
-    ordered = sorted(plans, key=lambda p: (p.est_rows <= 0, p.est_rows, p.name))
+    ordered = sorted((p for p in plans if not getattr(p, 'reference', False)), key=lambda p: (p.est_rows <= 0, p.est_rows, p.name))
     for p in ordered:
         cols = types.get(p.name, [])
         strings = [c for c, t in cols if t in STRING_TYPES]
