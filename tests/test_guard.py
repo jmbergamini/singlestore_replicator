@@ -154,10 +154,6 @@ class ClassifyTests(unittest.TestCase):
         guard = steps.guard_for('O9', DB, steps.OWNER)
         with self.assertRaises(GuardError):
             guard.check("CREATE PIPELINE `p` AS LOAD DATA KAFKA 'b/t' INTO TABLE `%s`.`t`" % DB.source)
-        lockout = steps.guard_for('lockout', DB, steps.OWNER)
-        lockout.check("REVOKE INSERT ON `%s`.* FROM 'app'@'%%'" % DB.source)
-        with self.assertRaises(GuardError):
-            lockout.check("REVOKE INSERT ON `elsewhere`.* FROM 'app'@'%'")
 
     def test_probe_accepts_a_string_token_or_an_integer(self):
         from s2rebuild.sqlutil import probe_guard
@@ -358,18 +354,14 @@ class StepGuardTests(unittest.TestCase):
             o10.check('DROP DATABASE `%s`' % RET)
         o11 = steps.guard_for('O11', self.db, steps.OWNER)
         o11.check('START PIPELINE `%s`.`p`' % SRC)
-        o11.check("GRANT INSERT ON *.* TO 'app'@'%'")
         o11.check('SET GLOBAL query_parallelism_per_leaf_core = 0.5')
-        with self.assertRaises(GuardError):
-            o11.check('START PIPELINE `%s`.`p`' % TGT)
-        c3 = steps.guard_for('C3', self.db, steps.OWNER)
-        c3.check('DROP DATABASE `%s`' % TGT)
-        c3.check('DROP DATABASE `%s`' % SRC)
-        c3.check('DETACH DATABASE `%s`' % SRC)
-        with self.assertRaises(GuardError):
-            c3.check('DROP DATABASE `%s`' % RET)
-        with self.assertRaises(GuardError):
-            c3.check('DETACH DATABASE `%s`' % RET)
+        for refused in ('START PIPELINE `%s`.`p`' % TGT, "GRANT INSERT ON *.* TO 'app'@'%'"):
+            with self.assertRaises(GuardError):
+                o11.check(refused)
+        c3 = steps.guard_for('C3', self.db, steps.OWNER)  # C3 issues reads only
+        for refused in ('DROP DATABASE `%s`' % TGT, 'DETACH DATABASE `%s`' % SRC, 'DROP DATABASE `%s`' % RET):
+            with self.assertRaises(GuardError):
+                c3.check(refused)
         c5 = steps.guard_for('cleanup', self.db, steps.OWNER)
         c5.check('DROP DATABASE `%s`' % RET)
         c5.check('DETACH DATABASE `%s`' % RET)
@@ -377,9 +369,6 @@ class StepGuardTests(unittest.TestCase):
             c5.check('DROP DATABASE `%s`' % SRC)
         steps.guard_for('C4', self.db, steps.OWNER).check("DROP USER 's2rebuild_runner'@'%'")
         steps.guard_for('P1', self.db, steps.OWNER).check("CREATE USER 'u'@'%' IDENTIFIED BY '<password>'")
-        lockout = steps.guard_for('lockout', self.db, steps.OWNER)
-        lockout.check("REVOKE INSERT ON *.* FROM 'app'@'%'")
-        lockout.check('KILL CONNECTION 5')
         with self.assertRaises(KitError):
             steps.guard_for('O6', self.db, steps.OWNER)
 
@@ -390,18 +379,16 @@ FORBIDDEN_WORDS = ('detach', 'attach', 'drop', 'truncate', 'pipeline', 'grant', 
 ALLOWANCES = {
     'sqlutil.py': set(FORBIDDEN_WORDS),           # classifies every statement kind
     'steps.py': set(FORBIDDEN_WORDS),             # registry titles, gate texts and owner allowances
-    'cli.py': {'pipeline', 'drop', 'grant', 'revoke', 'kill', 'attach'},   # command help text, the --drop flag, record_attachment
+    'cli.py': {'pipeline', 'drop', 'grant', 'attach'},   # command help text, the --drop flag, record_attachment
     'inventory.py': {'pipeline', 'grant', 'attach', 'drop'},  # pipeline capture, grantees, attachment row, DROP in the write privilege list
-    'estimate.py': {'pipeline', 'attach', 'revoke', 'kill'},   # pipeline allowance and the plan sheet's freeze path wording
-    'report_xlsx.py': {'pipeline', 'grant', 'attach', 'revoke', 'detach'},  # Pipelines tabs, grants scope row, the attachment rows and their is_detached column, Path B action row
+    'estimate.py': {'pipeline', 'attach'},   # the plan sheet's pipeline lines and freeze wording
+    'report_xlsx.py': {'pipeline', 'grant', 'attach', 'detach'},  # Pipelines tabs, grants scope row, the attachment rows and their is_detached column
     'copy.py': {'drop', 'kill'},                                # DROP TABLE in the fresh-table fallback (section 10.9); the hard-stop hint names the operating system kill, no KILL statement
     'transform.py': set(),
     'verify.py': set(),
     'postcopy.py': set(),
     'projections.py': {'attach'},  # the docstring: ATTACH ... AS carries the projections to the live name (fact 45); no ATTACH statement
     'routines.py': {'pipeline'},  # the load target refusal (a pipeline INTO PROCEDURE whose procedure the replacement will not hold)
-    'watch.py': {'pipeline', 'drop', 'truncate', 'grant'},     # PIPELINES state query, the write regex (DROP, TRUNCATE), grantee lookup
-    'workspace.py': set(),  # the Management API read (P2) and the O1 workspace guard; no statement
     'prompts.py': {'pipeline'},  # the pipeline credential prompts (P3, O9); the only statement is the PASSWORD_ variables read
     'report_md.py': set(),
     'ownersql.py': {'drop', 'grant', 'attach', 'pipeline', 'detach', 'kill'},  # account and cleanup blocks, attachment checks, pipeline block dispatch
@@ -409,17 +396,12 @@ ALLOWANCES = {
     'cleanup.py': {'detach', 'attach', 'drop'},  # C5: DETACH, ATTACH by syntax and DROP of the retained copy behind its record checks
     'freeze.py': {'detach', 'attach', 'kill', 'pipeline', 'grant', 'revoke'},  # the freeze block, DETACH KILL escalation, pipelines check, grants reference
     'grants.py': {'grant', 'revoke', 'drop', 'pipeline'},              # REVOKE and GRANT statements, the privilege names
-    'lockout.py': {'grant', 'revoke', 'kill'},                         # the loop's REVOKE and KILL CONNECTION statements, grants module
-    'pipelines.py': {'pipeline', 'grant', 'revoke'},                   # pipeline statements, grant restore at O11 (grants revoked by the lockout)
-    'notebook.py': {'grant', 'revoke', 'kill', 'pipeline', 'detach'},  # the lockout cell text and the run payload
-    'abandon.py': {'detach', 'attach', 'drop', 'kill', 'revoke'},  # the abandon block, detach_kill of the escalation, the Path B refusal text
-    'rehearse.py': {'drop', 'kill', 'pipeline', 'detach', 'attach'},  # cleanup by record (DETACH, ATTACH by syntax, DROP), the SIGKILL test, the pipelines of O9 and O11
-    'sample.py': {'attach', 'drop'},  # the READ ONLY attachment check of the source, DROP TABLE of the staging table
+    'pipelines.py': {'pipeline', 'grant', 'drop', 'truncate'},         # pipeline statements, the C1 grants compare, the C1 writer sample's write regex (DROP, TRUNCATE)
+    'notebook.py': {'kill', 'pipeline', 'detach'},  # the run payload (detach_wait_seconds, detach_kill) and the pipeline keys
+    'abandon.py': {'detach', 'attach', 'drop', 'kill'},  # the abandon block, detach_kill of the escalation
     'config.py': {'pipeline', 'detach', 'kill'},  # pipelines section, detach_wait_seconds, detach_kill
-    'journal.py': {'pipeline', 'grant', 'attach', 'revoke', 'detach'},  # pipelines, grants_snapshot (never overwritten by a revoked state), the attachments table and its is_detached column
+    'journal.py': {'pipeline', 'grant', 'attach', 'detach'},  # pipelines, the grants_snapshot table, the attachments table and its is_detached column
     'connect.py': set(),
-    'bundle.py': set(),
-    'enginecapture.py': {'pipeline', 'attach', 'detach', 'drop'},  # the PIPELINES views, the ATTACH forms and the 2720 row of the error table
     'common.py': set(),
     '__init__.py': set(),
     '__main__.py': set(),

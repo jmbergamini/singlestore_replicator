@@ -9,7 +9,7 @@ from s2rebuild import copy as copy_module
 from s2rebuild.common import EXIT_DONE, EXIT_REFUSED, KitError
 from tests.helpers import run_cli
 from tests.test_copy import SRC, TGT
-from tests.test_pipelines import o3_harness, o3_writes, owner_harness
+from tests.test_pipelines import o3_harness, o3_writes
 
 SID = '1028600672070281646:7367158985892520834'
 
@@ -89,12 +89,6 @@ class AbandonTests(unittest.TestCase):
             with self.assertRaisesRegex(KitError, 'copy lock'):
                 abandon.run(h.ctx(), 'copy running', execute=True)
         self.assertEqual(h.fake.attachment(SRC)['ATTACH_TYPE'], 'READONLY')
-
-    def test_refused_on_path_b(self):
-        h = owner_harness(self, mutate=lambda d: d.update(freeze={'mode': 'lockout'}))
-        h.journal.record_attachment('source', SRC, SID, 'cid-1', 'READWRITE')
-        with self.assertRaisesRegex(KitError, 'Path B'):
-            abandon.run(h.ctx(), 'lockout', execute=True)
 
     def test_dry_run_and_print_only_issue_nothing(self):
         h = frozen_with_replacement(self)

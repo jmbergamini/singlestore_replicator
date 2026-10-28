@@ -14,7 +14,7 @@ kit injects them at replay time from the environment variables named in the conf
 SQL literal with backslashes and quotes escaped; the value lives only in the process environment
 and in the statement sent to the server, and every form of it is masked in logs. Route customer
 leaves the CREATE statements to the customer and keeps the same verification. Statements issued
-through the owner guards: STOP PIPELINE (O2), USE, CREATE PIPELINE, ALTER PIPELINE (O9), GRANT,
+through the owner guards: STOP PIPELINE (O2), USE, CREATE PIPELINE, ALTER PIPELINE (O9),
 START PIPELINE, SET GLOBAL (O11); SELECT on the pipeline and privilege views.
 """
 import json
@@ -223,16 +223,16 @@ def verify_block(names, items, capture_step='O2', placeholder_file=None):
     return b
 
 
-def release_block(names, items, grant_snapshot, config=None):
-    """O11: retention and partition checks, GRANT restores first (each checked), START PIPELINE per expected pipeline, parallelism.
+def release_block(names, items, config=None):
+    """O11: retention and partition checks, START PIPELINE per expected pipeline, parallelism.
 
     With pipelines.start_at_release: none no pipeline is started: the block checks that every
     captured partition is present, that none is Running, and notes how to start them later; the
     retention check belongs to the start and is left out.
     """
     start = starts_at_release(config)
-    b = ownersql.Block('O11', 'Release: restore grants, start pipelines, application restart' if start else
-                       'Release: restore grants, pipelines left stopped, application restart')
+    b = ownersql.Block('O11', 'Release: start pipelines, application restart' if start else
+                       'Release: pipelines left stopped, application restart')
     for item in expected_items(items):
         known = _offsets_known(item)
         if not known:
@@ -249,12 +249,6 @@ def release_block(names, items, grant_snapshot, config=None):
                 + ' OR '.join(['(SOURCE_PARTITION_ID = %s AND EARLIEST_OFFSET > %s)'] * len(known)) + ')',
                 (names['source'], item['name']) + tuple(v for o in known for v in (str(o['partition']), committed_offset(o)[1])),
                 ownersql.Expect('column_equals', 'n', 0))
-    for grantee, scopes in sorted(grants.normalize(grant_snapshot).items()):
-        for scope, privs in sorted(scopes.items()):
-            sql, params = grants.privilege_count_check(grantee, scope, privs, names['source'])
-            b.check('%s write privileges on %s before the restore (informational)' % (grantee, scope), sql, params, ownersql.Expect('some_rows'))
-            b.statement('GRANT %s ON %s TO %s' % (', '.join(privs), scope, grantee), 'restore the grants revoked by the lockout')
-            b.check('%s holds every restored privilege on %s' % (grantee, scope), sql, params, ownersql.Expect('column_equals', 'n', len(privs)))
     if start:
         for item in expected_items(items):
             b.statement('START PIPELINE %s' % qualified(names['source'], item['name']), 'start pipeline %s on the live database' % item['name'],
@@ -416,6 +410,7 @@ def _require_committed(items):
     The replay position must be the committed one. A NULL successful offset beside a loaded one
     counts as a difference (a batch extracted and never committed); only both NULL passes.
     """
+
     def shown(v):
         """An offset as the refusal prints it: NULL for None."""
         return 'NULL' if v is None else v
@@ -554,21 +549,20 @@ def handle_o9(step, ctx):
 
 
 def handle_o11(step, ctx):
-    """O11 handler: retention and partition checks, grants restored first (from any unrestored snapshot), pipelines started, release time.
+    """O11 handler: retention and partition checks, pipelines started, release time.
 
     With the owner profile, release_started_utc is written inside the open owner session once
     the retention check and every check ahead of the first statement passed, just before that
     statement (ownersql.execute_block before_first_statement). From that statement on a started
-    pipeline or a restored grant may write to the live name, so an O11 that fails or is
+    pipeline may write to the live name, so an O11 that fails or is
     interrupted after it never leaves the rollback open. An O11 that stopped before it (a failed
     check, a lost connection) issued nothing and leaves the rollback open. released_utc follows
-    once the whole block and the grants compare passed.
+    once the whole block passed.
     """
     cap = capture_for(ctx)
     items = cap['items']
     names = ownersql.names_for(ctx)
-    snap = grants.unrestored_snapshot(ctx.journal)
-    b = release_block(names, items, snap, ctx.config)
+    b = release_block(names, items, ctx.config)
     if ctx.dry_run or not ctx.owner_configured:
         return ownersql.handle_admin(step, ctx, b)
     owner = ctx.owner_session(read_guard('owner O11'))
@@ -586,16 +580,6 @@ def handle_o11(step, ctx):
         now = iso(utc_now())
         for item in expected_items(items) if starts_at_release(ctx.config) else ():
             ctx.journal.upsert_pipeline(item['name'], started_utc=now)
-        if snap:
-            owner2 = ctx.owner_session(read_guard('owner O11 compare'))
-            try:
-                diff = grants.compare(owner2, ctx.db.source, snap)
-            finally:
-                owner2.close()
-            if diff:
-                raise KitError('Grants differ from the snapshot after the restore: ' + ', '.join(sorted(diff)))
-            for grantee in snap:
-                ctx.journal.mark_grant_restored(grantee)
         ctx.journal.set_meta('released_utc', now)
 
     def _before_first_statement():
@@ -666,6 +650,65 @@ def after_release_checks(session, db_name, items, journal, log, sleep=time.sleep
     return ok, lines
 
 
+WRITE = re.compile(r'^\s*(INSERT|UPDATE|DELETE|REPLACE|LOAD|TRUNCATE|ALTER|DROP|CREATE|START\s+PIPELINE)\b', re.I)
+IDLE_COMMANDS = ('Sleep', 'Binlog Dump', 'Connect')
+
+
+def has_process_privilege(session):
+    """True when the connected account holds PROCESS globally (USER_PRIVILEGES of CURRENT_USER())."""
+    rows = session.query('SELECT CURRENT_USER() AS u')
+    user = str(rows[0]['u'] if rows and isinstance(rows[0], dict) else (rows[0][0] if rows else ''))
+    if '@' in user:
+        name, host = user.split('@', 1)
+        grantee = "'%s'@'%s'" % (name.strip("'"), host.strip("'"))
+    else:
+        grantee = "'%s'@'%%'" % user
+    return any(str(r['GRANTEE']) == grantee and str(r['PRIVILEGE_TYPE']).upper() == 'PROCESS'
+               for r in session.query(inventory.USER_PRIVILEGES_SQL))
+
+
+def statement_kind(info):
+    """The leading keyword of a statement, or 'other'."""
+    text = (info or '').strip()
+    m = WRITE.match(text)
+    if m:
+        return ' '.join(m.group(1).upper().split())
+    return text.split(' ', 1)[0].upper() if text else 'other'
+
+
+def writer_sample(session, db_name, protected_users, log, samples=3):
+    """C1: the non-idle PROCESSLIST sessions on the database from accounts outside protected_users, sampled samples times.
+
+    Refuses without the PROCESS privilege, since the runner would see only its own sessions.
+    Logs each session seen and returns how many were seen. Reads PROCESSLIST only.
+    """
+    if not has_process_privilege(session):
+        raise KitError('The connected account lacks the PROCESS privilege; C1 would see only its own sessions. Grant PROCESS first.')
+    seen = 0
+    for _ in range(samples):
+        for r in session.query(inventory.PROCESSLIST_SQL, (db_name, '%' + db_name + '%')):
+            if str(r.get('USER')) in protected_users:
+                continue
+            if str(r.get('COMMAND') or '') in IDLE_COMMANDS and not (r.get('INFO') or '').strip():
+                continue
+            seen += 1
+            log('SESSION SEEN id=%s user=%s host=%s command=%s time=%ss kind=%s stmt=%s' % (
+                r.get('ID'), r.get('USER'), r.get('HOST'), r.get('COMMAND'), r.get('TIME'), statement_kind(r.get('INFO')),
+                (r.get('INFO') or '')[:100].replace('\n', ' ')))
+    log('writer sample on %s: %d session(s) seen in %d samples' % (db_name, seen, samples))
+    return seen
+
+
+def count_largest(session, db_name, plans, limit):
+    """{table: count} for the largest tables of the plan."""
+    from . import verify
+    out = {}
+    for p in sorted(plans, key=lambda p: -p.est_rows)[:limit]:
+        rows = session.query(verify.count_sql(db_name, p.name))
+        out[p.name] = int(rows[0]['n'] if rows and isinstance(rows[0], dict) else (rows[0][0] if rows else 0))
+    return out
+
+
 def handle_c1(step, ctx):
     """C1 handler: writer watch and count changes on the live database, pipeline and grants checks with the owner, app_writes_seen.
 
@@ -680,7 +723,6 @@ def handle_c1(step, ctx):
     otherwise it fails with exit 4.
     """
     from . import copy as copy_module
-    from . import watch
     cap = capture_for(ctx)
     items = cap['items']
     if ctx.dry_run:
@@ -698,14 +740,14 @@ def handle_c1(step, ctx):
     protected = {ctx.config.runner.user} | ({ctx.config.owner.user} if ctx.config.owner else set())
     ok, lines = True, []
     try:
-        summary = watch.watch(runner, ctx.db.source, plans, protected, ctx.log, interval=1, tables=10, max_checks=3, sleep=lambda s: None)
-        counts1 = watch.count_largest(runner, ctx.db.source, plans, 10)
+        writers_seen = writer_sample(runner, ctx.db.source, protected, ctx.log)
+        counts1 = count_largest(runner, ctx.db.source, plans, 10)
         if ctx.owner_configured:
             owner = ctx.owner_session(read_guard('owner C1'))
             try:
                 ok, lines = after_release_checks(owner, ctx.db.source, items, ctx.journal, ctx.log, sleep=sleep, started_since=released,
                                                  start=starts_at_release(ctx.config))
-                snap = grants.snapshot_from_journal(ctx.journal) or grants.reference_from_journal(ctx.journal)
+                snap = grants.reference_from_journal(ctx.journal)
                 if snap:
                     diff = grants.compare(owner, ctx.db.source, snap)
                     if diff:
@@ -714,12 +756,12 @@ def handle_c1(step, ctx):
                     else:
                         lines.append('grants equal the snapshot for %d account(s)' % len(snap))
                 else:
-                    lines.append('no grants snapshot or reference was taken, so grants are not compared')
+                    lines.append('no grants reference was taken at O3, so grants are not compared')
             finally:
                 owner.close()
         else:
             sleep(60)
-        counts2 = watch.count_largest(runner, ctx.db.source, plans, 10)
+        counts2 = count_largest(runner, ctx.db.source, plans, 10)
     finally:
         runner.close()
     journal_counts = {t['table_name']: t.get('target_count') for t in ctx.journal.tables()}
@@ -729,13 +771,13 @@ def handle_c1(step, ctx):
         lines.append(NOT_CHECKED)
         ctx.journal.event('c1_not_checked', NOT_CHECKED)
         ctx.log(lines[-1])
-    seen_now = bool(summary['writers_seen'] or moved or differs or any(summary['count_deltas'].values()))
+    seen_now = bool(writers_seen or moved or differs)
     seen_before = ctx.journal.get_meta('app_writes_seen')
     writes = seen_now or bool(seen_before)
     if seen_now:
         ctx.journal.set_meta('app_writes_seen', seen_before or iso(utc_now()))
         lines.append('application writes seen on the live database (%s); a rollback is now a new freeze and reconciliation' % (
-            ', '.join(filter(None, ['sessions' if summary['writers_seen'] else '', 'counts moved on ' + ', '.join(moved) if moved else '',
+            ', '.join(filter(None, ['sessions' if writers_seen else '', 'counts moved on ' + ', '.join(moved) if moved else '',
                                      'counts differ from the copy on ' + ', '.join(differs) if differs else '']))))
     elif seen_before:
         # an earlier C1 attempt of this run saw them and recorded app_writes_seen; this sample saw none, which does not undo that

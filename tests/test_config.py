@@ -25,22 +25,19 @@ class DefaultsTests(unittest.TestCase):
         self.assertEqual(cfg.copy.workers, 4)
         self.assertEqual(cfg.copy.chunk_rows, 10_000_000)
         self.assertEqual(cfg.copy.min_rows_for_chunking, 5_000_000)
-        self.assertEqual(cfg.copy.max_buckets_per_table, 32)
+        self.assertEqual(cfg.copy.max_buckets_per_table, 64)
+        self.assertEqual(cfg.copy.slow_chunk_minutes, 30)
         self.assertEqual(cfg.copy.table_concurrency, 'auto')
-        self.assertEqual(cfg.freeze.mode, 'readonly')
         self.assertEqual(cfg.freeze.detach_wait_seconds, 120)
         self.assertTrue(cfg.freeze.detach_kill)
-        self.assertEqual(cfg.freeze.lockout.connections, 6)
-        self.assertEqual(cfg.freeze.lockout.quiet_passes_required, 3)
         self.assertEqual(cfg.verify.tiers, ['count', 'newest', 'fingerprint'])
         self.assertIsNone(cfg.verify.fingerprint_budget_minutes, 'no deadline unless set')
         self.assertIsNone(cfg.verify.sessions, 'copy.workers unless set')
         self.assertEqual((cfg.verify.full_fingerprint_max_rows, cfg.verify.sample_percent, cfg.verify.value_columns), (1_000_000_000, 5, 4))
-        self.assertEqual((cfg.workspace.keepalive_minutes, cfg.workspace.management_api_key_keychain, cfg.copy.max_consecutive_failures), (15, None, 6))
+        self.assertEqual((cfg.workspace.keepalive_minutes, cfg.copy.max_consecutive_failures), (15, 6))
         self.assertEqual(cfg.pipelines.route, 'kit')
         self.assertEqual(cfg.pipelines.credentials_env['KAFKA'], 'S2REBUILD_KAFKA_CREDENTIALS')
-        self.assertEqual(cfg.estimate.baseline, 'customer/baseline.json')
-        self.assertEqual(cfg.estimate.band_percent, 15)
+        self.assertEqual(cfg.estimate.rows_per_hour, 2_400_000_000)
         self.assertEqual(cfg.closeout.retain_days, 90)
         self.assertEqual(cfg.closeout.flexible_parallelism, 0.5)
         self.assertEqual(cfg.paths.runs_dir, 'customer/runs')
@@ -51,8 +48,6 @@ class DefaultsTests(unittest.TestCase):
         self.assertEqual(db.app_managed_pipelines, ())
         self.assertEqual(cfg.window.start, dt.datetime(2026, 11, 1, 5, tzinfo=dt.timezone.utc))
         self.assertEqual(cfg.window.duration, dt.timedelta(hours=8))
-        self.assertEqual(cfg.window.abort_deadline(0), dt.datetime(2026, 11, 1, 11, 30, tzinfo=dt.timezone.utc))
-        self.assertEqual(cfg.window.abort_deadline(240), dt.datetime(2026, 11, 1, 11, 26, tzinfo=dt.timezone.utc))
 
     def test_default_names_come_from_the_run_date(self):
         def strip(d):
@@ -105,8 +100,8 @@ class ValidationTests(unittest.TestCase):
                     lambda d: d['connections']['runner'].update(password='x'))
         self.refuse(r'Unknown configuration key databases\.0\.tables\.big_events\.chunk',
                     lambda d: d['databases'][0]['tables'].update(big_events={'chunk': 1}))
-        self.refuse(r'Unknown configuration key freeze\.lockout\.connection',
-                    lambda d: d.update(freeze={'lockout': {'connection': 1}}))
+        self.refuse(r'Unknown configuration key freeze\.lockout',
+                    lambda d: d.update(freeze={'lockout': {'connections': 1}}))
 
     def test_required_keys(self):
         self.refuse(r'workspace\.host is required', lambda d: d['workspace'].pop('host'))
@@ -138,11 +133,8 @@ class ValidationTests(unittest.TestCase):
         self.refuse('ISO 8601', lambda d: d['window'].update(start='tomorrow'))
         cfg = config_from(lambda d: d['window'].update(start='2026-11-01T00:00:00-05:00'))
         self.assertEqual(cfg.window.start, dt.datetime(2026, 11, 1, 5, tzinfo=dt.timezone.utc))
-        self.refuse('at least 0', lambda d: d['window'].update(buffer_minutes=-1))
 
-    def test_freeze_mode_and_workers(self):
-        self.refuse(r'freeze\.mode must be one of', lambda d: d.update(freeze={'mode': 'frozen'}))
-        self.assertEqual(config_from(lambda d: d.update(freeze={'mode': 'lockout'})).freeze.mode, 'lockout')
+    def test_workers(self):
         self.refuse(r'copy\.workers must be at least 1', lambda d: d.update(copy={'workers': 0}))
         self.refuse(r'copy\.workers must be at most 32', lambda d: d.update(copy={'workers': 33}))
         self.assertEqual(config_from(lambda d: d.update(copy={'workers': 16})).copy.workers, 16)
@@ -191,8 +183,7 @@ class ValidationTests(unittest.TestCase):
         self.refuse(r'pipelines\.credentials_env\.KAFKA must name', lambda d: d.update(pipelines={'credentials_env': {'KAFKA': 'lower'}}))
         self.refuse(r'pipelines\.retention_hours\.KAFKA must be a number', lambda d: d.update(pipelines={'retention_hours': {'KAFKA': 'week'}}))
         self.refuse(r'pipelines\.route must be one of', lambda d: d.update(pipelines={'route': 'manual'}))
-        self.refuse(r'protected_accounts must hold', lambda d: d.update(freeze={'lockout': {'protected_accounts': [1]}}))
-        self.refuse(r'estimate\.band_percent must be at most 100', lambda d: d.update(estimate={'band_percent': 101}))
+        self.refuse(r'estimate\.rows_per_hour must be at least 1', lambda d: d.update(estimate={'rows_per_hour': 0}))
         self.assertIsNone(config_from(lambda d: d.update(closeout={'flexible_parallelism': None})).closeout.flexible_parallelism)
         with self.assertRaisesRegex(KitError, 'mapping at the top level'):
             from s2rebuild.config import build_config

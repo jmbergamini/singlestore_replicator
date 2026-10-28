@@ -5,19 +5,21 @@ Author: John Bergamini
 The reference runner generalized (section 10.9 of the architecture). Kept as it was: hash-bucket
 predicates CRC32(key_expr) MOD B = k, server-side INSERT INTO replacement SELECT FROM source,
 journal transitions committed before each statement, delete-then-reinsert reconciliation of a
-started or failed bucket, the write guard, the redactor, the abort deadline, the stop file, lock
+started or failed bucket, the write guard, the redactor, the stop file, lock
 waits requeued without consuming an attempt, the definition diff that ignores only the
 AUTO_INCREMENT counter, the refusal of a replacement holding rows the journal cannot explain,
 and the count proof at the end. New: names and sizes from config, the bucket cap, a queue per
 table with per-table concurrency and automatic serialization after a lock wait, the lock probe,
-the fresh-table fallback, per-chunk timings for calibrate, the circuit breaker (copy.max_consecutive_failures
-failed chunks in a row end O6 INCOMPLETE) and the 1997 transient (reconciled and requeued without an
-attempt). A fresh-table load replaces a whole
+the fresh-table fallback, per-chunk timings, the circuit breaker (copy.max_consecutive_failures
+failed chunks in a row stop new chunks), one automatic retry round at the end of the pass for the
+chunks that failed in it, each no sooner than RETRY_DELAY_SECONDS after its failure (Helios fact
+12), and the progress line naming a chunk that runs longer than copy.slow_chunk_minutes. A
+fresh-table load replaces a whole
 table, so it reopens O7 and O8 and the table's verification as a mark-recopy does, and the O10
 block files of the database get a STOP first. Stop safety: a chunk fails after copy.max_lock_waits
 lock waits, with the fresh-table command in its error; a second Ctrl-C prints the hard-stop hint
-and the workers still finish their chunks; the fresh-table load honors the abort deadline and the
-stop file and reuses only the fresh table its journal recorded.
+and the workers still finish their chunks; the fresh-table load honors the stop file and reuses
+only the fresh table its journal recorded.
 
 Statements issued, every one through the runner guard naming the replacement: CREATE DATABASE,
 CREATE TABLE LIKE, SHOW CREATE TABLE, INSERT INTO replacement SELECT FROM source, DELETE FROM
@@ -36,17 +38,20 @@ import time
 import traceback
 from pathlib import Path
 
-from . import estimate, inventory, ownersql, steps, transform
-from .common import EXIT_INCOMPLETE, EXIT_MISMATCH, EXIT_REFUSED, KitError, auto_table_limit, iso, parse_utc, utc_now
+from . import inventory, ownersql, steps, transform
+from .common import EXIT_INCOMPLETE, EXIT_MISMATCH, EXIT_REFUSED, KitError, auto_table_limit, iso, utc_now
 from .sqlutil import ident, qualified, runner_guard
 
 DURABILITY_FLAGS = ('IS_SYNC', 'IS_SYNC_DURABILITY', 'IS_SYNC_DURABILITY_ON_REF_DB_ONLY')
 LOCK_WAIT_ERRNO = 1205
-# Error 1997 (transaction was already in its commit phase): a chunk in flight while autoscale replaces a node
-# (Helios fact 40). A transient: the chunk is reconciled and requeued without consuming an attempt.
-COMMIT_PHASE_ERRNO = 1997
 BREAKER_MESSAGE = ('chunks are failing in a row; nodes may be restarting, see MV_EVENTS; rerun with --retry-failed when the workspace '
                    'is steady')
+# A client cut off mid INSERT leaves a prepared transaction that may still commit for 15 to 20 minutes (Helios fact 12),
+# so a failed chunk is retried no sooner than this after its failure (the retry round, and the K1 hint).
+RETRY_DELAY_SECONDS = 20 * 60
+# The error text of the chunk rows a fresh-table load writes (one whole-table INSERT, not a chunk timing).
+FRESH_LOAD_ERROR = 'fresh-table load'
+
 FRESH_SUFFIX = '__fresh'
 STAGE_SUFFIX = '__stage'
 MAX_NAME_CHARS = 64
@@ -103,12 +108,6 @@ def is_lock_wait(exc):
     """True for error 1205 (lock wait timeout) however the driver wraps it."""
     args = getattr(exc, 'args', ())
     return (bool(args) and args[0] == LOCK_WAIT_ERRNO) or 'Lock wait timeout' in str(exc)
-
-
-def is_commit_phase(exc):
-    """True for error 1997 (already in its commit phase) however the driver wraps it."""
-    args = getattr(exc, 'args', ())
-    return (bool(args) and args[0] == COMMIT_PHASE_ERRNO) or 'commit phase' in str(exc).lower()
 
 
 def one_value(rows, key='n'):
@@ -367,16 +366,16 @@ class Runner:
     tables continue. Before a chunk on a table that has waited for a lock, the reconciliation
     DELETE runs as a probe with lock_wait_timeout = lock_probe_timeout_seconds. The
     max_lock_waits-th lock wait of one chunk in a run fails that chunk as an attempt, with the
-    fresh-table command in its error, so a lock that never clears ends O6 incomplete. Error 1997
-    (commit phase, a node replaced under the chunk) is a transient: the chunk is marked failed,
-    so its rows are reconciled, and goes to the back of its queue without consuming an attempt.
-    The circuit breaker: copy.max_consecutive_failures failed chunks with no success between
-    them (1997 counted, lock waits not) stop new chunks; the running ones finish, BREAKER_MESSAGE
-    is logged and journaled, and O6 ends INCOMPLETE.
+    fresh-table command in its error, so a lock that never clears ends O6 incomplete. Failed
+    chunks queue last in their table. The circuit breaker: copy.max_consecutive_failures failed
+    chunks with no success between them (lock waits not counted) stop new chunks; the running
+    ones finish and BREAKER_MESSAGE is logged and journaled. Then, unless the operator stopped
+    the pass, one retry round runs every chunk left, those that failed in the pass no sooner than
+    RETRY_DELAY_SECONDS after their failure; a breaker in the retry round ends O6 INCOMPLETE.
     """
 
-    def __init__(self, plans, statements, journal, connect, log, copy_config, workers=None, abort_at=None, stop_file=None,
-                 after_insert_hook=None, retry_failed=False, sleep=time.sleep, clock=time.monotonic):
+    def __init__(self, plans, statements, journal, connect, log, copy_config, workers=None, stop_file=None,
+                 after_insert_hook=None, retry_failed=False, sleep=time.sleep, clock=time.monotonic, retry_delay=None):
         self.plans = plans
         self.by_name = {p.name: p for p in plans}
         self.st = statements
@@ -386,12 +385,12 @@ class Runner:
         self.cfg = copy_config
         self.workers = max(1, int(workers or copy_config.workers))
         self.default_limit = auto_table_limit(self.workers)
-        self.abort_at = abort_at
         self.stop_file = Path(stop_file) if stop_file else None
         self.after_insert_hook = after_insert_hook
         self.retry_failed = retry_failed
         self.sleep = sleep
         self.clock = clock
+        self.retry_delay = RETRY_DELAY_SECONDS if retry_delay is None else retry_delay
         self.lock = threading.Lock()
         self.stop_launching = threading.Event()
         self.queues = collections.OrderedDict((p.name, collections.deque()) for p in plans)
@@ -415,17 +414,19 @@ class Runner:
         self.consecutive_failures = 0
         self.breaker_tripped = False
         self.interrupted = False
+        # (table, bucket): clock time of a failure in this pass, the start of each running chunk, and the earliest retry time
+        self.failed_at = {}
+        self.running = {}
+        self.not_before = {}
+        self.retry_round = False
+        self.journal_broken = False
         self._seed_from_journal()
 
     def _seed_from_journal(self):
-        """A table serialized after a lock wait in an earlier run stays serialized and probed on resume."""
+        """A table serialized after a lock wait in an earlier run stays serialized and probed on resume (reads the journal tables)."""
         if self.cfg.table_concurrency != 'auto':
             return
-        try:
-            rows = self.journal.tables()
-        except Exception:  # noqa: BLE001 - a journal without a plan yet has nothing to seed
-            return
-        for row in rows:
+        for row in self.journal.tables():
             name = row.get('table_name')
             if name in self.by_name and name not in self.configured and row.get('concurrency') == 1:
                 self.limits[name] = 1
@@ -433,16 +434,28 @@ class Runner:
 
     # -- queue ------------------------------------------------------------------
     def load_pending(self):
-        """Fill the queues from the journal: pending, started and failed chunks (parked failures need retry_failed)."""
+        """Fill the queues from the journal: pending and started chunks, then the failed ones last in their table (K1).
+
+        A chunk parked after copy.max_attempts failures needs retry_failed, unless it failed in
+        this pass (the retry round); one that failed in this pass waits until RETRY_DELAY_SECONDS
+        after its failure (not_before).
+        """
         total = 0
         for p in self.plans:
+            failed = []
             for _, bucket, state, _, attempts in self.journal.chunk_states(p.name):
                 if state == 'done':
                     continue
-                if state == 'failed' and attempts >= self.cfg.max_attempts and not self.retry_failed:
+                if state == 'failed':
+                    if attempts >= self.cfg.max_attempts and not self.retry_failed and (p.name, bucket) not in self.failed_at:
+                        continue
+                    if (p.name, bucket) in self.failed_at:
+                        self.not_before[(p.name, bucket)] = self.failed_at[(p.name, bucket)] + self.retry_delay
+                    failed.append((bucket, state))
                     continue
                 self.queues[p.name].append((bucket, state))
-                total += 1
+            self.queues[p.name].extend(failed)
+            total += len(self.queues[p.name])
         return total
 
     def remaining(self):
@@ -451,12 +464,8 @@ class Runner:
             return sum(len(q) for q in self.queues.values()) + sum(self.in_flight.values())
 
     def should_stop_launching(self):
-        """True after the abort deadline, when the stop file exists, or once a stop was requested."""
+        """True when the stop file exists, or once a stop was requested."""
         if self.stop_launching.is_set():
-            return True
-        if self.abort_at is not None and utc_now() >= self.abort_at:
-            self.log('Abort deadline reached; no new chunks will start')
-            self.stop_launching.set()
             return True
         if self.stop_file is not None and self.stop_file.exists():
             self.log('Stop file present; no new chunks will start')
@@ -476,7 +485,11 @@ class Runner:
                 limit = self.limits.get(name, self.default_limit)
                 if self.in_flight[name] >= limit:
                     continue
-                bucket, prior = queue.popleft()
+                ready = next((i for i, (b, _) in enumerate(queue) if self.not_before.get((name, b), 0) <= now), None)
+                if ready is None:
+                    continue
+                bucket, prior = queue[ready]
+                del queue[ready]
                 self.in_flight[name] += 1
                 self.peak_in_flight[name] = max(self.peak_in_flight[name], self.in_flight[name])
                 return name, bucket, prior
@@ -505,18 +518,23 @@ class Runner:
         """Reconcile when needed (with the lock probe on a table that has waited), then insert the bucket."""
         p = self.by_name[table]
         self.journal.mark_started(table, bucket)
+        with self.lock:
+            self.running[(table, bucket)] = self.clock()
         probe = self.lock_waits[table] > 0
         if prior_state in ('started', 'failed') or probe:
             if probe:
                 session.execute(self.st.set_lock_wait(self.cfg.lock_probe_timeout_seconds))
             try:
                 removed = session.execute(self.st.delete_chunk(p, bucket))
-            finally:
+            except BaseException:
                 if probe:
                     try:
                         session.execute(self.st.set_lock_wait(session.lock_wait_default))
-                    except Exception as exc:  # noqa: BLE001 - the original error must keep propagating
+                    except Exception as exc:  # noqa: BLE001 - logging only: the original error keeps propagating
                         self._safe_log('restoring lock_wait_timeout failed: %s' % exc)
+                raise
+            if probe:
+                session.execute(self.st.set_lock_wait(session.lock_wait_default))
             if prior_state in ('started', 'failed'):
                 self.journal.event('reconcile_delete', '%s bucket %d removed %d rows before re-insert' % (table, bucket, removed))
                 self.log('Reconciled %s bucket %d: removed %d rows left by an interrupted attempt' % (table, bucket, removed))
@@ -545,11 +563,13 @@ class Runner:
         try:
             staged = session.execute(self.st.insert_stage(plan, stage, bucket))
             rows = session.execute(self.st.insert_from_stage(plan, stage))
-        finally:
+        except BaseException:
             try:
                 session.execute(self.st.drop_table(stage))
-            except Exception as exc:  # noqa: BLE001 - the original error must keep propagating
+            except Exception as exc:  # noqa: BLE001 - logging only: the original error keeps propagating
                 self._safe_log('dropping the staging table %s failed: %s' % (stage, exc))
+            raise
+        session.execute(self.st.drop_table(stage))
         if rows != staged:
             raise KitError('Reference table %s bucket %d: %d rows staged but %d inserted' % (plan.name, bucket, staged, rows))
         return rows
@@ -575,20 +595,12 @@ class Runner:
                 self.stop_launching.set()
         if tripped:
             self._safe_log('circuit breaker: %d chunk failures in a row; %s' % (self.consecutive_failures, BREAKER_MESSAGE))
-            try:
-                self.journal.event('breaker', '%d chunk failures in a row; no new chunk starts' % self.consecutive_failures)
-            except Exception as exc:  # noqa: BLE001 - journal trouble is reported, not fatal
-                self._safe_log('the breaker event could not be journaled: %s' % type(exc).__name__)
+            self.journal.event('breaker', '%d chunk failures in a row; no new chunk starts' % self.consecutive_failures)
 
     def _count_success(self):
         """A chunk done resets the breaker's count."""
         with self.lock:
             self.consecutive_failures = 0
-
-    def requeue_transient(self, table, bucket):
-        """Put a chunk that failed with 1997 at the back of its table's queue as failed, so it is reconciled; no park, no attempt."""
-        with self.lock:
-            self.queues[table].append((bucket, 'failed'))
 
     def _count_lock_wait(self, table, bucket):
         """Count one more lock wait for a chunk in this run; returns the count."""
@@ -636,7 +648,11 @@ class Runner:
                         break
                 try:
                     self.log('worker %d start %s bucket %d/%d (prior state %s)' % (idx, table, bucket, self.by_name[table].n_buckets, prior))
-                    rows = self.run_chunk(session, table, bucket, prior)
+                    try:
+                        rows = self.run_chunk(session, table, bucket, prior)
+                    finally:
+                        with self.lock:
+                            self.running.pop((table, bucket), None)
                     self._count_success()
                     self.log('worker %d done %s bucket %d/%d rows=%d' % (idx, table, bucket, self.by_name[table].n_buckets, rows))
                 except Exception as exc:  # noqa: BLE001 - journal the failure and continue with the next chunk
@@ -651,26 +667,24 @@ class Runner:
                             self._safe_log('worker %d LOCK WAIT on %s bucket %d; parked for %d s: %s' % (
                                 idx, table, bucket, self.cfg.lock_retry_seconds, detail))
                             self.requeue_after_lock(table, bucket)
-                        elif is_commit_phase(exc):
-                            self.journal.undo_attempt(table, bucket)
-                            self.journal.event('transient', '%s bucket %d: error %d, requeued without an attempt' % (
-                                table, bucket, COMMIT_PHASE_ERRNO))
-                            self._safe_log('worker %d TRANSIENT %s bucket %d (error %d, a node may have been replaced); reconciled and '
-                                           'requeued without an attempt: %s' % (idx, table, bucket, COMMIT_PHASE_ERRNO, detail))
-                            self.requeue_transient(table, bucket)
-                            self._count_failure()
                         else:
                             with self.lock:
                                 self.failed_this_run += 1
+                                if not capped:  # a lock that never cleared has its own way out, the fresh-table load
+                                    self.failed_at[(table, bucket)] = self.clock()
                                 if capped and table not in self.lock_capped:
                                     self.lock_capped.append(table)
                             self._safe_log('worker %d FAILED %s bucket %d: %s' % (idx, table, bucket, detail))
                             if capped:
                                 self.requeue_after_lock(table, bucket, requeue=False)
                             self._count_failure()
-                    except Exception as inner:  # noqa: BLE001 - journal trouble is reported, not fatal
-                        self._safe_log('worker %d could not journal the failure of %s bucket %d: %s' % (
+                    except Exception as inner:
+                        # the journal must never disagree with the server: stop the pool and raise; the chunk stays started for reconciliation
+                        self.journal_broken = True
+                        self.stop_launching.set()
+                        self._safe_log('worker %d could not journal the failure of %s bucket %d: %s; no new chunk starts' % (
                             idx, table, bucket, self.log.redactor('%s: %s' % (type(inner).__name__, inner))))
+                        raise
                     if session is not None:
                         session.close()
                         session = None
@@ -682,13 +696,14 @@ class Runner:
 
     # -- progress and completion ------------------------------------------------------
     def progress_line(self):
-        """The progress line: tables and buckets done, failed, rows, rows per hour, projected finish, deadline."""
+        """The progress line: tables and buckets done, failed, rows, rows per hour, projected finish, slow chunks (K7)."""
         totals, tables_done = self.journal.totals()
         done_n, done_rows = totals['done']
         all_n = sum(v[0] for v in totals.values())
         elapsed = max(1.0, self.clock() - self.started_at)
         with self.lock:
             rows = self.rows_since_start
+            running = dict(self.running)
         per_hour = rows / elapsed * 3600
         remaining_est = sum(p.est_rows for p in self.plans) - done_rows
         if per_hour > 0 and remaining_est > 0:
@@ -698,9 +713,12 @@ class Runner:
             finish = 'now'
         else:
             finish = 'unknown'
-        deadline = (' deadline=%s' % iso(self.abort_at)) if self.abort_at else ''
+        now = self.clock()
+        limit = self.cfg.slow_chunk_minutes * 60
+        slow = sorted(((now - since, key) for key, since in running.items() if now - since > limit), reverse=True)
+        slow_text = (' slow=%s' % ','.join('%s/%d %dm' % (t, b, age // 60) for age, (t, b) in slow)) if slow else ''
         return 'progress tables_done=%d/%d buckets_done=%d/%d failed=%d rows_done=%d rows_per_hour=%.0f projected_finish=%s%s' % (
-            tables_done, len(self.plans), done_n, all_n, totals['failed'][0], done_rows, per_hour, finish, deadline)
+            tables_done, len(self.plans), done_n, all_n, totals['failed'][0], done_rows, per_hour, finish, slow_text)
 
     def copy(self):
         """Run the pool until every chunk is done or a stop condition holds; returns True when the copy is complete."""
@@ -710,6 +728,14 @@ class Runner:
             self.log('No pending chunks; copy already complete')
             return self.finish()
         self.log('Starting copy: %d chunks pending, %d workers' % (pending, self.workers))
+        self._run_pool()
+        if self.failed_at and not self.interrupted and not self.journal_broken and not (self.stop_file is not None and self.stop_file.exists()):
+            self._start_retry_round()
+            self._run_pool()
+        return self.finish()
+
+    def _run_pool(self):
+        """Start the workers, wait for them with the progress line, then log the progress once more."""
         threads = [threading.Thread(target=self.worker, args=(i,), name='worker-%d' % i, daemon=True) for i in range(self.workers)]
         old_hook = threading.excepthook
         threading.excepthook = self._thread_excepthook
@@ -720,7 +746,26 @@ class Runner:
         finally:
             threading.excepthook = old_hook
         self._safe_log(self._progress_or_note())
-        return self.finish()
+
+    def _start_retry_round(self):
+        """B3: the one retry round of the pass. Resets the breaker and queues every chunk left; the chunks that failed in the pass go
+        last in their table, each no sooner than RETRY_DELAY_SECONDS after its failure. A failure in this round is not retried again."""
+        with self.lock:
+            self.retry_round = True
+            self.consecutive_failures = 0
+            self.breaker_tripped = False
+            self.stop_launching.clear()
+            for queue in self.queues.values():
+                queue.clear()
+        queued = self.load_pending()
+        failed = sorted(self.failed_at)
+        self.failed_at = {}
+        wait = max([0.0] + [self.not_before.get(key, 0) - self.clock() for key in failed])
+        line = ('retry round: %d chunk(s) failed in this pass (%s), %d chunk(s) queued; the failed ones start no sooner than %d minutes after '
+                'their failure (the server may still commit an interrupted INSERT), the first in about %d minutes' % (
+                    len(failed), ', '.join('%s/%d' % key for key in failed[:20]), queued, self.retry_delay // 60, wait // 60))
+        self._safe_log(line)
+        self.journal.event('retry_round', line)
 
     def _wait_for_workers(self, threads):
         """Wait until every worker has ended, with the progress line; a Ctrl-C never ends the wait.
@@ -810,13 +855,10 @@ class _CopySession:
         from .connect import Session
         self.inner = Session(conn, runner_guard(target_db, 'runner O6'), log)
         self.lock_wait_default = 60
-        try:
-            rows = self.inner.query('SELECT @@lock_wait_timeout AS v')
-            if rows:
-                row = rows[0]
-                self.lock_wait_default = int(row['v'] if isinstance(row, dict) else row[0])
-        except Exception:  # noqa: BLE001 - a server without the variable keeps the default
-            pass
+        rows = self.inner.query('SELECT @@lock_wait_timeout AS v')
+        if rows:
+            row = rows[0]
+            self.lock_wait_default = int(row['v'] if isinstance(row, dict) else row[0])
 
     def query(self, sql, args=()):
         """Query through the guarded session."""
@@ -911,7 +953,7 @@ def fresh_table_load(session, statements, journal, log, plan, ctx=None, planned=
     loaded record is stale and the table is loaded again. A missing replacement table is never
     recreated from the source definition: the load resumes from a complete recorded fresh table
     or refuses. Every bucket is marked done with error
-    estimate.FRESH_LOAD_ERROR (bucket 0 holds the rows), so calibrate skips them. The load
+    FRESH_LOAD_ERROR (bucket 0 holds the rows). The load
     replaces the whole table, so before its first write the journal reopens the evidence built
     on the old rows (Journal.reopen_evidence: target_count and verified_at_utc cleared,
     recopy_epoch + 1, O7 and O8 pending when they had passed), as a mark-recopy of the table
@@ -971,38 +1013,46 @@ def fresh_table_load(session, statements, journal, log, plan, ctx=None, planned=
         if plan.name in existing:
             session.execute(statements.drop_table(plan.name))
         session.execute(statements.rename_fresh(plan))
-    journal.mark_loaded(plan.name, plan.n_buckets, rows, estimate.FRESH_LOAD_ERROR, FRESH_META + plan.name, '%s %s' % (fresh, FRESH_DONE))
+    journal.mark_loaded(plan.name, plan.n_buckets, rows, FRESH_LOAD_ERROR, FRESH_META + plan.name, '%s %s' % (fresh, FRESH_DONE))
     journal.record_table_counts(plan.name, src, tgt)
     journal.event('manual_load', '%s loaded through the fresh-table fallback with %d rows' % (plan.name, rows))
     log('Fresh-table load of %s done: %d rows, count proof matches' % (plan.name, rows))
     return rows
 
 
-def resolve_abort_at(journal, config, longest_chunk_seconds=0):
-    """The abort deadline: the earlier of the journal's O1 record and the window-derived deadline.
+def mismatch_hint(journal, source, run_id=None):
+    """K1: for each table whose counts differ, the buckets with a reconcile_delete event in this journal and the recovery lines.
 
-    The window deadline is end minus restart allowance minus buffer minus the longest modeled
-    chunk (section 10.6). O1 may have recorded it before a capture existed, so O6 recomputes
-    with the plan and keeps the earlier of the two. None without a record or a window.
+    A reconcile ran before the re-insert of an interrupted chunk; when the interrupted INSERT
+    committed on the server afterwards (Helios fact 12), the bucket holds its rows twice. So:
+    wait until RETRY_DELAY_SECONDS after the interruption, then mark-recopy that bucket and run
+    from O6. Reads the journal only.
     """
-    candidates = []
-    recorded = journal.get_meta('abort_deadline')
-    if recorded:
-        candidates.append(parse_utc(recorded, 'abort_deadline'))
-    if config.window is not None:
-        candidates.append(config.window.abort_deadline(longest_chunk_seconds))
-    return min(candidates) if candidates else None
-
-
-def baseline_for(config):
-    """The configured baseline file when present, else the shipped default."""
-    return estimate.load_baseline(config.resolve(config.estimate.baseline) if config.estimate.baseline else None)
-
-
-def longest_chunk_seconds(plans, config, journal=None):
-    """The longest modeled chunk of a plan list, the allowance the deadline subtracts; the rates scaled by the leaf cores
-    P2 recorded in the journal (inventory.recorded_leaf_cores) when one is given."""
-    return estimate.estimate(plans, config, baseline_for(config), leaf_cores=inventory.recorded_leaf_cores(journal)).schedule.longest_chunk_seconds
+    flag = ' --db %s%s' % (source, steps.run_flag(run_id))
+    reconciled = {}
+    for event in journal.events():
+        if event['kind'] != 'reconcile_delete':
+            continue
+        m = re.match(r'(\S+) bucket (\d+) ', event['detail'])
+        if m:
+            reconciled.setdefault(m.group(1), {})[int(m.group(2))] = event['ts']
+    lines = []
+    for t in journal.tables():
+        if t.get('source_count') is None or t.get('target_count') is None or int(t['source_count']) == int(t['target_count']):
+            continue
+        name = t['table_name']
+        buckets = reconciled.get(name, {})
+        if not buckets:
+            lines.append('%s: source %s rows, replacement %s; no bucket of it was reconciled in this run.' % (
+                name, t['source_count'], t['target_count']))
+            continue
+        lines.append('%s: source %s rows, replacement %s; reconciled buckets %s (an interrupted INSERT may have committed after its '
+                     'reconcile). Wait until %d minutes after the interruption (the last reconcile was at %s), then run '
+                     '%s and s2rebuild run --from O6%s.' % (
+                         name, t['source_count'], t['target_count'], ', '.join(str(b) for b in sorted(buckets)), RETRY_DELAY_SECONDS // 60,
+                         max(buckets.values()), ' and '.join('s2rebuild mark-recopy %s --bucket %d%s' % (name, b, flag) for b in sorted(buckets)),
+                         flag))
+    return lines
 
 
 def stop_file_for(journal_path):
@@ -1077,9 +1127,9 @@ def handle_o6(step, ctx):
     """O6 handler: copy every chunk (or one table through the fresh-table fallback), then the count proof.
 
     Live path: the copy lock, the source and row-accounting checks of the reference preflight,
-    then the Runner with the abort deadline including the longest-chunk allowance. The abort
-    deadline is computed first: past it, or while the stop file exists, a fresh-table load is
-    refused before any connection opens.
+    then the Runner. While the stop file exists a fresh-table load is refused before any
+    connection opens. A count mismatch names the reconciled buckets of each mismatched table
+    and the recovery (mismatch_hint, K1).
     """
     try:
         data, plans, directory = load_plans(ctx)
@@ -1110,11 +1160,7 @@ def handle_o6(step, ctx):
     if journal.is_empty():
         return steps.Outcome(steps.REFUSED, 'O5 has not written the plan into this journal; run O5 first', EXIT_REFUSED)
     journal.check_plan(plans, statements.source_db, statements.target_db)
-    abort_at = resolve_abort_at(journal, ctx.config, longest_chunk_seconds(plans, ctx.config, journal))
     stop_file = stop_file_for(ctx.journal_path)
-    if fresh and abort_at is not None and utc_now() >= abort_at:
-        return steps.Outcome(steps.REFUSED, 'Abort deadline %s UTC has passed; the fresh-table load of %s is one whole-table INSERT '
-                             'and does not start after it' % (iso(abort_at), fresh), EXIT_REFUSED)
     if fresh and stop_file is not None and stop_file.exists():
         return steps.Outcome(steps.REFUSED, 'Stop file %s present; the fresh-table load of %s does not start. Remove it with '
                              's2rebuild resume, then rerun' % (stop_file, fresh), EXIT_REFUSED)
@@ -1142,15 +1188,17 @@ def handle_o6(step, ctx):
                     return steps.Outcome(steps.INCOMPLETE, 'fresh-table load done; %d chunks still pending on other tables' % left, EXIT_INCOMPLETE)
         finally:
             session.close()
-        if abort_at is not None:
-            ctx.log('Abort deadline: %s UTC (includes the longest-chunk allowance). Stop file: %s' % (iso(abort_at), stop_file))
-        runner = Runner(plans, statements, journal, ctx.runner_connector(), ctx.log, ctx.config.copy, abort_at=abort_at,
+        runner = Runner(plans, statements, journal, ctx.runner_connector(), ctx.log, ctx.config.copy,
                         stop_file=stop_file, retry_failed=bool(ctx.options.get('retry_failed')))
         complete = runner.copy()
     if not complete:
         totals, _ = journal.totals()
         if totals['pending'][0] + totals['started'][0] + totals['failed'][0] == 0:
-            return steps.Outcome(steps.MISMATCH, 'count proof found a per-table mismatch; see the journal counts', EXIT_MISMATCH)
+            hint = mismatch_hint(journal, ctx.db.source, ctx.run_id)
+            for line in hint:
+                ctx.log(line)
+            return steps.Outcome(steps.MISMATCH, 'count proof found a per-table mismatch; see the journal counts%s' % (
+                ('; ' + ' '.join(hint)) if hint else ''), EXIT_MISMATCH)
         if runner.breaker_tripped:
             return steps.Outcome(steps.INCOMPLETE, 'copy incomplete: pending=%d started=%d failed=%d; %s' % (
                 totals['pending'][0], totals['started'][0], totals['failed'][0], BREAKER_MESSAGE), EXIT_INCOMPLETE)

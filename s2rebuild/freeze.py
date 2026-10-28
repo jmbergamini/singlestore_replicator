@@ -3,7 +3,7 @@
 Author: John Bergamini
 
 Section 10.7 of the architecture. DETACH then ATTACH READ ONLY stops every writer in minutes;
-revoke-and-kill (lockout.py) is the fallback only when freeze.mode is lockout. The DETACH waits
+it is the only freeze. The DETACH waits
 at most freeze.detach_wait_seconds; then the kit cancels it on its own connection and issues
 DETACH ... KILL when freeze.detach_kill is set (ownersql.detach_with_escalation). O3 is
 resumable: when the source is already attached READONLY on the recorded STORAGE_ID (a rerun,
@@ -53,7 +53,7 @@ def block(names):
     b.statement('DETACH DATABASE %s' % ident(names['source']),
                 'detach the source; when it waits more than %s s%s' % (names['detach_wait_seconds'],
                                                                          ', cancel it and run DETACH DATABASE %s KILL instead' % ident(names['source']) if names['detach_kill']
-                                                                         else ' cancel it and stop the writers first (detach_kill is off; s2rebuild lockout works as a bridge)'),
+                                                                         else ' cancel it and stop the writers first (detach_kill is off)'),
                 detach={'wait': names['detach_wait_seconds'], 'kill': bool(names['detach_kill'])})
     _detached_check(b, names)
     _attach(b, names)
@@ -231,10 +231,9 @@ def finish_freeze(ctx):
     ctx.log('freeze_time recorded: ' + when)
     ctx.log(PORTAL_ROWS_NOTE % ctx.db.source)
     if ctx.owner_configured:
-        from . import lockout
         owner = ctx.owner_session(read_guard('owner O3 grants reference'))
         try:
-            grants.record_reference(ctx.journal, grants.snapshot(owner, ctx.db.source, lockout.protected_users(ctx.config)))
+            grants.record_reference(ctx.journal, grants.snapshot(owner, ctx.db.source, grants.protected_users(ctx.config)))
         finally:
             owner.close()
         ctx.log('grants reference recorded for the C1 comparison (nothing revoked)')
@@ -252,11 +251,8 @@ def handle_o3(step, ctx):
     owner-sql/O3-reentry.sql, executed with the owner profile or left for the gate). Anything
     else gets the whole block, whose first checks refuse a source name held by another storage.
     A read error on the branch view, and a dry run (it opens no connection), also get the whole
-    block. Path B defers to lockout.
+    block.
     """
-    if ctx.config.freeze.mode == 'lockout':
-        from . import lockout
-        return lockout.handle_o3_lockout(step, ctx)
     names = ownersql.names_for(ctx)
     if not ctx.dry_run and not ownersql.placeholders(names['source_sid']):
         identity = 'owner' if ctx.owner_configured else 'runner'

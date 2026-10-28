@@ -26,7 +26,7 @@ import re
 import time
 from pathlib import Path
 
-from . import estimate, projections, routines, steps
+from . import projections, routines, steps
 from .common import KitError, iso, utc_now
 from .sqlutil import ident, qualified, strip_literals
 
@@ -393,7 +393,7 @@ def capture(session, db, config, owner_session=None, exact_counts=False, log=Non
     """
     now = utc_now()
     name = db.source
-    protected = {config.runner.user} | ({config.owner.user} if config.owner else set()) | set(config.freeze.lockout.protected_accounts)
+    protected = {config.runner.user} | ({config.owner.user} if config.owner else set())
     layout = _one(session.query(LAYOUT_SQL, (name,)), 'Source database %s' % name)
     attachment = _one(session.query(ATTACHMENT_SQL, (name,)), 'attachment', required=False)
     objects = session.query(OBJECTS_SQL, (name,))
@@ -776,8 +776,8 @@ def drift_lines(report):
 # ---------------------------------------------------------------------------
 # System profile (--all-databases)
 # ---------------------------------------------------------------------------
-def system_profile(session, config, baseline, estimate_module):
-    """One row per database in the workspace with layout, tables, rows, GiB, pipelines and a modeled copy time."""
+def system_profile(session, config):
+    """One row per database in the workspace with layout, tables, rows, GiB, pipelines and the copy time at estimate.rows_per_hour."""
     layouts = session.query(ALL_LAYOUTS_SQL)
     rows_by_db = {}
     for r in session.query(ALL_ROWS_SQL):
@@ -788,9 +788,7 @@ def system_profile(session, config, baseline, estimate_module):
     for lay in layouts:
         name = lay['DATABASE_NAME']
         table_rows = rows_by_db.get(name, [])
-        jobs = [(n, buckets_for(n, config.copy.chunk_rows, config.copy.min_rows_for_chunking, config.copy.max_buckets_per_table))
-                for n in table_rows]
-        wall = estimate_module.simulate_rows(jobs, config.copy.workers, baseline).wall_seconds if jobs else 0.0
+        wall = sum(table_rows) / float(config.estimate.rows_per_hour) * 3600.0
         out.append({'database': name, 'partitions': _int(lay['NUM_PARTITIONS']), 'sub_partitions': _int(lay['NUM_SUB_PARTITIONS']),
                     'tables': len(table_rows), 'estimated_rows': sum(table_rows), 'size_gib': sizes.get(name),
                     'pipelines': pipelines.get(name, 0), 'copy_minutes_expected': round(wall / 60.0, 1)})
@@ -852,16 +850,10 @@ def grantee_of(current_user):
 
 
 def workers_line(config, leaf_cores):
-    """The P2 line that sets copy.workers beside the leaf cores read and the worker count and leaf cores the baseline was fitted with.
-
-    The baseline is the configured file when present, else the shipped constants (estimate.load_baseline); the line is
-    information for the operator (LESSONS fact 42: client concurrency is not the limit), never a gate.
-    """
-    baseline = estimate.load_baseline(config.resolve(config.estimate.baseline) if config.estimate.baseline else None)
+    """The P2 line that sets copy.workers beside the leaf cores read; information for the operator (LESSONS fact 42:
+    client concurrency is not the limit), never a gate."""
     cores = '%d leaf cores' % leaf_cores if leaf_cores is not None else 'leaf cores not readable'
-    fitted = '%d leaf cores' % baseline.leaf_cores if baseline.leaf_cores is not None else 'leaf cores not recorded'
-    return 'workers: %d configured (copy.workers), table concurrency %s, on %s; the baseline was fitted with %d workers on %s' % (
-        config.copy.workers, config.copy.table_concurrency, cores, baseline.workers, fitted)
+    return 'workers: %d configured (copy.workers), table concurrency %s, on %s' % (config.copy.workers, config.copy.table_concurrency, cores)
 
 
 def preflight(runner, db, config, owner=None):
@@ -960,9 +952,8 @@ def preflight(runner, db, config, owner=None):
 def recorded_leaf_cores(journal):
     """The leaf cores P2 recorded in the journal's preflight record (meta preflight, key leaf_cores), or None.
 
-    None when there is no journal, P2 has not run in it, or MV_NODES was not readable. The
-    estimate scales its rates with it (estimate.scale_factor) and calibrate stores it with the
-    baseline. Reads the journal only.
+    None when there is no journal, P2 has not run in it, or MV_NODES was not readable. Reads the
+    journal only.
     """
     if journal is None:
         return None
@@ -977,28 +968,17 @@ def recorded_leaf_cores(journal):
     return int(cores) if cores is not None else None
 
 
-def workspace_check(ctx):
-    """The workspace part of P2: (ok, lines, facts) through the Management API when a key is configured, else the three questions.
-
-    With workspace.management_api_key_keychain set, the state must be ACTIVE (workspace.preflight_lines);
-    the facts go into the preflight record for the plan sheet and the O1 guard. Without a key the
-    lines are the questions O1 records the answer to. Reads the API only; no statement.
-    """
-    from . import workspace
-    if not workspace.api_configured(ctx.config):
-        return True, workspace.question_lines(), {'source': 'questions'}
-    facts = workspace.read_workspace(ctx.config, keychain=getattr(ctx.sessions, 'keychain', None), redactor=ctx.log.redactor)
-    lines = workspace.preflight_lines(facts)
-    return facts.get('state') == workspace.ACTIVE, lines, facts
+def workspace_lines():
+    """The workspace part of P2: the three questions O1 records the answers to (--workspace NOTE). No statement."""
+    lines = ['workspace: answer before the window:']
+    lines.extend('  %d. %s' % (i, q) for i, q in enumerate(steps.WORKSPACE_QUESTIONS, 1))
+    lines.append('  ' + steps.WORKSPACE_HINT)
+    return lines
 
 
 def handle_p2(step, ctx):
-    """P2 handler (also behind s2rebuild check): the preflight checks, the workspace state and settings, the source record in the journal.
-
-    Refuses Path B with more than one configured database (steps.path_b_single_database) before any connection.
-    """
+    """P2 handler (also behind s2rebuild check): the preflight checks, the workspace questions, the source record in the journal."""
     from .sqlutil import read_guard
-    steps.path_b_single_database(ctx.config)
     runner = ctx.runner_session(read_guard('runner P2'))
     owner = ctx.owner_session(read_guard('owner P2')) if ctx.owner_configured else None
     try:
@@ -1022,9 +1002,7 @@ def handle_p2(step, ctx):
         runner.close()
         if owner is not None:
             owner.close()
-    workspace_ok, workspace_lines, facts['workspace'] = workspace_check(ctx)
-    ok = ok and workspace_ok
-    lines.extend(workspace_lines)
+    lines.extend(workspace_lines())
     for line in lines:
         ctx.log('    ' + line)
     att = facts.get('source_attachment')

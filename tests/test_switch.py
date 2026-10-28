@@ -3,7 +3,6 @@
 Author: John Bergamini
 """
 import contextlib
-import dataclasses
 import io
 import json
 import os
@@ -15,7 +14,7 @@ from s2rebuild import ownersql, steps, switch
 from s2rebuild.common import EXIT_DONE, EXIT_INCOMPLETE, EXIT_REFUSED, KitError
 from s2rebuild.journal import Journal
 from s2rebuild.sqlutil import read_guard
-from tests.fakedb import FakeDisconnect, SimulatedCrash, multiset
+from tests.fakedb import SimulatedCrash, multiset
 from tests.helpers import FAULT_POINTS, Plan, crash_journal, crash_journals, run_cli
 from tests.test_copy import SRC, TGT, Harness
 from tests.test_verify import (LATE_ROW, arm_recopy, assert_counter_follows, assert_reinserted_once, auto_increment_on_t_comp, counter_writes,
@@ -153,29 +152,6 @@ def two_databases(d):
     d['databases'].append({'source': SECOND, 'layout': {'partitions': 8, 'sub_partitions': 64}})
 
 
-def path_b_harness(test):
-    """A switched harness on Path B (freeze.mode lockout, two held connections, two quiet passes): the source stays READWRITE on its recorded STORAGE_ID."""
-    h = switched_harness(test, mutate=lambda d: d.update(freeze={'mode': 'lockout', 'lockout': {'connections': 2, 'quiet_passes_required': 2}}))
-    h.fake.attachment(SRC)['ATTACH_TYPE'] = 'READWRITE'
-    h.journal.record_attachment('source', SRC, '1028600672070281646:7367158985892520834', 'cid-1', 'READWRITE')
-    return h
-
-
-def verified_path_b(test, owner=True):
-    """verified_harness on Path B (O7 and O8 run, O9 passed): the source READWRITE on its recorded STORAGE_ID, no lockout pass yet."""
-    h = verified_harness(test, owner=owner, mutate=lambda d: d.update(freeze={'mode': 'lockout', 'lockout': {'connections': 2,
-                                                                                                             'quiet_passes_required': 2}}))
-    h.fake.attachment(SRC)['ATTACH_TYPE'] = 'READWRITE'
-    h.journal.record_attachment('source', SRC, '1028600672070281646:7367158985892520834', 'cid-1', 'READWRITE')
-    return h
-
-
-def lockout_pass(h, quiet=True):
-    """Record a lockout pass now, as s2rebuild lockout --hold does on every pass."""
-    from s2rebuild import lockout
-    lockout.record_pass(h.journal, quiet)
-
-
 def second_journal(test, h, switched=False):
     """The journal of second_db: two planned tables copied and verified after freeze_time, O1 to O9 passed.
 
@@ -239,12 +215,12 @@ def ownerlib():
 
 
 def rollback_block_for(h, retained=False):
-    """The printed rollback block: R1 and R2a, or with retained=True the companion through the retained copy (R1, R2b, R2c)."""
+    """The printed rollback block: R1 and R2a, or with retained=True the companion through the retained copy (R1, R2b)."""
     ctx = h.ctx()
     names, inputs = ownersql.names_for(ctx), ownersql.block_inputs(ctx)
     if retained:
         return dict(ownersql.companion_blocks('O10', names, h.config, rollback=True, released=inputs['released'],
-                                              app_writes_seen=inputs['app_writes_seen'], grants=inputs['grants']))['retained']
+                                              app_writes_seen=inputs['app_writes_seen']))['retained']
     return ownersql.block_for('O10', names, h.config, rollback=True, **inputs)
 
 
@@ -255,8 +231,8 @@ def run_rollback_block(h, retained=False):
         return ownerlib()['run_block'](h.fake.connect().cursor(), block.to_dict(), {'run_id': h.run_id})
 
 
-def old_kit_switch(h):
-    """A switch made without S2b and S4 (an older kit): the machine's S1 and S2, then S3 by hand on the fake with the live record recorded.
+def switch_without_s2b(h):
+    """A switch that took S1, S2 and S3 but not S2b and S4: the machine's S1 and S2, then S3 by hand on the fake with the live record recorded.
 
     The workspace then holds four entries: the detached original and the live branch under the
     live name, the replacement and the retained copy. Returns (machine, names) read afterwards.
@@ -329,7 +305,7 @@ class ExpectAndBlockTests(unittest.TestCase):
         h = switched_harness(self)
         names = ownersql.names_for(h.ctx())
         for step_id in ('P1', 'C4', 'C3', 'O2', 'O3', 'O9', 'O10', 'O11'):
-            block = ownersql.block_for(step_id, names, h.config, pipelines=[], grants={}, capture_step='O2')
+            block = ownersql.block_for(step_id, names, h.config, pipelines=[], capture_step='O2')
             self.assertTrue(block.render().startswith('-- %s:' % step_id), step_id)
         with self.assertRaises(KitError):
             ownersql.block_for('O6', names)
@@ -547,202 +523,6 @@ class MachineTests(unittest.TestCase):
         self.assertIn('switch_statement_failed', [e['kind'] for e in h.journal.events()])
 
 
-class PathBSwitchTests(unittest.TestCase):
-    """F12: on Path B, S1 needs a quiet lockout pass no older than freeze.quiet_max_age_seconds."""
-
-    def test_f12_s1_refused_when_the_last_lockout_pass_is_stale(self):
-        """No pass, a quiet pass older than the limit, or a fresh pass that found work refuses S1 with nothing issued; a fresh quiet pass switches.
-
-        The forward block carries the journal rule as a note on Path B, since the hand and notebook routes cannot read the journal, and
-        checks the privileges the lockout took live instead (test_f12_forward_block_checks_the_lockout_privileges_live_before_s1).
-        """
-        import datetime as dt
-        from s2rebuild import lockout
-        from s2rebuild.common import iso, utc_now
-        h = path_b_harness(self)
-        self.assertEqual((h.config.freeze.quiet_max_age_seconds, h.config.freeze.lockout.interval_seconds), (60, 5), 'the documented defaults')
-        label = r'Switch refused at "S1 before \(Path B\): the last lockout pass was quiet within 60 s": '
-        for reason, meta in (('no lockout pass is recorded', None), ('more than freeze.quiet_max_age_seconds', ('1', iso(utc_now() - dt.timedelta(seconds=120)))),
-                             ('was not quiet', ('0', iso(utc_now())))):
-            if meta:
-                h.journal.set_meta(lockout.LAST_PASS_QUIET, meta[0])
-                h.journal.set_meta(lockout.LAST_PASS_UTC, meta[1])
-            machine, _ = machine_for(h)
-            with self.assertRaisesRegex(KitError, label + '.*' + reason):
-                machine.forward()
-            self.assertEqual((detaches(h), machine.position()), ([], switch.NOT_STARTED), reason)
-            self.assertIn('FAILED', h.journal.events('switch_check')[-1])
-        lockout.record_pass(h.journal, True)
-        machine, names = machine_for(h)
-        self.assertEqual(machine.forward(), switch.COMPLETE, h.text())
-        self.assertEqual(len(detaches(h)), 1)
-        note = '-- NOTE: S1 before (Path B): the last lockout pass was quiet within 60 s (freeze.quiet_max_age_seconds).'
-        self.assertIn(note, switch.forward_block(names).render())
-        self.assertNotIn(note, switch.forward_block(dict(names, freeze_mode='readonly')).render())
-
-    def test_f12_path_b_refusals_that_issue_nothing_come_before_the_go_and_leave_the_recopy_open(self):
-        """On Path B the last pass check and the other S1 before-checks ran after Journal.record_go, so a refusal that issued nothing
-        still recorded the go, and mark-recopy, step O8 --redo and O6 to O8 were refused for the rest of the run, although a pass that
-        was not quiet means writers may have reached the READWRITE source since O8. Now S0 and the go transaction check the last pass,
-        and the S1 before-checks run once before the go. No pass, a stale pass, a pass that was not quiet, a pass going stale while
-        the operator types the live name, a grant the lockout took held again, and a foreign non-idle session each refuse with no
-        DETACH and no go recorded; O8 --redo, mark-recopy and run --from O6 then run, and a fresh quiet pass switches once. The
-        failure points at the S1 DETACH are in test_f12_path_b_detach_fault_points_resume_behind_s1_without_a_fresh_pass."""
-        import datetime as dt
-        from s2rebuild import grants, lockout
-        from s2rebuild.common import iso, utc_now
-        grant = {'GRANTEE': "'app'@'%'", 'PRIVILEGE_TYPE': 'INSERT'}
-        busy = {'ID': 41, 'USER': 'app', 'HOST': 'h:41', 'DB': SRC, 'COMMAND': 'Query', 'TIME': 1, 'INFO': 'UPDATE t_comp SET note = 1'}
-        stale = iso(utc_now() - dt.timedelta(seconds=120))
-        cases = {
-            'no pass': (None, 'S0 refused: S1 before (Path B): the last lockout pass was not quiet within 60 s: no lockout pass is recorded'),
-            'stale pass': (('1', stale), 'S0 refused: S1 before (Path B): the last lockout pass was not quiet within 60 s: the last lockout '
-                                         'pass was at %s' % stale),
-            'not quiet': (('0', None), 'S0 refused: S1 before (Path B): the last lockout pass was not quiet within 60 s: the last lockout '
-                                       'pass at '),
-            'stale while typing': (('1', None), 'Switch refused at "S1 before (Path B): the last lockout pass was quiet within 60 s": the '
-                                                'last lockout pass was at %s' % stale),
-            'grant back': (('1', None), 'Switch refused at "S1 before (Path B): \'app\'@\'%\' holds none of the write privileges the lockout '
-                                        'took on *.*": expected n = 0, observed n = 1'),
-            'foreign session': (('1', None), 'Switch refused at "S1 before: no foreign non-idle session": expected n = 0, observed n = 1'),
-        }
-        for case, (meta, refusal) in cases.items():
-            with self.subTest(case=case):
-                h = verified_path_b(self)
-                grants.record_snapshot(h.journal, {"'app'@'%'": {'*.*': ['INSERT']}})
-                if meta:
-                    h.journal.set_meta(lockout.LAST_PASS_QUIET, meta[0])
-                    h.journal.set_meta(lockout.LAST_PASS_UTC, meta[1] or iso(utc_now()))
-                if case == 'grant back':
-                    h.fake.privileges.append(dict(grant))
-                if case == 'foreign session':
-                    h.fake.processlist.append(dict(busy))
-                options = {}
-                if case == 'stale while typing':
-                    def confirm(prompt, h=h):
-                        h.journal.set_meta(lockout.LAST_PASS_UTC, stale)  # the hold stopped while the operator typed
-                        return SRC
-                    options = {'confirm': confirm}
-                out = h.step('O10', yes=not options, options=options)
-                self.assertEqual(out.status, steps.REFUSED, h.text())
-                self.assertTrue(out.note.startswith(refusal), out.note)
-                self.assertEqual((detaches(h), h.journal.events('switch_go'), h.journal.switch_began()), ([], [], None),
-                                 'nothing issued, no go: the re-copy stays open')
-                self.assertEqual(h.step('O8', redo=True).status, steps.PASSED, h.text())
-                code, text = mark_recopy_cli(h)
-                self.assertEqual(code, EXIT_DONE, text)
-                self.assertEqual(run_from_o6(h, to_id='O9'), EXIT_DONE, h.text())
-                if grant in h.fake.privileges:
-                    h.fake.privileges.remove(grant)
-                h.fake.processlist = []
-                lockout.record_pass(h.journal, True)
-                out = h.step('O10', yes=True, redo=False)
-                self.assertEqual(out.status, steps.PASSED, h.text())
-                self.assertEqual(len(detaches(h)), 1, 'S1 is applied once')
-        # the go transaction reads the last pass again (a pass going stale between the S1 before-checks and the go)
-        h = verified_path_b(self)
-        h.journal.set_meta(lockout.LAST_PASS_QUIET, '1')
-        h.journal.set_meta(lockout.LAST_PASS_UTC, stale)
-        names = ownersql.names_for(h.ctx())
-        self.assertEqual((switch.path_b_pass_age(names, switch.NOT_STARTED), switch.path_b_pass_age(names, switch.DETACHED),
-                          switch.path_b_pass_age(dict(names, freeze_mode='readonly'), switch.NOT_STARTED)), (60, None, None))
-        with self.assertRaisesRegex(KitError, r'^S0 refused at the go decision: S1 before \(Path B\): the last lockout pass was not quiet '
-                                              r'within 60 s: the last lockout pass was at %s' % stale):
-            h.journal.record_go('go recorded for live name %s' % SRC, lambda journal: switch.go_problems(journal, 60))
-        self.assertEqual((h.journal.events('switch_go'), switch.go_problems(h.journal)), ([], []), 'no go; behind S1 the pass does not apply')
-
-    def test_f12_path_b_detach_fault_points_resume_behind_s1_without_a_fresh_pass(self):
-        """The S1 DETACH on Path B at the three failure points: before (not applied), after (applied, reply lost) and journal (applied,
-        the switch_statement event lost). The go was recorded, so the re-copy stays refused. The hold ends once S1 ran, so the last pass
-        then goes stale: behind S1 (after, journal) the rerun of O10 resumes at S2 without a fresh pass, since the pass checks apply only
-        while S1 is ahead; at not started (before) it refuses until a fresh quiet pass, then switches. S1 is applied once."""
-        import datetime as dt
-        from s2rebuild import lockout
-        from s2rebuild.common import iso, utc_now
-        for point in FAULT_POINTS:
-            with self.subTest(point=point):
-                h = verified_path_b(self)
-                lockout.record_pass(h.journal, True)
-                if point == 'journal':
-                    crash_journal(self, h.journal, 'event', match=lambda kind, detail: kind == 'switch_statement' and detail.startswith('S1'))
-                    with self.assertRaises(SimulatedCrash):
-                        h.step('O10', yes=True)
-                else:
-                    h.fake.fail_statement(r'^DETACH DATABASE `%s`$' % SRC, point)
-                    self.assertEqual(h.step('O10', yes=True).status, steps.REFUSED, h.text())
-                self.assertEqual(len(detaches(h)), 0 if point == 'before' else 1)
-                self.assertTrue(h.journal.switch_began().startswith('the go decision was recorded'), h.journal.switch_began())
-                code, text = mark_recopy_cli(h)
-                self.assertEqual(code, EXIT_REFUSED, text)
-                h.journal.set_meta(lockout.LAST_PASS_UTC, iso(utc_now() - dt.timedelta(seconds=300)))  # the hold ended
-                out = h.step('O10', yes=True, redo=False)
-                if point == 'before':
-                    self.assertEqual(out.status, steps.REFUSED, h.text())
-                    self.assertIn('S1 before (Path B): the last lockout pass was not quiet within 60 s', out.note)
-                    self.assertEqual(detaches(h), [])
-                    lockout.record_pass(h.journal, True)
-                    out = h.step('O10', yes=True, redo=False)
-                self.assertEqual(out.status, steps.PASSED, h.text())
-                self.assertEqual(len(detaches(h)), 1, 'S1 is applied once')
-
-    def test_f12_forward_block_checks_the_lockout_privileges_live_before_s1(self):
-        """The Path B forward block that owner-sql O10 prints and the notebook O10 cell runs carried the last pass rule only as a note, and
-        its remedy (lockout --hold) needs the owner profile these routes run without; a grant restored after the quiet proof was detached
-        on. Now each account and scope of the snapshot not given back gets a check before the DETACH that it holds none of those
-        privileges, expect n = 0, and the note no longer sends the operator to lockout --hold. The notebook (ownerlib run_block) stops at
-        that check with nothing issued, also when its query is lost just before or just after it runs; the kit route refuses the same
-        grant live before the go, and a crash at the journal write of that check leaves no go. With the grant revoked again the block
-        detaches once. Without a snapshot the block says it has no privilege check; Path A has none."""
-        from s2rebuild import grants
-        grant = {'GRANTEE': "'app'@'%'", 'PRIVILEGE_TYPE': 'INSERT'}
-        label = "S1 before (Path B): 'app'@'%' holds none of the write privileges the lockout took on *.*"
-        h = verified_path_b(self, owner=False)
-        names = ownersql.names_for(h.ctx())
-        self.assertIn('the journal holds no lockout snapshot, so this block has no privilege check', switch.forward_block(names).render())
-        grants.record_snapshot(h.journal, {"'app'@'%'": {'*.*': ['INSERT', 'UPDATE']}})
-        h.fake.privileges.append(dict(grant))  # another job gave the grant back after the quiet proof
-        self.assertEqual(h.step('O10', yes=True).status, steps.PENDING, h.text())
-        printed = (h.tmp / 'runs' / h.run_id / SRC / 'owner-sql' / 'O10.sql').read_text()
-        self.assertLess(printed.index('-- CHECK %s; expect n = 0' % label), printed.index('DETACH DATABASE `%s`;' % SRC))
-        self.assertIn("GRANTEE = '''app''@''%''' AND PRIVILEGE_TYPE IN ('INSERT', 'UPDATE');", printed)
-        self.assertNotIn('keep s2rebuild lockout --hold running', printed)
-        self.assertNotIn('no lockout snapshot', printed)
-        self.assertNotIn(label, ownersql.block_for('O10', dict(names, freeze_mode='readonly'), h.config, grants={"'app'@'%'": {'*.*': ['INSERT']}}).render())
-        code, text = run_cli(['owner-notebook', '--config', str(h.config_path), '--run', h.run_id], env=h.env)
-        self.assertEqual(code, EXIT_DONE, text)
-        self.assertIn('holds none of the write privileges the lockout took on', (h.tmp / 'runs' / h.run_id / 'owner-steps.ipynb').read_text())
-        from s2rebuild import notebook
-        block = notebook.blocks_for_run(h.ctx())[1]['O10'].to_dict()
-        self.assertIn(label, [item.get('label') for item in block['items']])
-        check_sql = r'^SELECT COUNT\(\*\) AS n FROM information_schema\.USER_PRIVILEGES WHERE GRANTEE = '
-        for point in ('grant back', 'before', 'after'):
-            with self.subTest(route='notebook', point=point):
-                if point != 'grant back':
-                    h.fake.fail_statement(check_sql, point)
-                with contextlib.redirect_stdout(io.StringIO()):
-                    result = ownerlib()['run_block'](h.fake.connect('ops_owner').cursor(), block, {'run_id': h.run_id})
-                self.assertTrue(result['status'].startswith('FAILED at check ' + label if point == 'grant back' else 'ERROR FakeDisconnect'),
-                                result['status'])
-                self.assertEqual((result['statements'], detaches(h)), (0, []), 'stopped before the DETACH')
-        ho = verified_path_b(self)
-        grants.record_snapshot(ho.journal, {"'app'@'%'": {'*.*': ['INSERT']}})
-        lockout_pass(ho)
-        fired = crash_journal(self, ho.journal, 'event', match=lambda kind, detail: kind == 'switch_check' and detail.startswith(label))
-        with self.assertRaises(SimulatedCrash):
-            ho.step('O10', yes=True)
-        self.assertEqual((len(fired), detaches(ho), ho.journal.switch_began()), (1, [], None), 'the kit route: no go, nothing issued')
-        ho.fake.privileges.append(dict(grant))
-        out = ho.step('O10', yes=True, redo=False)
-        self.assertEqual(out.status, steps.REFUSED, ho.text())
-        self.assertIn('Switch refused at "%s": expected n = 0, observed n = 1' % label, out.note)
-        self.assertEqual((detaches(ho), ho.journal.switch_began()), ([], None))
-        h.fake.privileges.remove(grant)
-        with contextlib.redirect_stdout(io.StringIO()):
-            result = ownerlib()['run_block'](h.fake.connect('ops_owner').cursor(), block, {'run_id': h.run_id})
-        self.assertEqual(result['status'], 'passed', result)
-        self.assertEqual(len(detaches(h)), 1)
-
-
 class RollbackBoundaryTests(unittest.TestCase):
     """F1: S3 attaches the live name READWRITE, so a rollback from switched first proves that nothing changed."""
 
@@ -861,7 +641,7 @@ class RollbackBoundaryTests(unittest.TestCase):
         self.assertNotIn('-- STOP', text)
         result = run_rollback_block(h, retained=True)
         self.assertEqual(result['status'], 'passed', result)
-        self.assertEqual((result['statements'], len(result['skipped'])), (2, 2), 'R1 and R2b; the two R2c statements skipped')
+        self.assertEqual((result['statements'], len(result['skipped'])), (2, 0), 'R1 and R2b')
         src = h.fake.attachment(SRC)
         self.assertEqual((src['STORAGE_ID'], src['ATTACH_TYPE']), ('1028600672070281646:7367158985892520834', 'READWRITE'))
 
@@ -932,7 +712,7 @@ class RollbackBoundaryTests(unittest.TestCase):
                 tail.items = block.items[start:]
                 with contextlib.redirect_stdout(io.StringIO()):
                     finished = ownerlib()['run_block'](h.fake.connect().cursor(), tail.to_dict(), {'run_id': h.run_id})
-                self.assertEqual((finished['status'], finished['statements'], len(finished['skipped'])), ('passed', 1, 2), 'R2b; R2c skipped')
+                self.assertEqual((finished['status'], finished['statements'], len(finished['skipped'])), ('passed', 1, 0), 'R2b')
                 src = h.fake.attachment(SRC)
                 self.assertEqual((src['STORAGE_ID'], src['ATTACH_TYPE']), ('1028600672070281646:7367158985892520834', 'READWRITE'))
 
@@ -1036,19 +816,6 @@ class S0AndHandlerTests(unittest.TestCase):
         ready_for_s0(h)
         lines = switch.s0_checks(ctx, names)
         self.assertTrue(lines[0].startswith('S0: O8 and O9 passed'))
-        self.assertIn('abort deadline', lines[1])
-
-    def test_s0_uses_the_window_deadline_and_skips_the_time_check_after_s1(self):
-        import dataclasses
-        import datetime as dt
-        h = switched_harness(self)
-        ready_for_s0(h)
-        past = dataclasses.replace(h.config.window, start=dt.datetime(2020, 1, 1, tzinfo=dt.timezone.utc), end=dt.datetime(2020, 1, 1, 8, tzinfo=dt.timezone.utc))
-        ctx = steps.StepContext(dataclasses.replace(h.config, window=past), h.db, h.journal, h.run_id, h.log, yes=True, sessions=h.sessions)
-        names = ownersql.names_for(ctx)
-        with self.assertRaisesRegex(KitError, 'switch allowance remains before the abort deadline 2020-01-01'):
-            switch.s0_checks(ctx, names)
-        self.assertTrue(switch.s0_checks(ctx, names, position=switch.RETAINED), 're-entry behind S1 is never blocked by the clock')
 
     def test_handler_typed_live_name(self):
         h = switched_harness(self)
@@ -1136,7 +903,8 @@ class RecopyEvidenceTests(unittest.TestCase):
 
     def test_f4_recopy_fault_points_refuse_the_switch_until_the_rerun_verifies(self):
         """A failure before, after, or after and before the journal update, at the DELETE and at the INSERT of the bucket mark-recopy
-        marked: O6 stops, S0 refuses and O10 issues no DETACH; the operator's rerun from O6 passes O6 to O8 and O10 detaches once."""
+        marked: the retry round of the same O6 pass copies the bucket again (B3), O6 to O8 pass and O10 detaches once. A kill at the
+        journal write ends the pass instead; S0 refuses until the operator's rerun from O6 passes O6 to O8."""
         for statement in ('DELETE', 'INSERT'):
             for point in FAULT_POINTS:
                 with self.subTest(statement=statement, point=point):
@@ -1144,15 +912,18 @@ class RecopyEvidenceTests(unittest.TestCase):
                     h.journal.mark_recopy('t_single', 1)
                     start = len(h.fake.writes)
                     fired = arm_recopy(self, h, 't_single', statement, point)
-                    self.assertEqual(run_from_o6(h, to_id='O9'), EXIT_INCOMPLETE, h.text())
+                    code = run_from_o6(h, to_id='O9')
                     self.assertEqual(len(fired), 1, 'the fault fired')
-                    self.assertEqual({s: h.journal.step_status(s) for s in ('O6', 'O7', 'O8')}, {'O6': 'pending', 'O7': 'pending', 'O8': 'pending'})
-                    with self.assertRaisesRegex(KitError, r'S0 refused: O8 has not passed; not verified on the rows now copied: t_single \('):
-                        s0(h)
-                    with self.assertRaisesRegex(KitError, r'Cannot run O10 .*not passed: O6, O7, O8'):
-                        h.step('O10', yes=True, redo=False)
-                    self.assertEqual(detaches(h), [], 'nothing is switched on an unverified copy')
-                    self.assertEqual(run_from_o6(h, to_id='O9'), EXIT_DONE, h.text())
+                    if point == 'journal':
+                        # a kill at a journal write ends the pass with no retry round: S0 refuses until the rerun verifies
+                        self.assertEqual(code, EXIT_INCOMPLETE, h.text())
+                        with self.assertRaisesRegex(KitError, r'S0 refused: O8 has not passed; not verified on the rows now copied: t_single \('):
+                            s0(h)
+                        self.assertEqual(detaches(h), [], 'nothing is switched on an unverified copy')
+                        self.assertEqual(run_from_o6(h, to_id='O9'), EXIT_DONE, h.text())
+                    else:
+                        self.assertEqual(code, EXIT_DONE, h.text())
+                        self.assertEqual(len(h.journal.events('retry_round')), 1, 'the retry round copied the bucket again')
                     assert_reinserted_once(self, h, 't_single', start)
                     self.assertTrue(s0(h))
                     out = h.step('O10', yes=True, redo=False)

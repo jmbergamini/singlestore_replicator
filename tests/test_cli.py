@@ -5,7 +5,6 @@ Author: John Bergamini
 """
 import contextlib
 import hashlib
-import json
 import os
 import re
 import shlex
@@ -18,7 +17,7 @@ from unittest import mock
 
 import yaml
 
-from s2rebuild import cli, inventory, rehearse, steps
+from s2rebuild import cli, inventory
 from s2rebuild.common import EXIT_DONE, EXIT_GATE, EXIT_INCOMPLETE, EXIT_REFUSED
 from s2rebuild.journal import Journal
 from tests.fakedb import SimulatedCrash
@@ -34,9 +33,8 @@ class HelpTests(unittest.TestCase):
     def test_help_lists_every_command_of_section_8(self):
         code, text = run_cli(['--help'])
         self.assertEqual(code, 0)
-        expected = ['check', 'account-sql', 'profile', 'plan', 'rehearse', 'sample-database', 'run', 'step', 'gate', 'status', 'watch',
-                    'quiet-proof', 'lockout', 'owner-sql', 'owner-notebook', 'mark-recopy', 'pause', 'resume', 'abandon', 'report',
-                    'calibrate', 'cleanup', 'bundle', 'engine-capture', 'docs-flags']
+        expected = ['check', 'account-sql', 'profile', 'plan', 'run', 'step', 'gate', 'status', 'owner-sql', 'owner-notebook',
+                    'mark-recopy', 'pause', 'resume', 'abandon', 'report', 'cleanup']
         self.assertEqual(cli.COMMAND_NAMES, expected)
         for name in expected:
             self.assertRegex(text, r'\n\s+%s\s' % re.escape(name), name)
@@ -66,18 +64,6 @@ class HelpTests(unittest.TestCase):
         code, text = run_cli(['gate', 'O1', '--note', 'x'])
         self.assertEqual(code, EXIT_REFUSED)
         self.assertIn('--pass', text)
-
-    def test_docs_flags_table_covers_every_command(self):
-        code, text = run_cli(['docs-flags'])
-        self.assertEqual(code, EXIT_DONE)
-        self.assertTrue(text.startswith('| Command | Flag | Default | Description |\n|---|---|---|---|\n'))
-        for name in cli.COMMAND_NAMES:
-            self.assertIn('| %s |' % name, text)
-        self.assertIn('| (global) | `--dry-run` |', text)
-        self.assertIn('| run | `--from ID` | O1 |', text)
-        self.assertIn('| gate | `--note TEXT` |', text)
-        self.assertNotIn(chr(0x2014), text)
-
 
 class StubTests(unittest.TestCase):
     def test_unimplemented_commands_refuse_and_name_the_milestone(self):
@@ -167,7 +153,7 @@ class ProfileCliTests(unittest.TestCase):
             self.assertEqual(wb.sheetnames[0], 'Summary')
             self.assertEqual(wb.sheetnames[1:7], ['order_items', 'orders', 'events', 'customers', 'totals', 'empty_table'])
             self.assertIn('workbook written to %s (Summary plus 6 table tabs)' % out, text)
-            self.assertIn('FITS', text)
+            self.assertIn('Estimate   copy about', text)
             self.assertIn('No connection was opened', text)
             self.assertFalse((ROOT / 'customer' / 'runs').exists(), 'a dry run on the fixture writes nothing under the kit')
             self.assertFalse((Path(tmp) / 'runs').exists(), 'a dry run writes only the workbook it was asked for')
@@ -180,30 +166,9 @@ class ProfileCliTests(unittest.TestCase):
         self.assertEqual(code, EXIT_REFUSED)
         self.assertIn('needs --out FILE', text)
 
-    def test_profile_exits_4_when_the_window_does_not_fit(self):
+    def test_profile_plan_cycle_on_a_run(self):
         with tempfile.TemporaryDirectory() as tmp:
-            path, cfg = write_config(tmp, lambda d: d['window'].update(end='2026-11-01T05:10:00Z'))
-            out = Path(tmp) / 'short.xlsx'
-            code, text = run_cli(['profile', '--dry-run', '--config', str(path), '--inventory', str(FIXTURE_INVENTORY), '--out', str(out)])
-            self.assertEqual(code, EXIT_GATE, text)
-            self.assertIn('DOES NOT FIT', text)
-            self.assertTrue(out.is_file())
-            self.assertNotIn('ERROR', text)
-            record_passed(cfg, '20261101-0500')
-            code, text = run_cli(['profile', '--config', str(path), '--inventory', str(FIXTURE_INVENTORY), '--run', '20261101-0500'])
-            self.assertEqual(code, EXIT_GATE, text)
-            code, text = run_cli(['status', '--config', str(path)])
-            self.assertRegex(text, r'P3\s+Profile\s+passed', 'a non-fitting estimate is still a completed capture')
-            code, text = run_cli(['profile', '--dry-run', '--config', str(path), '--inventory', str(FIXTURE_INVENTORY)])
-            self.assertEqual(code, EXIT_GATE, text)
-            reports = Path(tmp) / 'runs' / '20261101-0500' / 'example_orders_db' / 'reports'
-            self.assertTrue((reports / 'profile-dry-run.xlsx').is_file(), 'a dry run never overwrites the live workbook')
-            self.assertTrue((reports / 'profile.xlsx').is_file())
-
-    def test_profile_plan_calibrate_cycle_on_a_run(self):
-        from openpyxl import load_workbook
-        with tempfile.TemporaryDirectory() as tmp:
-            path, cfg = write_config(tmp, lambda d: d.update(estimate={'baseline': str(Path(tmp) / 'customer' / 'baseline.json')}))
+            path, cfg = write_config(tmp)
             base = ['--config', str(path)]
             code, text = run_cli(['plan'] + base)
             self.assertEqual(code, EXIT_REFUSED, 'plan needs a run with a capture')
@@ -220,7 +185,7 @@ class ProfileCliTests(unittest.TestCase):
             code, text = run_cli(['plan'] + base)
             self.assertEqual(code, EXIT_DONE, text)
             self.assertIn('SingleStore Database Rebuild Kit    run 20261101-0500    database example_orders_db', text)
-            self.assertIn('Deadline', text)
+            self.assertIn('Estimate   copy about', text)
             self.assertIn('Pipelines  2 captured (1 KAFKA, 1 S3)', text)
             journal_path = run_dir / 'journal.sqlite'
             with contextlib.closing(Journal(journal_path)) as journal:
@@ -237,27 +202,10 @@ class ProfileCliTests(unittest.TestCase):
             self.assertTrue((run_dir / 'reports' / 'freeze-capture.xlsx').is_file())
             code, text = run_cli(['status'] + base)
             self.assertRegex(text, r'O4\s+Freeze capture\s+passed')
-            code, text = run_cli(['calibrate', '--journal', str(REFERENCE_JOURNAL), '--until', '2026-10-24T08:00:00Z', '--size-gib', '938', '--dry-run'] + base)
-            self.assertEqual(code, EXIT_DONE, text)
-            self.assertIn('scan_s_per_row = 7.62', text)
-            self.assertIn('about 488 GiB per hour', text)
-            self.assertIn('DRY RUN: baseline not written', text)
-            self.assertFalse((Path(tmp) / 'customer' / 'baseline.json').exists())
-            code, text = run_cli(['calibrate', '--journal', str(REFERENCE_JOURNAL), '--until', '2026-10-24T08:00:00Z'] + base)
-            self.assertEqual(code, EXIT_DONE, text)
-            baseline = Path(tmp) / 'customer' / 'baseline.json'
-            self.assertTrue(baseline.is_file())
-            self.assertIn('baseline written to %s' % baseline, text)
             code, text = run_cli(['profile', '--inventory', str(FIXTURE_INVENTORY), '--out', str(Path(tmp) / 'customer' / 'again.xlsx')] + base)
             self.assertEqual(code, EXIT_REFUSED, 'P3 passed, so a capture again needs --redo (F5)')
             code, text = run_cli(['profile', '--redo', '--inventory', str(FIXTURE_INVENTORY), '--out', str(Path(tmp) / 'customer' / 'again.xlsx')] + base)
             self.assertEqual(code, EXIT_DONE, text)
-            wb = load_workbook(str(Path(tmp) / 'customer' / 'again.xlsx'))
-            summary = {str(r[0].value): r[1].value for r in wb['Summary'].iter_rows(min_col=1, max_col=2) if r[0].value}
-            self.assertTrue(str(summary['Baseline']).startswith(str(baseline)), 'the written baseline is picked up by the next profile')
-            code, text = run_cli(['calibrate', '--run', '20261101-0500'] + base)
-            self.assertEqual(code, EXIT_REFUSED, 'the run journal has no chunks yet')
-            self.assertIn('at least 4', text)
 
 
     def test_profile_refuses_a_load_target_the_replacement_will_not_hold_and_the_plan_sheet_counts_the_routines(self):
@@ -454,11 +402,6 @@ class CopyCliTests(unittest.TestCase):
         code, text = run_cli(['report'] + base, env=h.env)
         self.assertEqual(code, EXIT_DONE, text)
         self.assertTrue((h.tmp / 'runs' / h.run_id / 'example_orders_db' / 'reports' / 'final.xlsx').is_file())
-        code, text = run_cli(['watch', '--dry-run'] + base, env=h.env)
-        self.assertEqual(code, EXIT_DONE, text)
-        self.assertIn('DRY RUN: SELECT ID, USER, HOST', text)
-        code, text = run_cli(['quiet-proof', '--dry-run'] + base, env=h.env)
-        self.assertEqual(code, EXIT_DONE, text)
         code, text = run_cli(['step', 'O6', '--fresh-table', 't_single', '--dry-run'] + base, env=h.env)
         self.assertEqual(code, EXIT_DONE, text)
 
@@ -474,7 +417,7 @@ class LiveJournalCliTests(unittest.TestCase):
             code, text = run_cli(['gate', 'P1', '--pass', '--note', 'account, Keychain items and config in place', '--run', '20261101-0500'] + base)
             self.assertEqual(code, EXIT_DONE, 'the P1 gate starts the first run')
             record_passed(cfg, '20261101-0500', ('P2',))
-            code, text = run_cli(['run', '--run', '20261101-0500', '--no-rehearsal', 'first run of the kit'] + base)
+            code, text = run_cli(['run', '--run', '20261101-0500'] + base)
             self.assertEqual(code, EXIT_GATE, text)
             self.assertIn('Stopped at O1', text)
             journal = Path(tmp) / 'runs' / '20261101-0500' / 'example_orders_db' / 'journal.sqlite'
@@ -557,7 +500,7 @@ class LiveJournalCliTests(unittest.TestCase):
     def test_most_recent_run_is_by_change_time_not_by_name(self):
         with tempfile.TemporaryDirectory() as tmp:
             path, cfg = write_config(tmp)
-            base = ['--config', str(path), '--no-rehearsal', 'selection test']
+            base = ['--config', str(path)]
             record_passed(cfg, 'zz-rehearsal')
             code, text = run_cli(['run', '--run', 'zz-rehearsal'] + base)
             self.assertEqual(code, EXIT_GATE, text)
@@ -575,48 +518,6 @@ class LiveJournalCliTests(unittest.TestCase):
             self.assertNotIn('zz-rehearsal', text)
             code, text = run_cli(['gate', 'O1', '--pass', '--note', 'go'] + base)
             self.assertIn('for run 20261101-0500', text)
-
-    def test_f12_lockout_with_two_databases_is_refused_at_check_run_and_step(self):
-        """Path B is single database in this pass: run and step O3, O10 and O11 refuse before any step is recorded, --db included;
-        check refuses before any connection and records nothing. The print and notebook routes refuse as well: owner-sql O3,
-        O10 and O11 and owner-notebook write no block file, and gate O3, O10 and O11 --pass record nothing. A connection
-        attempt fails the test instead of reaching a host."""
-        from unittest import mock
-        from s2rebuild.connect import SessionFactory
-        from s2rebuild.journal import Journal
-
-        def never(**kw):
-            raise AssertionError('the refusal must come before any connection')
-
-        def two_on_path_b(d):
-            d['databases'].append({'source': 'second_db', 'layout': {'partitions': 8, 'sub_partitions': 64}})
-            d['freeze'] = {'mode': 'lockout'}
-        refusal = ('freeze.mode lockout (Path B) is single database in this pass, and the configuration has 2 databases '
-                   '(example_orders_db, second_db)')
-        with tempfile.TemporaryDirectory() as tmp:
-            path, cfg = write_config(tmp, two_on_path_b)
-            base = ['--config', str(path), '--run', '20261101-0500']
-            env = {'S2REBUILD_RUNNER_PASSWORD': 'fixture-password'}
-            for argv in (['run', '--yes'], ['run', '--from', 'O1', '--db', 'example_orders_db'], ['step', 'O3', '--yes'], ['step', 'O10', '--yes'],
-                         ['step', 'O11', '--db', 'second_db'], ['check', '--yes'], ['owner-sql', 'O11', '--yes'],
-                         ['owner-sql', 'O3', '--db', 'example_orders_db'], ['owner-sql', 'O10', '--yes', '--dry-run'], ['owner-notebook', '--yes'],
-                         ['gate', 'O3', '--pass', '--note', 'x'], ['gate', 'O10', '--pass', '--note', 'x', '--db', 'second_db'],
-                         ['gate', 'O11', '--pass', '--note', 'x', '--yes', '--dry-run']):
-                with mock.patch.object(cli, 'SessionFactory', lambda config, env, log, dry_run: SessionFactory(config, env, log, dry_run, connector=never)):
-                    code, text = run_cli(argv + base, env=env)
-                self.assertEqual(code, EXIT_REFUSED, (argv, text))
-                self.assertIn(refusal, text, argv)
-            run_dir = Path(tmp) / 'runs' / '20261101-0500'
-            self.assertEqual(sorted(p.name for p in run_dir.rglob('*') if p.suffix in ('.sql', '.ipynb')), [], 'no block file is written')
-            for source in ('example_orders_db', 'second_db'):
-                # F5's entry rule: a refused command writes nothing, so no step is recorded for either database
-                path_ = run_dir / source / 'journal.sqlite'
-                if path_.exists():
-                    journal = Journal(path_, read_only=True)
-                    try:
-                        self.assertEqual(journal.steps_board(), {}, source)
-                    finally:
-                        journal.close()
 
     def test_refused_arguments_create_nothing(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -757,12 +658,12 @@ class LiveRun:
         self.path.write_text(yaml.safe_dump(data, sort_keys=False), encoding='utf8')
 
     def started(self, test):
-        """P1 gated, P2 by a live check, O1 run with the rehearsal waived: O1 recorded the names and the configuration hash."""
+        """P1 gated, P2 by a live check, O1 run: O1 recorded the names and the configuration hash."""
         code, text = self.cli('gate', 'P1', '--pass', '--note', 'account, Keychain items and config in place')
         test.assertEqual(code, EXIT_DONE, text)
         code, text = self.cli('check')
         test.assertEqual(code, EXIT_DONE, text)
-        code, text = self.cli('run', '--no-rehearsal', 'no rehearsal for this test')
+        code, text = self.cli('run')
         test.assertEqual(code, EXIT_GATE, text)
         return self
 
@@ -1011,7 +912,7 @@ class EntryPointRuleTests(unittest.TestCase):
             board, events = journal.steps_board(), journal.events()
         statements = len(h.fake.statements)
         for argv in (['owner-sql', 'O3'], ['owner-sql', 'O10', '--rollback'], ['owner-notebook'], ['gate', 'O1', '--pass', '--note', 'go'],
-                     ['run', '--from', 'O2'], ['run', '--no-rehearsal', 'x'], ['step', 'O2'], ['check'], ['profile', '--step', 'O4'],
+                     ['run', '--from', 'O2'], ['run'], ['step', 'O2'], ['check'], ['profile', '--step', 'O4'],
                      ['mark-recopy', 't_single'], ['owner-sql', 'O3', '--accept-config-change', 'renamed on purpose'],
                      ['owner-sql', 'O3', '--dry-run']):
             code, text = h.cli(*argv)
@@ -1034,9 +935,9 @@ class EntryPointRuleTests(unittest.TestCase):
         h = LiveRun(self)
         self.assertEqual(h.cli('gate', 'P1', '--pass', '--note', 'in place')[0], EXIT_DONE)
         self.assertEqual(h.cli('check')[0], EXIT_DONE)
-        h.rewrite(lambda d: d['window'].update(buffer_minutes=20))
+        h.rewrite(lambda d: d.setdefault('copy', {}).update(progress_seconds=30))
         self.assertEqual(h.cli('check')[0], EXIT_DONE, 'no hash is recorded before O1')
-        self.assertEqual(h.cli('run', '--no-rehearsal', 'no rehearsal for this test')[0], EXIT_GATE)
+        self.assertEqual(h.cli('run')[0], EXIT_GATE)
         with h.journal() as journal:
             old = journal.get_meta('config_hash')
             board = journal.steps_board()
@@ -1132,10 +1033,10 @@ class EntryPointRuleTests(unittest.TestCase):
         self.assertNotIn('warning', text, 'P1 has no preconditions')
         code, text = h.cli('gate', 'O1', '--pass', '--note', 'go without running O1')
         self.assertEqual(code, EXIT_DONE, text)
-        self.assertIn('warning: example_orders_db: O1 has not run in this journal, so its checks (P2, rehearsal evidence) and its records '
-                      '(window, deadline, names, configuration hash) are missing; run s2rebuild run --from O1 --to O1 --redo --db '
+        self.assertIn('warning: example_orders_db: O1 has not run in this journal, so its check (P2) and its records '
+                      '(window, names, configuration hash) are missing; run s2rebuild run --from O1 --to O1 --redo --db '
                       'example_orders_db --run %s, then record the go again' % RUN, text)
-        h.cli('run', '--from', 'O1', '--to', 'O1', '--redo', '--no-rehearsal', 'gate test')
+        h.cli('run', '--from', 'O1', '--to', 'O1', '--redo')
         code, text = h.cli('gate', 'O1', '--pass', '--note', 'go after O1 ran')
         self.assertEqual(code, EXIT_DONE, text)
         self.assertNotIn('warning', text)
@@ -1166,7 +1067,7 @@ class EntryPointRuleTests(unittest.TestCase):
         h = LiveRun(self, lambda d: d['databases'].append({'source': 'second_db', 'layout': {'partitions': 8, 'sub_partitions': 64}}))
         record_passed(h.config, RUN, ('P1', 'P2'))
         # W9: the second database leaves its names to the kit; --mode test applies the defaults without a prompt
-        code, text = h.cli('run', '--no-rehearsal', 'no rehearsal for this test', '--yes', '--mode', 'test')
+        code, text = h.cli('run', '--yes', '--mode', 'test')
         self.assertEqual(code, EXIT_GATE, text)
         self.assertEqual(text.count('Stopped at O1'), 1, text)
         code, text = h.cli('gate', 'O1', '--pass', '--note', 'go', '--yes')
@@ -1177,7 +1078,6 @@ class EntryPointRuleTests(unittest.TestCase):
                 self.assertEqual(journal.step_status('O1'), 'passed', db.source)
                 self.assertEqual(journal.get_meta('config_hash'), h.config.config_hash(), db.source)
                 self.assertEqual(tuple(journal.get_meta(k) for k in ('source_db', 'replacement_db', 'retained_db')), db.names)
-                self.assertEqual(journal.events('no_rehearsal'), ['O1 without rehearsal evidence: no rehearsal for this test'])
         second = h.config.databases[1]
         blocks = h.tmp / 'runs' / RUN / 'second_db' / 'owner-sql'
         original = h.path.read_text(encoding='utf8')
@@ -1208,16 +1108,6 @@ def readme_sequence():
     return [words for words in (shlex.split(line, comments=True) for line in blocks[0].splitlines()) if words]
 
 
-def passed_rehearsal(ctx, prefix, rows=None, keep=False, kill_test=None, from_database=None, percent=1, start_pipelines=False):
-    """What a passed rehearsal leaves in the run (rehearse.run on the fake is tested in test_rehearse): timings with P5 passed."""
-    folder = ctx.config.runs_dir() / ctx.run_id / 'rehearsal'
-    folder.mkdir(parents=True, exist_ok=True)
-    (folder / 'timings.json').write_text(json.dumps({'prefix': prefix, 'p5_status': 'passed'}), encoding='utf8')
-    ctx.journal.step_start('P5')
-    ctx.journal.step_end('P5', 'passed', 'rehearsal %s passed' % prefix, str(folder / 'timings.json'))
-    return steps.Outcome(steps.PASSED, 'rehearsal complete')
-
-
 class RunSelectionTests(unittest.TestCase):
     """F6: run resumes the run the README sequence works on; every gate hint and log header names it with --run."""
 
@@ -1230,8 +1120,7 @@ class RunSelectionTests(unittest.TestCase):
 
     def test_f6_readme_sequence_verbatim_ends_with_one_run_and_o1_passed(self):
         """The bash block of README.md, parsed out of the file and run line by line against the fake, P1 gate to the run after the go,
-        with RUN_ID replaced by the id the P1 gate printed. The rehearsal is the one line whose work is stood in (passed_rehearsal):
-        it forks and kills a copy process and needs the owner profile. The sequence ends with one run directory, O1 passed in it and
+        with RUN_ID replaced by the id the P1 gate printed. The sequence ends with one run directory, O1 passed in it and
         the run stopped at O2. A sequence without a statement of its own: the three failure points of the journal writes that start
         and resume the run are test_f6_run_selection_fault_points_rerun_lands_in_the_same_run."""
         h = LiveRun(self)
@@ -1240,30 +1129,28 @@ class RunSelectionTests(unittest.TestCase):
         for needed in (['s2rebuild', 'gate', 'P1'], ['s2rebuild', 'check'], ['s2rebuild', 'run', '--from', 'O1'], ['s2rebuild', 'gate', 'O1']):
             self.assertTrue(any(words[:len(needed)] == needed for words in sequence), needed)
         env, run_id, outputs = {}, None, {}
-        with mock.patch.object(rehearse, 'run', passed_rehearsal):
-            for words in sequence:
-                if words[0] == 'export':
-                    self.assertEqual(words[1], 'S2REBUILD_RUN=RUN_ID')
-                    self.assertIsNotNone(run_id, 'the run is exported after the command that starts it')
-                    env['S2REBUILD_RUN'] = run_id
-                    continue
-                self.assertEqual(words[0], 's2rebuild')
-                code, text = self.bare(h, *words[1:], **env)
-                self.assertEqual(code, EXIT_GATE if words[1] == 'run' else EXIT_DONE, '%s: %s' % (' '.join(words), text))
-                if words[1:3] == ['gate', 'P1']:
-                    run_id = re.search(r'gate P1 recorded as PASS for run (\S+),', text).group(1)
-                outputs[' '.join(words)] = text
+        for words in sequence:
+            if words[0] == 'export':
+                self.assertEqual(words[1], 'S2REBUILD_RUN=RUN_ID')
+                self.assertIsNotNone(run_id, 'the run is exported after the command that starts it')
+                env['S2REBUILD_RUN'] = run_id
+                continue
+            self.assertEqual(words[0], 's2rebuild')
+            code, text = self.bare(h, *words[1:], **env)
+            self.assertEqual(code, EXIT_GATE if words[1] == 'run' else EXIT_DONE, '%s: %s' % (' '.join(words), text))
+            if words[1:3] == ['gate', 'P1']:
+                run_id = re.search(r'gate P1 recorded as PASS for run (\S+),', text).group(1)
+            outputs[' '.join(words)] = text
         self.assertEqual(self.runs(h), [run_id], 'one run directory')
         start = outputs['s2rebuild run --from O1']
         self.assertIn('run, run %s (--run %s) under' % (run_id, run_id), start)
         self.assertIn('record with: s2rebuild gate O1 --pass --note TEXT --run %s [--evidence FILE]' % run_id, start)
-        self.assertIn('rehearsal evidence: P5 passed in this run', start)
         self.assertIn('[O1] Start (python + decision; runner) database example_orders_db: already passed, skipped', outputs['s2rebuild run'])
         self.assertIn('Stopped at O2: a person must record the gate before the run continues; then s2rebuild run --run %s continues it'
                       % run_id, outputs['s2rebuild run'])
         with contextlib.closing(Journal(h.tmp / 'runs' / run_id / 'example_orders_db' / 'journal.sqlite')) as journal:
-            self.assertEqual({s: journal.step_status(s) for s in ('P1', 'P2', 'P3', 'P4', 'P5', 'O1', 'O2')},
-                             {'P1': 'passed', 'P2': 'passed', 'P3': 'passed', 'P4': 'passed', 'P5': 'passed', 'O1': 'passed', 'O2': 'pending'})
+            self.assertEqual({s: journal.step_status(s) for s in ('P1', 'P2', 'P3', 'P4', 'O1', 'O2')},
+                             {'P1': 'passed', 'P2': 'passed', 'P3': 'passed', 'P4': 'passed', 'O1': 'passed', 'O2': 'pending'})
             self.assertEqual(journal.get_meta('run_id'), run_id)
             self.assertEqual(journal.get_meta('config_hash'), h.config.config_hash())
 
@@ -1274,7 +1161,7 @@ class RunSelectionTests(unittest.TestCase):
         selection without a statement of its own: the three failure points of the writes it resumes are
         test_f6_run_selection_fault_points_rerun_lands_in_the_same_run."""
         h = LiveRun(self)
-        start = ('run', '--no-rehearsal', 'no rehearsal for this test')
+        start = ('run',)
         code, text = self.bare(h, *start)
         self.assertEqual(code, EXIT_REFUSED, 'with no run at all, run starts one; O1 refuses there without P2: %s' % text)
         (first,) = self.runs(h)
@@ -1303,7 +1190,7 @@ class RunSelectionTests(unittest.TestCase):
             self.assertEqual(code, EXIT_REFUSED, argv)
             self.assertIn(refusal, text, argv)
             self.assertEqual(self.runs(h), [first], 'the refusal of %s created nothing' % ' '.join(argv))
-        code, text = self.bare(h, 'run', '--new', '--no-rehearsal', 'no rehearsal for this test')
+        code, text = self.bare(h, 'run', '--new')
         self.assertEqual(code, EXIT_REFUSED, 'the new run holds no P2: %s' % text)
         (second,) = [name for name in self.runs(h) if name != first]
         self.assertIn('run s2rebuild check --run %s for this run first' % second, text)
@@ -1311,7 +1198,7 @@ class RunSelectionTests(unittest.TestCase):
         self.assertEqual(code, EXIT_GATE, text)
         self.assertIn('run, run %s (--run %s)' % (first, first), text)
         self.assertIn('Stopped at O2', text)
-        code, text = self.bare(h, 'run', '--new', '--run', 'second-night', '--no-rehearsal', 'no rehearsal for this test')
+        code, text = self.bare(h, 'run', '--new', '--run', 'second-night')
         self.assertEqual(code, EXIT_REFUSED, text)
         self.assertEqual(self.runs(h), sorted([first, second, 'second-night']))
         with contextlib.closing(Journal(h.tmp / 'runs' / first / 'example_orders_db' / 'journal.sqlite')) as journal:
@@ -1323,7 +1210,7 @@ class RunSelectionTests(unittest.TestCase):
         (step_start); after: a kill just after O1 recorded the run id (set_meta run_id); journal: a kill in gate O1 before its journal
         update (record_gate). The operator reruns the same commands as the README writes them, without --run: every rerun lands in
         the run the P1 gate started, never a new one, the go is recorded once and the run continues at O2."""
-        start = ('run', '--no-rehearsal', 'no rehearsal for this test')
+        start = ('run',)
         go = ('gate', 'O1', '--pass', '--note', 'go')
         for point in FAULT_POINTS:
             with self.subTest(point=point):
@@ -1362,6 +1249,23 @@ class RunSelectionTests(unittest.TestCase):
                     self.assertEqual((journal.step_status('O1'), journal.step_status('O2')), ('passed', 'pending'))
                     self.assertEqual(journal.get_meta('run_id'), run_id)
                     self.assertEqual(len([e for e in journal.events('gate') if e.startswith('O1 pass')]), 1, 'the go is recorded once')
+
+
+class AccountSqlTests(unittest.TestCase):
+    def test_b6_drop_execute_records_the_c4_gate_with_the_privileges_before_and_after(self):
+        def owner(d):
+            d['connections']['owner'] = {'user': 'admin', 'password_env': 'S2REBUILD_OWNER_PASSWORD'}
+        h = LiveRun(self, owner)
+        env = dict(LIVE_ENV, S2REBUILD_OWNER_PASSWORD='owner-fixture')
+        base = ['--config', str(h.path), '--run', RUN]
+        self.assertEqual(run_cli(['gate', 'P1', '--pass', '--note', 'in place'] + base, env=env)[0], EXIT_DONE)
+        code, text = run_cli(['account-sql', '--drop', '--execute'] + base, env=env)
+        self.assertEqual(code, EXIT_DONE, text)
+        self.assertIn('C4 account removal executed with the owner profile', text)
+        with h.journal() as journal:
+            c4 = journal.step('C4')
+        self.assertEqual(c4['status'], 'passed')
+        self.assertRegex(c4['note'], r'^C4 by account-sql --drop --execute: DROP USER s2rebuild_runner; privileges before: n = [1-9]\d*; after: n = 0$')
 
 
 if __name__ == '__main__':

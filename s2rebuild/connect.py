@@ -5,15 +5,18 @@ Author: John Bergamini
 Secrets reads a password from the macOS Keychain or from an environment variable and keeps
 it in memory only. Redactor masks host, user, password and CA path in every line that is
 printed or written. Session applies the active step's Guard to every statement before it
-reaches the server. DryRunSession records statements and issues nothing. KeepAlive sends
-SELECT 1 on its own runner connection every workspace.keepalive_minutes while a step runs, and
-is_driver_error names a connection reset (2003, 2004, 2006, 2013). Statements issued by this
+reaches the server. DryRunSession records statements and issues nothing. Every connection gets
+TCP keep-alive on its socket (enable_tcp_keepalive), and a connect that fails on name resolution
+or a refused connection is tried again (CONNECT_RETRIES). KeepAlive sends SELECT 1 on a fresh
+runner connection every workspace.keepalive_minutes while a step runs, and is_driver_error names
+a connection reset (2003, 2004, 2006, 2013). Statements issued by this
 module: SELECT 1 from the keep-alive thread; otherwise it forwards the statements the steps
 hand to a Session.
 """
 import getpass
 import os
 import re
+import socket
 import subprocess
 import sys
 import threading
@@ -24,6 +27,15 @@ from .common import KitError, iso, utc_now
 
 KEYCHAIN_TOOL = 'security'
 LOG_FILE_MODE = 0o600
+# B1: an INSERT that runs for hours leaves its socket idle, and a NAT or firewall on the path closes an idle flow (I5: 9 chunks lost
+# with [Errno 60] after 2 to 3 hours). Keep-alive probes after 60 s idle, then every 30 s.
+TCP_KEEPALIVE_IDLE_SECONDS = 60
+TCP_KEEPALIVE_INTERVAL_SECONDS = 30
+# B5: a connect that fails on name resolution or a refused connection is tried this many more times, CONNECT_RETRY_SECONDS apart.
+CONNECT_RETRIES = 3
+CONNECT_RETRY_SECONDS = 20
+_RETRY_CONNECT = re.compile(r'Errno (8|-2|-3|61|111)\b|nodename nor servname|Name or service not known|Temporary failure in name resolution|'
+                            r'Connection refused', re.I)
 
 
 USER_FORMS = (
@@ -145,14 +157,60 @@ class Secrets:
                     autocommit=True, connect_timeout=15, read_timeout=8 * 3600, write_timeout=600,
                     charset='utf8mb4', cursorclass=pymysql.cursors.DictCursor)
 
-    def connect(self, connector=None):
-        """Open a connection. connector defaults to pymysql.connect; tests pass a fake."""
+    def connect(self, connector=None, sleep=time.sleep):
+        """Open a connection with TCP keep-alive on its socket. connector defaults to pymysql.connect; tests pass a fake.
+
+        A failure on name resolution or a refused connection (retryable_connect_error) is tried
+        CONNECT_RETRIES more times, CONNECT_RETRY_SECONDS apart (B5), then raises KitError with the
+        host name; any other error is raised at once.
+        """
         if not Path(self.ca).is_file():
             raise KitError('CA file not found at the configured workspace.ca_file path')
         if connector is None:
             import pymysql
             connector = pymysql.connect
-        return connector(**self.connect_kwargs())
+        for attempt in range(CONNECT_RETRIES + 1):
+            try:
+                conn = connector(**self.connect_kwargs())
+                break
+            except Exception as exc:
+                if not retryable_connect_error(exc):
+                    raise
+                if attempt == CONNECT_RETRIES:
+                    raise KitError('Cannot connect to %s: %s after %d attempts over %d s; check name resolution (dig %s, then flush the resolver '
+                                   'cache) and that the workspace is ACTIVE' % (self.host, _connect_reason(exc), attempt + 1,
+                                                                                 CONNECT_RETRIES * CONNECT_RETRY_SECONDS, self.host)) from exc
+                sleep(CONNECT_RETRY_SECONDS)
+        enable_tcp_keepalive(conn)
+        return conn
+
+
+def retryable_connect_error(exc):
+    """True for a connect failure worth another try: name resolution failed or the connection was refused (B5)."""
+    return driver_errno(exc) == 2003 and bool(_RETRY_CONNECT.search(str(exc)))
+
+
+def _connect_reason(exc):
+    """'name resolution failed' or 'connection refused' for a retryable connect error."""
+    return 'connection refused' if re.search(r'refused|Errno (61|111)\b', str(exc), re.I) else 'name resolution failed'
+
+
+def enable_tcp_keepalive(conn):
+    """B1: SO_KEEPALIVE on the connection's socket, first probe after TCP_KEEPALIVE_IDLE_SECONDS, then every TCP_KEEPALIVE_INTERVAL_SECONDS.
+
+    The idle option is TCP_KEEPALIVE on macOS and TCP_KEEPIDLE on Linux. Returns True when the
+    socket was set; a connection without a socket (a test fake) is left as it is.
+    """
+    sock = getattr(conn, '_sock', None)
+    if sock is None:
+        return False
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    idle = getattr(socket, 'TCP_KEEPALIVE', None) if sys.platform == 'darwin' else getattr(socket, 'TCP_KEEPIDLE', None)
+    if idle is not None:
+        sock.setsockopt(socket.IPPROTO_TCP, idle, TCP_KEEPALIVE_IDLE_SECONDS)
+    if hasattr(socket, 'TCP_KEEPINTVL'):
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, TCP_KEEPALIVE_INTERVAL_SECONDS)
+    return True
 
 
 class Session:
@@ -368,13 +426,14 @@ def is_driver_error(exc):
 
 
 class KeepAlive:
-    """A daemon thread that sends SELECT 1 on its own runner connection every interval while a step runs.
+    """A daemon thread that sends SELECT 1 on a fresh runner connection every interval while a step runs.
 
     Auto-suspend counts queries from connections as activity, so a long step with no statement
-    for a while (a wait, a slow block) must not leave the workspace idle. The connection opens at
-    the first ping, so a short step opens none; a ping that fails is logged and the next one opens
-    a new connection. run_step starts it and stops it at the end of the step; 0 minutes disables
-    it. clock and poll are injected by the tests (a fake clock, a short poll).
+    for a while (a wait, a slow block) must not leave the workspace idle. Each ping opens its own
+    connection and closes it (B4), so an aggregator restart between pings costs nothing, and a
+    short step opens none; a ping that fails is logged with the error number and the redacted
+    message. run_step starts it and stops it at the end of the step; 0 minutes disables it. clock
+    and poll are injected by the tests (a fake clock, a short poll).
     """
 
     def __init__(self, opener, minutes, log=None, clock=None, poll=1.0, guard=None):
@@ -387,7 +446,6 @@ class KeepAlive:
         self.guard = guard or read_guard('keep-alive')
         self.stopped = threading.Event()
         self.thread = None
-        self.session = None
         self.sent = []
         self.failures = 0
 
@@ -398,30 +456,27 @@ class KeepAlive:
         return self
 
     def stop(self):
-        """Stop the thread, wait for it and close the connection it opened."""
+        """Stop the thread and wait for it."""
         self.stopped.set()
         if self.thread is not None:
             self.thread.join(timeout=max(5.0, self.poll * 5))
-        if self.session is not None:
-            self.session.close()
-            self.session = None
 
     def ping(self):
-        """Send SELECT 1 once, opening the connection when needed; a failure is logged, never raised."""
+        """Send SELECT 1 once on a new connection, then close it; a failure is logged with its number and message, never raised."""
+        session = None
         try:
-            if self.session is None:
-                self.session = Session(self.opener(), self.guard, self.log)
-            self.session.query(KEEPALIVE_SQL)
+            session = Session(self.opener(), self.guard, self.log)
+            session.query(KEEPALIVE_SQL)
             self.sent.append(self.clock())
             if self.log is not None:
                 self.log('keep-alive: %s sent' % KEEPALIVE_SQL)
-        except Exception as exc:  # noqa: BLE001 - the keep-alive never ends a step
+        except Exception as exc:  # noqa: BLE001 - the keep-alive never ends a step; the failure is logged
             self.failures += 1
-            if self.session is not None:
-                self.session.close()
-                self.session = None
             if self.log is not None:
-                self.log('keep-alive: %s failed (%s); the next one opens a new connection' % (KEEPALIVE_SQL, type(exc).__name__))
+                self.log('keep-alive: %s failed: %s error %s: %s' % (KEEPALIVE_SQL, type(exc).__name__, driver_errno(exc) or 'without a number', exc))
+        finally:
+            if session is not None:
+                session.close()
 
     def _loop(self):
         due = self.clock() + self.seconds

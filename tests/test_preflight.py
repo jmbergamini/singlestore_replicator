@@ -1,18 +1,15 @@
-"""s2rebuild tests test_preflight: the P2 checks behind s2rebuild check, and the C2 report and calibrate handler.
+"""s2rebuild tests test_preflight: the P2 checks behind s2rebuild check, and the C2 report handler.
 
 Author: John Bergamini
 """
 import json
 import unittest
-from unittest import mock
 
-import openpyxl
-
-from s2rebuild import estimate, inventory, report_xlsx, steps
+from s2rebuild import steps
 from s2rebuild.common import EXIT_DONE
 from tests.fakedb import FakeDisconnect, SimulatedCrash
 from tests.helpers import FAULT_POINTS, ROOT, crash_journal, run_cli, write_config
-from tests.test_copy import FIXTURE_TABLES, SRC, TGT, Harness
+from tests.test_copy import SRC, TGT, Harness
 from tests.test_pipelines import owner_harness
 
 REFERENCE_JOURNAL = ROOT / 'tests' / 'fixtures' / 'reference-run' / 'copy-journal.sqlite'
@@ -49,13 +46,11 @@ class PreflightTests(unittest.TestCase):
         self.assertIn('source STORAGE_ID: 1028600672070281646:7367158985892520834 (READWRITE), recorded', text)
         self.assertIn('replacement name: %s is free' % TGT, text)
         self.assertIn('compute size: 16 leaf cores x 8 = 128 covers the 32 target partitions', text)
-        self.assertIn('workers: 2 configured (copy.workers), table concurrency auto, on 16 leaf cores; '
-                      'the baseline was fitted with 4 workers on leaf cores not recorded', text, 'W11: the worker line')
+        self.assertIn('workers: 2 configured (copy.workers), table concurrency auto, on 16 leaf cores', text, 'W11: the worker line')
         self.assertIn('owner: no owner profile configured', text)
-        self.assertIn('workspace: no Management API key configured (workspace.management_api_key_keychain); answer before the window:', text)
+        self.assertIn('workspace: answer before the window:', text)
         self.assertIn('1. is the workspace ACTIVE', text)
         self.assertIn('record the answers at O1 with --workspace NOTE', text)
-        self.assertEqual(json.loads(h.journal.get_meta('preflight'))['workspace'], {'source': 'questions'})
         self.assertEqual(h.journal.attachment('source')['storage_id'], '1028600672070281646:7367158985892520834')
         self.assertEqual(h.journal.get_meta('engine_version'), '10.8.0', 'the fake reports the engine of the capture')
 
@@ -78,45 +73,6 @@ class PreflightTests(unittest.TestCase):
         self.assertEqual(out.status, steps.PASSED, h.text())
         self.assertIn('leaf cores are not readable here; confirm in the Portal that cores x 8 >= 32 partitions', h.text())
         self.assertIn('owner: connected as <redacted>@%; 1 pipeline(s) visible', h.text())
-
-    def test_w8_p2_reads_the_workspace_through_the_api_and_refuses_a_state_other_than_active(self):
-        """With workspace.management_api_key_keychain set, P2 reads GET /v1/workspaces/<id> with the key from the Keychain as a bearer
-        token (never printed), records state, autoscale and auto-suspend, prints them on the plan sheet, and fails on a state other
-        than ACTIVE. The fake transport stands in for the network."""
-        from s2rebuild import workspace
-        calls = []
-        answer = {'state': 'ACTIVE', 'autoSuspend': {'suspendType': 'DISABLED'}, 'autoScale': {'maxScaleFactor': 1}}
-
-        def transport(request):
-            calls.append((request.full_url, request.get_header('Authorization')))
-            return 200, json.dumps(answer)
-        h = Harness(self, mutate=lambda d: d['workspace'].update(management_api_key_keychain='s2rebuild-api', id='ws-123'))
-        h.sessions.keychain = lambda service, account: 'api-key-value-%s' % service
-        with mock.patch.object(workspace, 'default_transport', transport):
-            out = p2(h)
-            self.assertEqual(out.status, steps.PASSED, h.text())
-            self.assertEqual(calls, [(workspace.API_BASE + '/v1/workspaces/ws-123', 'Bearer api-key-value-s2rebuild-api')])
-            text = h.text()
-            self.assertNotIn('api-key-value', text, 'the key joins the redactor')
-            self.assertIn('workspace state: ACTIVE (Management API)', text)
-            self.assertIn('workspace autoscale: off (maxScaleFactor=1); O1 refuses while it is on unless --accept-autoscale NOTE', text)
-            self.assertIn('workspace auto-suspend: off (suspendType=DISABLED); the keep-alive thread covers a running step', text)
-            facts = json.loads(h.journal.get_meta('preflight'))['workspace']
-            self.assertEqual((facts['source'], facts['state'], facts['autoscale'], facts['auto_suspend']), ('api', 'ACTIVE', False, False))
-            self.assertEqual(facts['fields'], answer)
-            self.assertEqual(workspace.recorded(h.journal), facts)
-            self.assertEqual(workspace.plan_lines(facts), ['Workspace  state ACTIVE; autoscale off (maxScaleFactor=1); auto-suspend off (suspendType=DISABLED) (Management API at P2)'])
-            answer.update(state='PENDING', autoScale={'enabled': True})
-            out = p2(h)
-            self.assertEqual((out.status, out.exit_code), (steps.FAILED, 4), h.text())
-            self.assertIn('workspace state: FAILED, PENDING is not ACTIVE (Management API); resume the workspace or wait for it to settle', out.note)
-            facts = json.loads(h.journal.get_meta('preflight'))['workspace']
-            self.assertEqual((facts['state'], facts['autoscale']), ('PENDING', True))
-            self.assertIn('workspace autoscale: on (enabled=True)', h.text())
-        h2 = Harness(self, mutate=lambda d: d['workspace'].update(management_api_key_keychain='s2rebuild-api'))
-        h2.sessions.keychain = lambda service, account: 'api-key-value'
-        self.assertEqual(p2(h2).status, steps.REFUSED, 'the read needs workspace.id')
-        self.assertIn('workspace.id is not set', h2.journal.step('P2')['note'])
 
     def test_check_dry_run_prints_the_queries(self):
         import tempfile
@@ -183,89 +139,23 @@ class RoutineTests(unittest.TestCase):
                     self.assertEqual(h.journal.step_status('P2'), 'passed')
 
 
-class ReportAndCalibrateTests(unittest.TestCase):
+class ReportTests(unittest.TestCase):
     def ready(self, h):
         """A copied harness with every step before C2 passed."""
         self.assertEqual(h.o5_o6().status, steps.PASSED)
         for step_id in ('O7', 'O8', 'O9', 'O10', 'O11', 'C1'):
             h.journal.step_end(step_id, 'passed', 'test')
 
-    def test_reports_and_a_recalibrated_baseline(self):
-        h = Harness(self, mutate=lambda d: d.update(estimate={'baseline': str('customer_baseline.json')}))
+    def test_c2_writes_the_reports(self):
+        h = Harness(self)
         self.assertEqual(p2(h).status, steps.PASSED, h.text())
         self.ready(h)
-        reference = estimate.calibrate(REFERENCE_JOURNAL, until='2026-10-24T08:00:00Z', workers=4)
-        original, given = estimate.calibrate, {}
-
-        def recorded(*args, **kwargs):
-            given.update(kwargs)
-            return reference
-        estimate.calibrate = recorded
-        try:
-            out = h.step('C2', redo=True)
-        finally:
-            estimate.calibrate = original
-        self.assertEqual(out.status, steps.PASSED, h.text())
-        self.assertEqual(given.get('leaf_cores'), 16, 'C2 hands calibrate the leaf cores P2 recorded (W10)')
-        self.assertEqual(inventory.recorded_leaf_cores(h.journal), 16)
+        out = h.step('C2', redo=True)
+        self.assertEqual((out.status, out.note), (steps.PASSED, 'reports written'), h.text())
         reports = h.tmp / 'runs' / h.run_id / SRC / 'reports'
         self.assertTrue((reports / 'final.xlsx').is_file())
         self.assertTrue((reports / 'run-report.md').is_file())
-        self.assertIn('baseline recalibrated and written to', out.note)
-        self.assertTrue((h.tmp / 'customer_baseline.json').is_file())
-
-    def test_f9_c2_with_three_chunks_passes_with_the_note(self):
-        """Three first-pass chunks cannot be fitted: the baseline in use stays (no baseline file is written), the Summary of the
-        final workbook and of the run report carry a Calibration line that says so, and C2 passes with that note, so C3 can run."""
-        h = Harness(self, tables={'t_single': FIXTURE_TABLES['t_single']})
-        self.ready(h)
-        self.assertEqual(len(estimate.read_chunks(h.journal_path)), 3)
-        out = h.step('C2', redo=False)
-        self.assertEqual((out.status, out.exit_code), (steps.PASSED, EXIT_DONE), h.text())
-        line = ('baseline not recalibrated (Calibration needs at least 4 first-pass chunks; found 3); '
-                'the baseline in use stays: the shipped default')
-        self.assertEqual(out.note, 'reports written; ' + line)
-        self.assertEqual(h.journal.step_status('C2'), 'passed')
-        self.assertFalse(h.config.resolve(h.config.estimate.baseline).exists(), 'the configured baseline file is not written')
-        reports = h.tmp / 'runs' / h.run_id / SRC / 'reports'
-        summary = {row[0]: row[1] for row in openpyxl.load_workbook(reports / 'final.xlsx')['Summary'].iter_rows(values_only=True)}
-        self.assertEqual(summary['Calibration'], line)
-        self.assertIn('- Calibration: ' + line, (reports / 'run-report.md').read_text())
         self.assertEqual(steps.unmet_preconditions(steps.REGISTRY['C3'], h.journal), [])
-
-    def test_f9_c2_fault_points_around_the_baseline_write(self):
-        """The three failure points around the one C2 write outside the reports, the fitted baseline file: a kill just before
-        it, just after it, and after it but before the C2 journal update. Rerunning step C2 passes and the file holds the
-        fitted baseline."""
-        reference = estimate.calibrate(REFERENCE_JOURNAL, until='2026-10-24T08:00:00Z', workers=4)
-        write = estimate.write_baseline
-        for point in FAULT_POINTS:
-            with self.subTest(point=point):
-                h = Harness(self, mutate=lambda d: d.update(estimate={'baseline': 'customer_baseline.json'}))
-                self.ready(h)
-                target = h.tmp / 'customer_baseline.json'
-
-                def killed(path, baseline, point=point):
-                    if point == 'after':
-                        write(path, baseline)
-                    raise SimulatedCrash('killed %s the baseline write' % point)
-                with mock.patch.object(estimate, 'calibrate', return_value=reference):
-                    if point == 'journal':
-                        crash_journal(self, h.journal, 'step_end', match=lambda step_id, status, *rest: (step_id, status) == ('C2', 'passed'))
-                        with self.assertRaises(SimulatedCrash):
-                            h.step('C2', redo=False)
-                        self.assertEqual(h.journal.step_status('C2'), 'running', 'killed before the journal update')
-                        self.assertTrue(target.is_file())
-                    else:
-                        with mock.patch.object(estimate, 'write_baseline', killed), self.assertRaises(SimulatedCrash):
-                            h.step('C2', redo=False)
-                        self.assertEqual(h.journal.step_status('C2'), 'failed')
-                        self.assertEqual(target.is_file(), point == 'after')
-                    out = h.step('C2', redo=False)
-                self.assertEqual(out.status, steps.PASSED, h.text())
-                self.assertEqual(out.note, 'reports written; baseline recalibrated and written to %s' % target)
-                self.assertEqual(estimate.load_baseline(target).scan_s_per_row, reference.baseline.scan_s_per_row)
-                self.assertEqual(h.journal.step_status('C2'), 'passed')
 
 
 if __name__ == '__main__':

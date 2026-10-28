@@ -1,34 +1,30 @@
 flowchart LR
   subgraph P[Prepare: before the window]
     direction TB
-    P1[P1 Prerequisites<br/>account, Keychain, config] --> P2[P2 Preflight<br/>connection, privileges,<br/>layout, storage IDs,<br/>workspace state and settings]
+    P1[P1 Prerequisites<br/>account, Keychain, config] --> P2[P2 Preflight<br/>connection, privileges,<br/>layout, storage IDs,<br/>workspace questions]
     P2 --> P3[P3 Profile<br/>inventory, routines, reference tables,<br/>estimate, pipeline credentials asked]
-    P3 --> P4{P4 Plan<br/>window, deadline,<br/>freeze path, names}
-    P4 --> P5[P5 Rehearsal<br/>the real steps on a throwaway copy:<br/>freeze, copy, switch, rollback]
+    P3 --> P4{P4 Plan<br/>window, owners, names}
   end
   subgraph O[Outage window]
     direction TB
-    O1[O1 Start<br/>names confirmed, go decision, deadline] --> O2[O2 Stop pipelines<br/>capture offsets]
-    O2 --> O3{O3 Freeze}
-    O3 -->|Path A, default| O3A[Detach, attach READ ONLY<br/>write probe]
-    O3 -->|Path B, fallback| O3B[Revoke and kill loop<br/>quiet proof]
-    O3A --> O4[O4 Freeze capture<br/>inventory, drift, copy plan]
-    O3B --> O4
+    O1[O1 Start<br/>names confirmed, go decision] --> O2[O2 Stop pipelines<br/>capture offsets]
+    O2 --> O3[O3 Freeze<br/>detach, attach READ ONLY,<br/>write probe]
+    O3 --> O4[O4 Freeze capture<br/>inventory, drift, copy plan]
     O4 --> O5[O5 Create replacement<br/>layout, tables, functions, aggregates]
-    O5 --> O6[O6 Copy<br/>chunks, journal, resume,<br/>staging for reference tables]
+    O5 --> O6[O6 Copy<br/>chunks, journal, resume,<br/>one retry round, staging for reference tables]
     O6 --> O7[O7 Post-copy<br/>views, procedures, counters, stale check]
     O7 --> O8[O8 Verify<br/>counts, newest, fingerprints<br/>in parallel, sampled over 1 B rows]
     O8 --> O9[O9 Pipelines<br/>create stopped at offsets]
     O9 --> O10{O10 Switch<br/>S1 detach, S2 retain, S2b drop original record,<br/>S3 attach live, S4 drop replacement<br/>ends with two entries}
-    O10 -->|go| O11[O11 Release<br/>start pipelines, restore grants,<br/>application restart]
+    O10 -->|go| O11[O11 Release<br/>start pipelines,<br/>application restart]
     O10 -->|no go| RB[Rollback<br/>original by syntax before S2b,<br/>through the retained copy after]
   end
   subgraph C[Close-out]
     direction TB
-    C1[C1 Verify after release] --> C2[C2 Report and calibrate<br/>retain-until date recorded]
-    C2 --> C3[C3 End state<br/>two entries, repair for older runs]
+    C1[C1 Verify after release] --> C2[C2 Report<br/>retain-until date recorded]
+    C2 --> C3[C3 End state<br/>two entries]
     C3 --> C4[C4 Remove migration account]
     C4 -.->|optional, after retain-until,<br/>the customer| C5[C5 cleanup --delete<br/>the retained original]
   end
-  P5 --> O1
+  P4 --> O1
   O11 --> C1

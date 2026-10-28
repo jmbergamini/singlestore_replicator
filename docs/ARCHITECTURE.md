@@ -1,8 +1,8 @@
 # SingleStore Database Rebuild Kit (s2rebuild): Architecture
 
 Author: John Bergamini
-Version: 1.0 (the design after the release 1.0 work order, `docs/RELEASE-1.0.md`)
-Date: October 27, 2026
+Version: 1.0 (the design after the release 1.0 work order, `docs/RELEASE-1.0.md`, and the final pass of October 28, 2026)
+Date: October 28, 2026
 
 ## 1. Verdict
 
@@ -12,7 +12,7 @@ The reference run that shaped this design copied 95 tables, 3.045 billion rows a
 
 Design rules:
 
-1. The freeze is a database state, not a grant state. DETACH then ATTACH READ ONLY is the default (Path A). Revoke-and-kill is the fallback (Path B) and is only loaded when the operator chooses it.
+1. The freeze is a database state, not a grant state. DETACH then ATTACH READ ONLY is the only freeze. Revoke-and-kill (the former Path B) failed on the reference night and was removed in the final pass.
 2. Every admin statement runs behind a precondition query. An out-of-order statement is refused, not executed.
 3. A database is identified by its branch record: name, STORAGE_ID and ATTACH_TYPE (every attach changes the COMPUTE_ID, fact 44). Names are not unique on Helios, and a STORAGE_ID names a storage that several records share (section 10.13).
 4. Every statement, gate result and timing is journaled. Any step can be re-entered from a terminal.
@@ -25,18 +25,17 @@ Design rules:
 In scope:
 
 - One or more databases per run, all in one workspace, configured in one YAML file.
-- Profile and time estimate before the window, from a throughput model calibrated on the reference run and recalibrated after every run.
-- Freeze by read-only attachment (Path A) or by revoke-and-kill (Path B).
+- Profile and a one-line time estimate before the window: the rows divided by the rows per hour a whole O6 measured (`estimate.rows_per_hour`).
+- Freeze by read-only attachment.
 - Server-side chunked copy with a durable journal, resume and reconciliation.
-- Views, routines (functions, table-valued functions, aggregates, procedures), AUTO_INCREMENT counters, reference tables through a staging table, pipelines (created stopped at recorded offsets), grants restore.
+- Views, routines (functions, table-valued functions, aggregates, procedures), AUTO_INCREMENT counters, reference tables through a staging table, pipelines (created stopped at recorded offsets).
 - Switch as a state machine with rollback by branch record, ending with two entries: the live database and the retained copy (10.13).
 - Verification in three tiers, the fingerprints in parallel and sampled by a contiguous range above a row threshold, with an elapsed budget and an acceptance without a rerun (10.10).
 - Operator prompts for the owner password, the pipeline credentials and the run names; the runner password generated to the workspace policy (section 8).
-- Workspace guards: the state and settings through the Management API, a keep-alive thread during every step, a circuit breaker in the copy (10.23).
+- Workspace guards: the three workspace questions answered at O1, a keep-alive thread during every step, TCP keep-alive on every connection, connect retries on name resolution, a circuit breaker and one retry round in the copy, `caffeinate` on macOS (10.2, 10.9).
 - Excel and Markdown reports: one summary tab plus one tab per table, the Views and Routines tabs, the end state and retention.
-- Rehearsal of the real steps on throwaway databases, synthetic or a sample of a real database (`sample-database`), including the switch, a rollback leg and the end state (10.18).
 - The customer's delete of the retained copy after the retention period (`cleanup`, C5).
-- A bundle command that produces a manifest and a zip of the static tree; an engine capture that the test fake is built from (`engine-capture`, docs/CODE-GUIDE.md).
+- An engine capture that the test fake is built from (`tools/enginecapture.py`, a development tool outside the command line, docs/CODE-GUIDE.md).
 
 Out of scope for this pass:
 
@@ -44,7 +43,7 @@ Out of scope for this pass:
 - Incremental catch-up or pre-staging of very large tables. The copy runs inside the window.
 - Range-based chunking (see section 14 for the option).
 - External functions. They are not captured; recreate them by hand on the live name after O10. Functions, table-valued functions, aggregates and procedures are migrated (10.22); `objects.routines.ignore` leaves one behind on purpose.
-- Live database testing. The first live test runs on John's own organization after this pass.
+- Synthetic, sampled or kill tests of any kind. The kit is validated by full end-to-end runs on a real database (the final pass, V1 to V4).
 
 ## 3. Step model
 
@@ -55,24 +54,23 @@ Kind: python (the kit runs it), admin (needs the Helios admin identity; the kit 
 | ID | Step | Kind | Identity | Gate to pass |
 |---|---|---|---|---|
 | P1 | Prerequisites | human + admin | admin | Kit installed, runner account created, Keychain items set, config written |
-| P2 | Preflight | python | runner (+ owner) | Connection, privileges, source layout, the source's branch record recorded and alone on its storage, target names free, compute size fits the partition count, the workspace ACTIVE with its autoscale and auto-suspend settings recorded when the Management API key is configured (else the three questions printed), the routines counted with the owner profile |
-| P3 | Profile | python | runner (+ owner for pipelines, routines and the write-capable accounts) | Inventory JSON with the routine definitions and the reference tables counted, profile Excel, estimate with bands scaled to the workspace, window fit printed; the pipeline credentials asked and stored in the Keychain on route kit |
-| P4 | Plan | decision | people | Freeze path, window, abort deadline, named owner for "application stopped", pipeline credential handover, retained name, retention days recorded in config; the auto-suspend choice for the waits between commands |
-| P5 | Rehearsal | python + admin | runner + owner | The real steps on throwaway databases: freeze, copy with the kill test resumed, verify, switch with a rollback leg, release, C1 and C3 ending at two entries; timings recorded under `customer/runs/` |
-| O1 | Start | python + decision | runner | Window and deadline recorded, P2 passed in this run, rehearsal evidence present or waived with `--no-rehearsal NOTE`, autoscale off or accepted with `--accept-autoscale NOTE`, the replacement and retained names confirmed (asked in production mode when the configuration leaves them out), go recorded |
+| P2 | Preflight | python | runner (+ owner) | Connection, privileges, source layout, the source's branch record recorded and alone on its storage, target names free, compute size fits the partition count, the three workspace questions printed, the routines counted with the owner profile |
+| P3 | Profile | python | runner (+ owner for pipelines, routines and the write-capable accounts) | Inventory JSON with the routine definitions and the reference tables counted, profile Excel, the estimate line printed; the pipeline credentials asked and stored in the Keychain on route kit |
+| P4 | Plan | decision | people | Window, named owner for "application stopped", pipeline credential handover, retained name, retention days recorded in config; the auto-suspend choice for the waits between commands |
+| O1 | Start | python + decision | runner | Window recorded, P2 passed in this run, the workspace answers recorded with `--workspace NOTE`, the replacement and retained names confirmed (asked in production mode when the configuration leaves them out), go recorded |
 | O2 | Stop pipelines | admin | owner | No pipeline in state Running; every definition captured with a credentials placeholder; offsets captured after the stop, loaded equal to successful on every partition |
-| O3 | Freeze | admin | owner | Path A: write probe refused and ATTACH_TYPE = READONLY. Path B: quiet proof passed the configured number of times |
+| O3 | Freeze | admin | owner | Write probe refused and ATTACH_TYPE = READONLY |
 | O4 | Freeze capture | python | runner | Inventory captured after the freeze; drift against P3 reviewed; copy plan written |
 | O5 | Create replacement | python | runner, owner for the routines | Replacement layout verified; every table definition matches the capture; the functions, table-valued functions and aggregates created with the captured definitions |
-| O6 | Copy | python | runner | Every chunk done (reference tables through a staging table); per-table count proof all match |
+| O6 | Copy | python | runner | Every chunk done (reference tables through a staging table; the failed chunks retried once at the end of the pass); per-table count proof all match |
 | O7 | Post-copy | python | runner, owner for the views and procedures | Views and procedures created, counters set, stale check 0 mismatches after re-copy |
 | O8 | Verify | python | runner | Tier 1 and 2 pass for every table; tier 3 a full match, or a sampled or not fingerprinted result accepted by the operator with `--yes` |
 | O9 | Pipelines | admin | owner | Expected pipeline count in the replacement, all Stopped, the committed offset of every partition in the replacement equals the O2 capture |
 | O10 | Switch | admin | owner | Live name resolves to the replacement branch with the target layout; retained copy attached read only; the original record and the replacement dropped; exactly two entries |
-| O11 | Release | admin + human | owner + customer | Retention check passed per partition; pipelines started; grants match the snapshot (Path B); application restarted and writing |
-| C1 | Verify after release | python | runner | Writer watch shows the application on the live database; pipelines Running with offsets advancing; no pipeline errors |
-| C2 | Report and calibrate | python | runner | Final Excel and Markdown written; baseline recalibrated from the journal, or kept with a note when the journal cannot be fitted |
-| C3 | End state | admin | owner | Exactly two entries across both storages, the live record and the retained record; the live name resolves to the live record; a write on the retained name refused; the listing recorded; the repair block for a switch made without S2b and S4 |
+| O11 | Release | admin + human | owner + customer | Retention check passed per partition; pipelines started; application restarted and writing |
+| C1 | Verify after release | python | runner | Writer sample shows the application on the live database; pipelines Running with offsets advancing; no pipeline errors |
+| C2 | Report | python | runner | Final Excel and Markdown written; retain-until recorded |
+| C3 | End state | admin | owner | Exactly two entries across both storages, the live record and the retained record; the live name resolves to the live record; a write on the retained name refused; the listing recorded; reads only |
 | C4 | Remove migration account | admin | owner | C3 passed; no view and no routine of the live database has the runner as its definer; DROP USER done, zero privileges remain, Keychain item deleted |
 
 C5, the delete of the retained copy, is a command (`s2rebuild cleanup --delete NAME`, owner, the customer's decision after `retain_until_utc`), not a step of the registry: the board stays P1 to C4 and no step and no configuration key deletes the retained copy (10.13).
@@ -84,48 +82,44 @@ Rules:
 - A step that has passed is skipped on re-run unless `--redo` is given.
 - Every command that runs or records a step follows the same rules. `run`, `step`, `check` (P2) and `profile` (P3, O4) refuse a step whose preconditions are not passed, for every selected database, before they connect or write; a dry run reports the refusal and goes on. `profile` captures a passed step again only with `--redo`, which logs what it rewrites (for O4 the copy plan); `check` reruns a passed P2 without it, since the preflight only reads and records its result again. `gate` records a step whose preconditions are not passed, with a warning that names them. The P1 gate starts the first run when none exists.
 - Every command that opens a run journal refuses it when the database names it records differ from the configuration, and, once O1 recorded the configuration hash, when the configuration hashes differently, unless `--accept-config-change NOTE` records an event with both hashes and the note and keeps the new hash. A dry run reports a changed hash and goes on; `status` and `report` only report both. Before O1 nothing is recorded, so the P4 decisions written into the configuration count for nothing.
-- O1 refuses unless P2 passed in the same journal and rehearsal evidence exists (P5 passed in this journal, or a rehearsal of any run under `customer/runs/` that records P5 passed), or `--no-rehearsal NOTE` waives it; the waiver is an event and part of the O1 note. With several databases, `run` and `step O1` run O1 for every selected database before they stop for the go, so each journal records its checks, names, configuration hash and window; a refused or failed O1 stops at once.
+- O1 refuses unless P2 passed in the same journal. With several databases, `run` and `step O1` run O1 for every selected database before they stop for the go, so each journal records its checks, names, configuration hash and window; a refused or failed O1 stops at once.
 - Admin steps without an owner profile print the block, then exit with code 4 until `s2rebuild gate <ID> --pass` is recorded.
 - Multiple databases run sequentially in config order through O2 to O9, then O10 and O11 per database after one go decision each. `--db` restricts a run to one database.
 
 ## 4. Flow diagram
 
-Source for `docs/flow.mmd`. Three columns: Prepare, Outage window, Close-out. `docs/flow.svg` (README) is an earlier mermaid render with the C3 and rollback labels corrected by hand, and `docs/flow.png` (PDF) is converted from it. Both show every step from P1 to C4 with shorter labels than the source and leave out the optional C5. Render both again from `docs/flow.mmd` with mermaid-cli when one is available, then rebuild the guide.
+Source for `docs/flow.mmd`. Three columns: Prepare, Outage window, Close-out. `docs/flow.svg` (README) is an earlier mermaid render with the C3 and rollback labels corrected by hand, and `docs/flow.png` (PDF) is converted from it. Both still show P5 and the Path B branch, which the final pass removed; render both again from `docs/flow.mmd` with mermaid-cli when one is available (none on the build Mac on October 28, 2026), then rebuild the guide.
 
 ```mermaid
 flowchart LR
   subgraph P[Prepare: before the window]
     direction TB
-    P1[P1 Prerequisites<br/>account, Keychain, config] --> P2[P2 Preflight<br/>connection, privileges,<br/>layout, storage IDs,<br/>workspace state and settings]
+    P1[P1 Prerequisites<br/>account, Keychain, config] --> P2[P2 Preflight<br/>connection, privileges,<br/>layout, storage IDs,<br/>workspace questions]
     P2 --> P3[P3 Profile<br/>inventory, routines, reference tables,<br/>estimate, pipeline credentials asked]
-    P3 --> P4{P4 Plan<br/>window, deadline,<br/>freeze path, names}
-    P4 --> P5[P5 Rehearsal<br/>the real steps on a throwaway copy:<br/>freeze, copy, switch, rollback]
+    P3 --> P4{P4 Plan<br/>window, owners, names}
   end
   subgraph O[Outage window]
     direction TB
-    O1[O1 Start<br/>names confirmed, go decision, deadline] --> O2[O2 Stop pipelines<br/>capture offsets]
-    O2 --> O3{O3 Freeze}
-    O3 -->|Path A, default| O3A[Detach, attach READ ONLY<br/>write probe]
-    O3 -->|Path B, fallback| O3B[Revoke and kill loop<br/>quiet proof]
-    O3A --> O4[O4 Freeze capture<br/>inventory, drift, copy plan]
-    O3B --> O4
+    O1[O1 Start<br/>names confirmed, go decision] --> O2[O2 Stop pipelines<br/>capture offsets]
+    O2 --> O3[O3 Freeze<br/>detach, attach READ ONLY,<br/>write probe]
+    O3 --> O4[O4 Freeze capture<br/>inventory, drift, copy plan]
     O4 --> O5[O5 Create replacement<br/>layout, tables, functions, aggregates]
-    O5 --> O6[O6 Copy<br/>chunks, journal, resume,<br/>staging for reference tables]
+    O5 --> O6[O6 Copy<br/>chunks, journal, resume,<br/>one retry round, staging for reference tables]
     O6 --> O7[O7 Post-copy<br/>views, procedures, counters, stale check]
     O7 --> O8[O8 Verify<br/>counts, newest, fingerprints<br/>in parallel, sampled over 1 B rows]
     O8 --> O9[O9 Pipelines<br/>create stopped at offsets]
     O9 --> O10{O10 Switch<br/>S1 detach, S2 retain, S2b drop original record,<br/>S3 attach live, S4 drop replacement<br/>ends with two entries}
-    O10 -->|go| O11[O11 Release<br/>start pipelines, restore grants,<br/>application restart]
+    O10 -->|go| O11[O11 Release<br/>start pipelines,<br/>application restart]
     O10 -->|no go| RB[Rollback<br/>original by syntax before S2b,<br/>through the retained copy after]
   end
   subgraph C[Close-out]
     direction TB
-    C1[C1 Verify after release] --> C2[C2 Report and calibrate<br/>retain-until date recorded]
-    C2 --> C3[C3 End state<br/>two entries, repair for older runs]
+    C1[C1 Verify after release] --> C2[C2 Report<br/>retain-until date recorded]
+    C2 --> C3[C3 End state<br/>two entries]
     C3 --> C4[C4 Remove migration account]
     C4 -.->|optional, after retain-until,<br/>the customer| C5[C5 cleanup --delete<br/>the retained original]
   end
-  P5 --> O1
+  P4 --> O1
   O11 --> C1
 ```
 
@@ -135,8 +129,8 @@ Two SQL identities. The split is forced by Helios: SUPER cannot be granted, the 
 
 | Identity | Who | Used by | Required privileges |
 |---|---|---|---|
-| runner | A SQL account the kit creates in P1 and drops in C4 | P2, P3 (tables), O4, O5 (database and tables), O6, O7 (counters, stale check), O8, C1, C2, watch, the keep-alive thread, `sample-database` (tables) | SELECT, INSERT, DELETE, CREATE, DROP, ALTER, CREATE DATABASE, DROP DATABASE, PROCESS, CREATE VIEW, SHOW VIEW on `*.*` |
-| owner | The workspace admin SQL user, or the Portal identity in a notebook | P1 account creation and the password policy, P2 and P3 pipelines, routines and the write-capable accounts, O2, O3, O5 functions and aggregates, O7 views and procedures, O9, O10, O11, C3, C4, lockout, `cleanup` (C5), `engine-capture`, `sample-database` (views and routines) | Everything the admin has. Named statements: STOP/START/CREATE/ALTER PIPELINE, DETACH, ATTACH, GRANT, REVOKE, KILL, CREATE USER, DROP USER, DROP DATABASE, CREATE VIEW, CREATE FUNCTION, CREATE AGGREGATE, CREATE PROCEDURE |
+| runner | A SQL account the kit creates in P1 and drops in C4 | P2, P3 (tables), O4, O5 (database and tables), O6, O7 (counters, stale check), O8, C1, C2, the keep-alive thread | SELECT, INSERT, DELETE, CREATE, DROP, ALTER, CREATE DATABASE, DROP DATABASE, PROCESS, CREATE VIEW, SHOW VIEW on `*.*` |
+| owner | The workspace admin SQL user, or the Portal identity in a notebook | P1 account creation and the password policy, P2 and P3 pipelines, routines and the write-capable accounts, O2, O3, O5 functions and aggregates, O7 views and procedures, O9, O10, O11, C3, C4, `cleanup` (C5), `tools/enginecapture.py` | Everything the admin has. Named statements: STOP/START/CREATE/ALTER PIPELINE, DETACH, ATTACH, GRANT (P1), KILL QUERY (the DETACH escalation), CREATE USER, DROP USER, DROP DATABASE, CREATE VIEW, CREATE FUNCTION, CREATE AGGREGATE, CREATE PROCEDURE |
 
 P2 checks the runner's privileges against the list above by reading `information_schema.USER_PRIVILEGES` for the runner's grantee string (`'user'@'host'`, built from `CURRENT_USER()`) and reports each missing one by name. It also attempts to detect whether the runner can ATTACH or DETACH (the branching documentation says CREATE DATABASE or ATTACH DATABASE permission allows branches); the result is recorded, not assumed.
 
@@ -151,13 +145,12 @@ Everything outside `customer/` is static. A run never writes outside `customer/`
   README.md                     step-based guide; the flow diagram comes first
   pyproject.toml                package metadata, console script s2rebuild = s2rebuild.cli:main
   requirements.txt              PyMySQL, PyYAML, openpyxl (nothing else)
-  MANIFEST.json                 written by `s2rebuild bundle`: path, bytes, sha256 of every static file
   certs/singlestore_bundle.pem  public SingleStore CA chain (not a secret)
   docs/
     flow.mmd, flow.svg, flow.png
     ARCHITECTURE.md             this file
     STEPS.md                    the step catalog in full (inputs, outputs, gate, restart notes)
-    CONFIG.md                   every config key and every CLI flag (flag table generated by `s2rebuild docs-flags`)
+    CONFIG.md                   every config key and every CLI flag
     CODE-GUIDE.md               module map, data flow, decisions you can change
     LESSONS.md                  Helios facts and run lessons, generic wording
     COVERAGE.md                 the coverage grid: what the kit migrates and what it does not
@@ -169,15 +162,16 @@ Everything outside `customer/` is static. A run never writes outside `customer/`
     config.example.yaml         placeholder names only
     env.example.sh
   s2rebuild/                    the package (section 10)
+  tools/
+    enginecapture.py            the engine capture for the test fake (development tool, not a kit command)
   notebooks/
     owner-steps.template.ipynb  filled by `s2rebuild owner-notebook`
   tests/                        offline tests, fake connection, no network
-    engine/helios-<version>.json  the engine capture the fake is built from (s2rebuild engine-capture)
-  customer/                     the only writable folder; excluded from the bundle by default
+    engine/helios-<version>.json  the engine capture the fake is built from (tools/enginecapture.py)
+  customer/                     the only writable folder
     config.yaml
     env.sh                      optional exports; no secret inside
-    baseline.json               written by `s2rebuild calibrate`
-    bundle-denylist.txt         words that must not appear in the static tree
+    bundle-denylist.txt         words that must not appear in the static tree (tests/test_style.py reads it)
     runs/<run_id>/
       <database>/journal.sqlite
       <database>/inventory/     inventory JSON, tables.csv, definitions
@@ -186,10 +180,9 @@ Everything outside `customer/` is static. A run never writes outside `customer/`
       <database>/reports/       profile.xlsx, final.xlsx, run-report.md
       logs/                     one log per step invocation, redacted
       owner-steps.ipynb         generated notebook (optional)
-      rehearsal/                P5: timings.json, the rehearsal's own journal and the folders of the rehearsed steps
 ```
 
-Local working files that are not part of the kit (`.venv/`, `dist/`, editor and assistant settings) are excluded from the bundle: built-in patterns in `bundle.py` plus the patterns listed in `customer/bundle-exclude.txt`.
+Git is the distribution: the kit ships as a clone at a release tag.
 
 ## 7. Configuration
 
@@ -200,67 +193,58 @@ kit: s2rebuild
 version: 1
 customer: "Example Customer"            # label for reports; never used in the static tree
 run:
-  mode: production                      # production asks at O1 for a replacement or retained name left out; test applies the defaults
+  mode: production                      # production asks at O1 for a replacement or retained name left out below; test applies the defaults
 workspace:
   host: svc-xxxx-dml.svc.singlestore.com
   port: 3306
   ca_file: certs/singlestore_bundle.pem
-  compute_size: S-16                    # label stored with the baseline record
-  # id: <workspace id>                 # the owner notebook checks it; the Management API read at P2 needs it
-  # management_api_key_keychain: s2rebuild-api  # optional: P2 reads state (must be ACTIVE), auto-suspend and autoscale
+  compute_size: S-16                    # label for the reports
+  # id: <workspace id>                 # optional; the owner notebook checks it before running anything
   keepalive_minutes: 15                 # SELECT 1 on its own connection every N minutes while a step runs; 0 disables
 connections:
   runner:
     user: s2rebuild_runner
-    password_keychain: s2rebuild-runner # filled by account-sql --execute at P1; or password_env: S2REBUILD_RUNNER_PASSWORD
+    password_keychain: s2rebuild-runner # filled by account-sql --execute at P1 (generated to the policy); or password_env: S2REBUILD_RUNNER_PASSWORD
   owner:                                # optional; when present, admin steps execute with gates
     user: admin
     password_keychain: s2rebuild-owner  # asked for at P1 when the item is missing
 databases:
   - source: acme_orders_db
-    replacement: acme_orders_db_rebuild_20261101    # default <source>_rebuild_<YYYYMMDD>; left out, O1 asks in production mode
-    retained: acme_orders_db_retained_20261101      # default <source>_retained_<YYYYMMDD>; left out, O1 asks in production mode
+    replacement: acme_orders_db_rebuild_20261101    # default <source>_rebuild_<YYYYMMDD>
+    retained: acme_orders_db_retained_20261101      # default <source>_retained_<YYYYMMDD>
     layout: { partitions: 32, sub_partitions: 512 }
     time_column_candidates: [_modified_time, updated_at, modified_at, _created_time, created_at, event_date]
     app_managed_pipelines: []           # pipelines the application drops and recreates itself
     tables:                             # optional per-table overrides
       big_events: { concurrency: 1, chunk_rows: 50000000 }
-window:
+window:                                 # optional; recorded at O1 and printed on the plan sheet, no step stops on it
   start: 2026-11-01T05:00:00Z
   end: 2026-11-01T13:00:00Z
-  restart_allowance_minutes: 60         # time the customer needs to restart on the original
-  buffer_minutes: 30
 freeze:
-  mode: readonly                        # readonly | lockout
   detach_wait_seconds: 120              # how long a plain DETACH may wait before the kit escalates
   detach_kill: true                     # DETACH DATABASE ... KILL when writers block the detach
   write_probe: true
-  quiet_max_age_seconds: 60             # Path B: S1 of O10 needs a quiet lockout pass no older than this
-  lockout:
-    connections: 6                      # held connections, to reach several aggregators
-    interval_seconds: 5                 # seconds between passes; 0 = tight loop
-    protected_accounts: []              # never revoked; runner and owner are always protected
-    quiet_passes_required: 3
 copy:
   workers: 4
   chunk_rows: 10000000
   min_rows_for_chunking: 5000000
-  max_buckets_per_table: 32
-  table_concurrency: auto               # auto | 1 to workers; auto caps a table at half the workers above 8 and serializes it after its first lock wait
+  max_buckets_per_table: 64            # each bucket is one CRC32(key) MOD B scan of the source; more buckets, shorter chunks
+  table_concurrency: auto               # auto | 1 to workers; auto serializes a table after its first lock wait
   lock_probe_timeout_seconds: 5
   lock_retry_seconds: 120
   max_attempts: 3
   max_lock_waits: 10                    # lock waits of one chunk, then it fails with the fresh-table command
-  max_consecutive_failures: 6           # circuit breaker: chunk failures in a row, then O6 ends INCOMPLETE
+  max_consecutive_failures: 6           # circuit breaker: chunk failures in a row stop new chunks; one retry round follows
   progress_seconds: 60
+  slow_chunk_minutes: 30                # the progress line names a chunk running longer than this
 verify:
   tiers: [count, newest, fingerprint]
-  sessions: null
-  full_fingerprint_max_rows: 1000000000
-  sample_percent: 5
-  fingerprint_budget_minutes: null
+  sessions: null                        # tier 3 connections; null = copy.workers
+  full_fingerprint_max_rows: 1000000000 # a table with more rows is sampled: a contiguous range on its sort key or time column
+  sample_percent: 5                     # the percent of the value span the sample covers; 100 = full fingerprint
+  fingerprint_budget_minutes: null      # elapsed deadline for tier 3; tables after it are recorded not fingerprinted; null = none
   fingerprint_groups: 64
-  value_columns: 4
+  value_columns: 4                      # value hash: the time column plus up to this many supported columns
 pipelines:
   route: kit                            # kit = the kit replays at O9; customer = the customer runs the placeholder file
   credentials_keychain: { KAFKA: s2rebuild-pipelines-kafka, S3: s2rebuild-pipelines-s3 }  # filled by the P3 prompt, read at O9 first
@@ -269,11 +253,9 @@ pipelines:
   per_pipeline_env: {}                  # pipeline_name: ENV_VAR, overrides the source-type entry
   retention_hours: { KAFKA: 168 }       # stated by the customer per source type, for the plan sheet
 estimate:
-  baseline: customer/baseline.json      # optional; defaults ship in s2rebuild/estimate.py
-  band_percent: 15
-  scale_up_cap: 1.0                     # credit for more leaf cores than the baseline's: 1.0 none, up to 4.0
+  rows_per_hour: 2400000000             # rows copied per hour over a whole O6 on this workspace; the estimate is rows / this
 closeout:
-  retain_days: 90                       # C2 records retain_until_utc; cleanup --delete refuses before it; minimum 1
+  retain_days: 90                       # C2 records retain_until_utc; cleanup --delete refuses before it; minimum 1, under 90 noted on the plan sheet
   flexible_parallelism: 0.5             # SET GLOBAL query_parallelism_per_leaf_core; null to skip
 paths:
   runs_dir: customer/runs
@@ -282,7 +264,7 @@ objects:
     ignore: []                          # routines left behind on purpose (the default migrates every captured routine): name or database.name
 ```
 
-Validation rules (config.py): identifiers match `^[A-Za-z0-9_]+$`; source, replacement and retained differ; window end is after start; `freeze.mode` is one of the two values; `copy.workers` is 1 to 32; `copy.table_concurrency` is auto or an integer from 1 to `copy.workers`; `objects.routines.ignore` entries are routine or database.routine names; unknown keys are an error (typos must not pass silently).
+Validation rules (config.py): identifiers match `^[A-Za-z0-9_]+$`; source, replacement and retained differ; window end is after start; `copy.workers` is 1 to 32; `copy.table_concurrency` is auto or an integer from 1 to `copy.workers`; `objects.routines.ignore` entries are routine or database.routine names; unknown keys are an error (typos must not pass silently).
 
 Environment variables: `S2REBUILD_CONFIG` (default config path), `S2REBUILD_RUN` (default run id), the password variables named in the config, the pipeline credential variables named in the config. Nothing else.
 
@@ -299,29 +281,20 @@ Prompts: every question the kit asks goes through `prompts.ask` (a hidden value 
 | Command | Step | What it does |
 |---|---|---|
 | `check` | P2 | Connect as runner (and owner if configured), privilege check, engine version, source layout and STORAGE_ID, target names free, compute cores × 8 ≥ partitions; refused until P1 is recorded, rerun any time |
-| `account-sql` | P1, C4 | Print the CREATE USER and GRANT block for the runner account; `--execute` runs it with the owner profile: the owner password is asked for when its Keychain item is missing, the password policy is printed, the runner password is generated to it and stored in its Keychain item (with `password_env` the variable is used as it is); `--drop` prints or executes the DROP USER block and the zero-privilege check. No password is ever printed |
-| `profile` | P3, O4 | Inventory, sizes, estimate, profile Excel for the configured databases; `--step O4` is the freeze capture with drift and the copy plan. Refused until the step's preconditions passed; a passed step is captured again only with `--redo`; `--dry-run` writes the `-dry-run` workbook only, nothing under `inventory/`. `--exact-counts` runs COUNT(*) per table; `--baseline FILE` overrides the throughput baseline; `--all-databases` adds a system sheet with every database in the workspace (partitions, sub-partitions, tables, rows, GiB, pipelines, estimated copy time) for ranking and sequencing |
-| `plan` | P4 | Print the plan sheet: window, abort deadline, freeze path, step owners, estimate with bands |
-| `rehearse` | P5 | Create throwaway databases (synthetic, or `--from-database NAME --percent P` for a sample of a real database) and run O2 to O11, C1 and C3 on them through the real steps: freeze, copy with a kill test mid-chunk and the resume, verify, pipelines created stopped (`--start-pipelines` starts them at O11), switch with a rollback by the original record and the switch again, release, C1, the two-entry gate of C3; cleanup by record. `--keep` leaves them for inspection |
-| `sample-database SOURCE NAME --percent P` | P5, lab | Build NAME as a sample of SOURCE: the layout of SOURCE, every table by LIKE, one `INSERT ... SELECT` per table with `CRC32(<key>) MOD 100 < P`, reference and small tables whole (a reference table of a READ ONLY source through a staging table), then the views and routines with the owner profile; `--tables LIST` fills only the named tables |
-| `run` | O1 to O11 | Run steps in order in the most recent run, skipping passed steps; `--from ID`, `--to ID`, `--redo`; `--new` starts a new run at O1; `--no-rehearsal NOTE` lets O1 start without rehearsal evidence; `--mode production|test` overrides `run.mode` for the names O1 asks for; O4 is captured inside the run (`profile --step O4` stays for a rerun) |
-| `step ID` | any | Run one step; `--no-rehearsal NOTE` lets O1 start without rehearsal evidence; `--mode` as for `run`; `--idle-workload NOTE` lets C1 pass on a live database that is idle on purpose |
+| `account-sql` | P1, C4 | Print the CREATE USER and GRANT block for the runner account (`--drop --execute` records the C4 gate with the privileges before and after); `--execute` runs it with the owner profile: the owner password is asked for when its Keychain item is missing, the password policy is printed, the runner password is generated to it and stored in its Keychain item (with `password_env` the variable is used as it is); `--drop` prints or executes the DROP USER block and the zero-privilege check. No password is ever printed |
+| `profile` | P3, O4 | Inventory, sizes, estimate, profile Excel for the configured databases; `--step O4` is the freeze capture with drift and the copy plan. Refused until the step's preconditions passed; a passed step is captured again only with `--redo`; `--dry-run` writes the `-dry-run` workbook only, nothing under `inventory/`. `--exact-counts` runs COUNT(*) per table; `--all-databases` adds a system sheet with every database in the workspace (partitions, sub-partitions, tables, rows, GiB, pipelines, copy time at `estimate.rows_per_hour`) for ranking and sequencing |
+| `plan` | P4 | Print the plan sheet: window, step owners, the estimate line, pipelines, the workspace questions |
+| `run` | O1 to O11 | Run steps in order in the most recent run, skipping passed steps; `--from ID`, `--to ID`, `--redo`; `--new` starts a new run at O1; `--workspace NOTE` records the answers to the workspace questions at O1; `--mode production|test` overrides `run.mode` for the names O1 asks for; O4 is captured inside the run (`profile --step O4` stays for a rerun). On macOS it starts `caffeinate -i -w <pid>` so the Mac stays awake while it runs |
+| `step ID` | any | Run one step (with `caffeinate` on macOS, as `run`); `--workspace NOTE` and `--mode` as for `run`; `--idle-workload NOTE` lets C1 pass on a live database that is idle on purpose |
 | `gate ID --pass|--fail --note TEXT [--evidence FILE] [--override NOTE]` | admin, human, decision; C1 and C2 | Record a gate result for a step the kit did not execute itself; warns when earlier steps are not passed; the P1 gate starts the first run; C1 and C2, python steps, only with `--override NOTE`, journaled as a `gate_override` event |
 | `status` | any | Board of steps per database: status, start, end, evidence path |
-| `watch` | O3, C1 | Writer watch: non-runner sessions with statement kind every `--interval` seconds (default 5) and count deltas on the largest `--tables N` every 60 seconds |
-| `quiet-proof` | O3 Path B | Pipelines none Running, no non-idle session from any other account, counts and newest timestamps stable across two samples one minute apart; writes `freeze_time` to the journal |
-| `lockout` | O3 Path B | Snapshot grants, revoke write privileges from every write-capable account, hold N connections, kill loop until `--until`, stop file or Ctrl-C; `--hold` keeps the loop running after the quiet proof until S1 of O10 has run. Owner profile required |
-| `owner-sql ID` | O2, O3, O9, O10, O11, C3, C4 | Print the ordered SQL block for a step with its precondition queries and expected results as comments; also written under `owner-sql/` (O3 Path A also writes the re-entry block, `O3-reentry.sql`; `O10 --rollback` writes `O10-rollback.sql` and `O10-rollback-retained.sql`; C3 writes `C3-repair.sql`) |
+| `owner-sql ID` | O2, O3, O9, O10, O11, C3, C4 | Print the ordered SQL block for a step with its precondition queries and expected results as comments; also written under `owner-sql/` (O3 also writes the re-entry block, `O3-reentry.sql`; `O10 --rollback` writes `O10-rollback.sql` and `O10-rollback-retained.sql`) |
 | `owner-notebook` | any admin step | Generate `owner-steps.ipynb` for the run with one cell per admin step; `--dry-run` prints what it would write |
 | `mark-recopy TABLE [--bucket N]` | O6 to O8 | Mark buckets for re-copy; the next copy run deletes and re-inserts them; O6, O7 and O8 go back to pending |
 | `abandon` | before O10 | Back out a run stopped before the switch: the source READWRITE again as its recorded record, the replacement dropped only as its recorded record and only while no branch was made from it, the run closed; prints the block, `--execute --note TEXT` runs it with the owner profile under the copy lock |
 | `pause` / `resume` | O6 | Create or remove the stop file; running chunks finish, no new chunk starts |
 | `report` | C2 | Final Excel and Markdown for a run (also produced automatically at the end of O8 and C1) |
-| `calibrate` | C2 | Fit the throughput model from a journal and write `customer/baseline.json`, with the leaf cores P2 recorded |
 | `cleanup` | C5 | List what the run left after C3 (the live record, the retained record, its size, `retain_until_utc`); `--delete NAME` deletes the retained copy for good: refused before the date, on a wrong name, a differing record or C3 not passed; the name typed again at the prompt (`--yes` does not apply); DETACH, the record's own syntax read write, a record check, DROP, each behind its check. Owner profile required |
-| `engine-capture` | tests | Write `tests/engine/helios-<version>.json`, the record of the engine the test fake is built from: the version, the column list of every `information_schema` view the kit reads, the ATTACH forms and id shapes as patterns, the PASSWORD_ variables, the runner-versus-owner counts on `--fixture-database NAME`, the hand-maintained error table carried over; `--out FILE`. Owner profile, reads only |
-| `bundle` | packaging | Write MANIFEST.json, check the denylist, zip the static tree to `dist/`; `--verify ZIP` unzips to a temp folder and compares hashes; `--include-customer` adds `customer/` |
-| `docs-flags` | docs | Print the flag table as Markdown for `docs/CONFIG.md` |
 
 Exit codes: 0 done; 1 refused or configuration error; 2 incomplete, rerun to resume; 3 verification mismatch; 4 gate pending or failed (human action needed).
 
@@ -329,26 +302,26 @@ Exit codes: 0 done; 1 refused or configuration error; 2 incomplete, rerun to res
 
 One SQLite journal per run per database: `customer/runs/<run>/<db>/journal.sqlite`, WAL mode, synchronous FULL. Tables:
 
-- `meta(key, value)`: source, replacement, retained, storage IDs, run id, config hash (written at O1, compared by every command; section 3), freeze_time, window, deadline, the last lockout pass (lockout_last_pass_utc, lockout_last_pass_quiet), and the switch and release times (switched_utc, set at S3 or by a passed O10 gate on the hand route, release_started_utc, released_utc, rollback_started_utc, app_writes_seen).
+- `meta(key, value)`: source, replacement, retained, storage IDs, run id, config hash (written at O1, compared by every command; section 3), freeze_time, window, the grants reference O3 took for C1, and the switch and release times (switched_utc, set at S3 or by a passed O10 gate on the hand route, release_started_utc, released_utc, rollback_started_utc, app_writes_seen).
 - `steps(step_id, status, started_utc, ended_utc, note, evidence_path)`: status is pending, running, passed, failed, skipped.
 - `tables(...)`: as in the reference runner plus `size_gib`, `time_column`, `key_kind`, `unique_key_lock_risk`, `concurrency`, `verified_at_utc`, `recopy_epoch` (0, plus one per re-copy mark).
 - `chunks(...)`: as in the reference runner (state, rows_inserted, timings, attempts, error, counts).
 - `verification(table_name, tier, result, source_value, target_value, sql_source, sql_target, detail, checked_utc, epoch, predicate, sample_rows)`: epoch is the table's `recopy_epoch` when the row was written; predicate and sample_rows are the WHERE text and the source rows of a sampled fingerprint, NULL for a full one.
 - `attachments(role, database_name, storage_id, compute_id, attach_type, observed_utc)`: role is source, replacement, retained, live.
-- `grants_snapshot(grantee, privileges_json, captured_utc, restored_utc)`.
+- `grants_snapshot(grantee, privileges_json, captured_utc, restored_utc)`: kept in the schema; no step writes it since the lockout was removed.
 - `pipelines(name, state_at_capture, source_type, source_location, target, batch_interval, duplicate_handling, definition_file, app_managed, created_in_replacement_utc, started_utc, state_after_start)`.
 - `pipeline_offsets(pipeline_name, source_partition, phase, earliest, latest, loaded, successful, observed_utc)`: phase is capture, before_start or after_release.
 - `events(ts, kind, detail)`.
 
-The `schema_version` row in meta is 4. Version 2 added `tables.recopy_epoch` and `verification.epoch`; version 3 added the branch record columns of `attachments` (`record_type`, `attach_syntax`, `is_detached`); version 4 added `verification.predicate` and `verification.sample_rows`. A writable open upgrades an older journal in place, and the read-only opens of `status` and `owner-sql` read it as it is (every table at epoch 0 with no row at that epoch; attachment rows with the record fields unknown; verification rows as full fingerprints). Rows written before version 2 carry no epoch, so S0 asks for a new O8 on them.
+The `schema_version` row in meta is 4, the one schema. A journal belongs to one run, so it is never upgraded: a journal with another version, or without every table, is refused before anything is written with "This journal was written by an older kit; finish or abandon that run with the kit version that started it." (R7).
 
 Restart rules:
 
-- Every step is idempotent against the journal: O5 skips tables already created and verified; O6 resumes pending, started and failed chunks; O7 skips views that exist; O9 skips pipelines that exist in the replacement; O3 and O10 compute their position from the live attachment state, not from memory (O3 resumes after the READONLY attachment, or at the ATTACH after a stop between DETACH and ATTACH); O10 continues from any of its positions (S2b after a failed proof, S4 after S3); C3 issues reads and the write probe, and its repair block runs a statement only while the record it names is the recorded one (an original already dropped is not attached again, a replacement already gone is not dropped again); C5 drops the retained copy only while its name holds the recorded record and the name was typed twice.
+- Every step is idempotent against the journal: O5 skips tables already created and verified; O6 resumes pending, started and failed chunks; O7 skips views that exist; O9 skips pipelines that exist in the replacement; O3 and O10 compute their position from the live attachment state, not from memory (O3 resumes after the READONLY attachment, or at the ATTACH after a stop between DETACH and ATTACH); O10 continues from any of its positions (S2b after a failed proof, S4 after S3); C3 issues reads and the write probe only; C5 drops the retained copy only while its name holds the recorded record and the name was typed twice.
 - `run --from ID` re-enters at a step. Steps before it must be `passed` or `skipped`, otherwise the kit refuses with the list of what is missing and how each passes, earliest first: `gate ID --pass` for a step a person records, `run --from` for a python step (one `run --from` covers consecutive outage steps), `step ID` for a P or C python step. `run --from` stops at a gate a person has not recorded, so the order is the order to follow. The preconditions are checked before the "already passed" skip, so a passed step behind a reopened step is refused like any other; a dry run only reports them.
 - A re-copy invalidates the evidence built on the copy. `mark_recopy` (the `mark-recopy` command, the O7 stale check and an O8 mismatch) writes in one transaction: the buckets to `failed` with attempts 0, the table's `verified_at_utc` and `target_count` cleared, its `recopy_epoch` plus one, and O6, O7 and O8 set to `pending` when they passed, with a note naming the table. A crash part way leaves the journal as it was. The O7 re-copy marks O6 passed again once a round ends with every chunk done and the count proof all matching. A fresh-table load (`step O6 --fresh-table TABLE`) replaces the whole table, so before its first statement it makes the same journal write without the chunk rows: `verified_at_utc` and `target_count` cleared, `recopy_epoch` plus one, O7 and O8 back to `pending`. `mark-recopy` checks every selected journal (the bucket exists, the switch has not begun) before it marks any. Just before each of these journal writes, the O10 block files already written for the database are rewritten so each starts with a STOP (10.17).
-- Once the switch may have begun, the copy is what the live name resolves to and `target_count` is what the rollback proof compares. From then on `mark_recopy` and O6, O7 and O8 refuse before any write: O10 passed, the go decision, an O10 gate (pass or fail), a switch observed (`switch_observed`: in the evidence of a refused `gate O10 --pass`, or in the position O10 reads before its go decision when it is not "not started"), `switched_utc`, a rollback or release time, or a retained or live attachment in the journal. The kit route records the go decision before its first statement, so an O10 that stopped before it (a Ctrl-C at the typed-name prompt, a lost owner connection, a stop during S0) issued nothing and does not count, even when it is `failed` or still `running`. Every O10 refusal that issues nothing comes before the go: S0 (on Path B with the last lockout pass), the S1 before-checks (read once just before the go and again before the DETACH), and the go transaction itself, so such a refusal leaves the re-copy open. A gate is how a person reports a hand or notebook O10, so every O10 gate counts. While O10 waits for its go it holds the copy lock (10.9). The go decision, a re-copy mark and the start of O6, O7 or O8 each read the switch state in their own `BEGIN IMMEDIATE` journal transaction: the go (`record_go`) reads the journal part of S0 again and refuses while O6, O7 or O8 is running, and a mark or a start refuses once the go is recorded. Of a re-copy and a go, whichever commits second is refused. A passed O6 to O8 is still skipped, so a `run` over them reaches O11. A new copy is a new run.
-- `pause` creates `<journal>.stop`; `resume` removes it. The abort deadline from the window has the same effect as `pause`. The window is optional; without it there is no deadline.
+- Once the switch may have begun, the copy is what the live name resolves to and `target_count` is what the rollback proof compares. From then on `mark_recopy` and O6, O7 and O8 refuse before any write: O10 passed, the go decision, an O10 gate (pass or fail), a switch observed (`switch_observed`: in the evidence of a refused `gate O10 --pass`, or in the position O10 reads before its go decision when it is not "not started"), `switched_utc`, a rollback or release time, or a retained or live attachment in the journal. The kit route records the go decision before its first statement, so an O10 that stopped before it (a Ctrl-C at the typed-name prompt, a lost owner connection, a stop during S0) issued nothing and does not count, even when it is `failed` or still `running`. Every O10 refusal that issues nothing comes before the go: S0, the S1 before-checks (read once just before the go and again before the DETACH), and the go transaction itself, so such a refusal leaves the re-copy open. A gate is how a person reports a hand or notebook O10, so every O10 gate counts. While O10 waits for its go it holds the copy lock (10.9). The go decision, a re-copy mark and the start of O6, O7 or O8 each read the switch state in their own `BEGIN IMMEDIATE` journal transaction: the go (`record_go`) reads the journal part of S0 again and refuses while O6, O7 or O8 is running, and a mark or a start refuses once the go is recorded. Of a re-copy and a go, whichever commits second is refused. A passed O6 to O8 is still skipped, so a `run` over them reaches O11. A new copy is a new run.
+- `pause` creates `<journal>.stop`; `resume` removes it. The window is optional and informational; no step stops on it.
 - A step whose handler raises anything other than a refusal (a driver error, Ctrl-C) is recorded `failed` with the exception type and error number, never the message, and the exception propagates. Only a killed process leaves a step `running`.
 - Never hard-stop the copy. A killed client leaves a prepared transaction holding a leaf table lock for 15 to 20 minutes. The README says this in the O6 section, once.
 
@@ -364,13 +337,15 @@ Load, validate and default the YAML. Expose `Config`, `DatabaseSpec`, `Window`. 
 
 `Secrets` reads passwords from Keychain or env; `Redactor` masks values in text; `connect(profile)` returns a PyMySQL connection with TLS (CA verified), autocommit, long read timeout, DictCursor. `Session` wraps a connection with the write guard for the active step (section 10.4).
 
-`KeepAlive` is the kit's own keep-alive: while a step runs (`steps.run_step` starts it before the handler and stops it at the end), a daemon thread sends `SELECT 1` on its own runner connection every `workspace.keepalive_minutes` (default 15; 0 disables), behind a read guard, so auto-suspend sees activity during a long statement or a wait (fact 41). The connection opens at the first ping, so a short step opens none; a ping that fails is logged and the next one opens a new connection. Nothing runs between commands: the plan (P4) records whether auto-suspend is off for the window or a notebook job of the customer runs the same query.
+Every connection gets TCP keep-alive on its socket right after the connect (`enable_tcp_keepalive`: `SO_KEEPALIVE`, the first probe after 60 seconds idle with `TCP_KEEPALIVE` on macOS or `TCP_KEEPIDLE` on Linux, then every 30 seconds with `TCP_KEEPINTVL`). An INSERT that runs for hours leaves its socket idle, and a NAT or firewall on the path closes an idle flow; I5 lost 9 chunks that way with 2013 `[Errno 60] Operation timed out` and no node event (fact 46, B1). A connect that fails on name resolution (`Errno 8`, `nodename nor servname`) or a refused connection is tried 3 more times, 20 seconds apart, then fails with the host name in the message (B5); every other connect error is raised at once.
+
+`KeepAlive` is the kit's own keep-alive: while a step runs (`steps.run_step` starts it before the handler and stops it at the end), a daemon thread sends `SELECT 1` every `workspace.keepalive_minutes` (default 15; 0 disables), behind a read guard, so auto-suspend sees activity during a long statement or a wait (fact 41). Each ping opens a fresh runner connection and closes it (B4), so an aggregator restart between pings costs nothing and a short step opens none; a ping that fails is logged with the error number and the redacted message. Nothing runs between commands: the plan (P4) records whether auto-suspend is off for the window or a notebook job of the customer runs the same query.
 
 `is_driver_error` names a connection reset: driver errors 2003 (unreachable), 2004 (no socket), 2006 (gone away) and 2013 (lost during a statement). A step that ends in one is recorded failed with `interrupted_note` as before; the command line then prints one plain line ("a node reset the connection; the workspace may be scaling or restarting; rerun the step") and exits 2, and the raw error, redacted, goes to the log file only (`Log.file`).
 
 ### 10.3 journal.py
 
-The schema in section 9 plus migrations keyed by a `schema_version` row (version 1 from the reference runner, version 2 for the re-copy epoch, 3 for the branch records, 4 for the sampling columns). All writes go through one lock. `init_plan`, `check_plan`, chunk state transitions, step transitions, verification rows, attachment rows.
+The schema in section 9 with one `schema_version` row; an older journal is refused, never upgraded (R7). All writes go through one lock. `init_plan`, `check_plan`, chunk state transitions, step transitions, verification rows, attachment rows.
 
 ### 10.4 steps.py
 
@@ -399,29 +374,11 @@ Copy plan: per table, key kind (keyed when a non-null PRIMARY or unique key exis
 
 ### 10.6 estimate.py (P3, P4)
 
-Throughput model fitted on the reference run. Per chunk of a table with N rows split into B buckets:
+One line: the rows of the plan divided by `estimate.rows_per_hour`, the rows per hour a whole O6 measured on the workspace of the run (default 2.4 B, I5 on an S-8 at 4X with 12 workers; 3.0 to 3.5 B while every worker ran). P3, P4 and the O4 capture print it, the profile workbook and the table tabs show it, and the final report sets it against the actual copy time and rows per hour, which is the figure to configure for the next run. No step stops on the estimate. The simulation, the bands, the window fit, the abort deadline, the baseline file and `calibrate` were removed in the final pass (R5): no time gate used them.
 
-```
-chunk_seconds = chunk_overhead_s + scan_s_per_row * N + insert_s_per_row * N / B
-table_worker_seconds = B * chunk_seconds
-reference_seconds = chunk_overhead_s + scan_s_per_row * N + 2 * insert_s_per_row * N   (a reference table: one chunk, two inserts)
-```
+Bucket count: `B = 1` when `N < min_rows_for_chunking`, otherwise `B = min(max_buckets_per_table, ceil(N / chunk_rows))`. Every bucket is one `CRC32(key) MOD B` scan of the source, so worker time grows with B × N. The cap is 64 (B2): at 32, I5's store_sales chunks held 135 M to 270 M rows, so one failure cost hours and the tail ran on few workers; 64 halves the chunk time for twice the scans. V1 records the per-chunk time to adjust it once.
 
-Default constants (reference run, 4 workers, S-16 compute at 2x, October 24, 2026): `scan_s_per_row = 7.62e-8` (13.1 million rows scanned per second per worker), `insert_s_per_row = 2.95e-6` (339 thousand rows inserted per second per worker), `chunk_overhead_s = 2`. The fit reproduces the reference run's 23,867 worker-seconds exactly and predicts the largest table within 1 percent. Row width did not change the fit (tables with 5 and 257 columns both landed within 10 percent).
-
-Scaled to the workspace: the baseline records the leaf cores of the workspace it was fitted on (`leaf_cores`, with the compute label; the shipped constants carry none). P2 records the leaf cores of the workspace in hand (`MV_NODES`, leaf nodes times cores per node) in the preflight record, and the estimate scales the scan and insert rates by `leaf_cores / baseline.leaf_cores` (`estimate.scale_factor`): downward without limit, upward at most `estimate.scale_up_cap` (default 1.0, no credit for a larger workspace until a performance test shows more; fact 42). A baseline without leaf cores, or a P2 that could not read them, scales nothing and the planning line says why. The chunk overhead is not scaled. The abort deadline's longest chunk (O1, O6, O7) uses the same scaled rates.
-
-Wall time: a list-scheduling simulation. Chunks sorted by table rows descending, W workers, per-table concurrency limits honored, each chunk takes its modeled seconds. The result is the expected copy wall time. Fixed allowances are added per step from config defaults: freeze 10 minutes, create replacement 2 minutes, count proof `2 * sum(N) * scan_s_per_row` (serial: one count on each side of every table, not divided by the workers), fingerprints up to the budget, post-copy 5 minutes, pipelines 1 minute per pipeline, switch 10 minutes, release 10 minutes.
-
-Bands: low = expected times (1 minus band/100), high = expected times (1 plus band/100), band default 15 percent.
-
-Window fit: `abort_deadline = window.end minus restart_allowance minus buffer minus longest_chunk_seconds`. The fit is one per run, not per database: `estimate.combine` adds the copy wall time and the allowances of every configured database in sequence and takes the largest longest chunk, and `run_fit` places that in the window (`profile`, `plan` and the O4 capture, which takes the other databases from their newest capture). The plan sheet and the profile print expected, low and high finish times against the deadline, say fits or does not fit (with "the run: N databases in sequence" for more than one), and end with the planning line: the rate scale against the baseline's leaf cores and the note that from 4 to 12 workers the reference workspace stayed near 3.5 B rows per hour.
-
-`calibrate` (C2) refits the two constants by least squares from a journal (duration against table rows and rows inserted per chunk, first-pass chunks only) and writes `customer/baseline.json` with the constants, workers, compute label, the leaf cores P2 recorded, run id and date. `profile` uses the baseline file when present.
-
-Bucket count: `B = 1` when `N < min_rows_for_chunking`, otherwise `B = min(max_buckets_per_table, ceil(N / chunk_rows))`. The cap matters: every hash-bucket chunk scans the whole table, so worker time grows with B × N. On the reference run the 134-bucket largest table spent 77 percent of its time scanning; a cap of 32 cuts the modeled copy from 105 to 61 minutes of wall time.
-
-### 10.7 freeze.py (O3, Path A)
+### 10.7 freeze.py (O3)
 
 Admin statements, each behind a query:
 
@@ -435,44 +392,38 @@ Admin statements, each behind a query:
 
 Re-entry: before it prints a block, the handler reads the position, with the owner session when the owner profile is configured (as O10 does), otherwise as the runner. The source attached READONLY on the recorded STORAGE_ID resumes at step 6. No database under the source name, with the recorded source record (name, STORAGE_ID, COMPUTE_ID) at `IS_DETACHED = 1` in `MV_CLOUD_BRANCHES`, is a stop between steps 2 and 4. The kit reads the source's own record, never the first row of its storage, which a branch of the source or a dropped record of an earlier attempt shares (facts 27 and 35). The re-entry block then checks the source record detached, no database named source and none named replacement, and runs steps 4 to 7. It never detaches again. The replacement check tells this stop from the switch (S1) and a rollback (R1), which also detach the source but come after O5 created the replacement. Any other position gets the whole block, whose first checks refuse a source name held by another STORAGE_ID. A read of `MV_CLOUD_BRANCHES` that fails is logged with the identity and the error number and also gets the whole block, which stops at its first check. A dry run opens no connection, so it prints the whole block and logs that a real rerun starts at the ATTACH after a stop between DETACH and ATTACH. The re-entry block goes through the normal admin flow (printed to `owner-sql/O3-reentry.sql`, executed with the owner profile or left for the gate), and the notebook O3 cell runs it when the whole block stops at its first check with no rows. `owner-sql O3` opens no session, so it writes both blocks, `O3.sql` and `O3-reentry.sql`. The whole block opens with a note that names the re-entry block, so a hand run that stops at the first check has already read it. The re-entry block's own checks (storage detached, source and replacement names free) refuse a database attached under the source name after the position read, or one the reading account cannot see.
 
-The application keeps read access during Path A. Its writes fail from O3 until S3 of O10: S3 attaches the replacement READWRITE under the live name, so from that moment the application can write again, before O11 starts a pipeline or restores a grant. The customer's named owner decides at O1 whether the application stays stopped until O11, and the kit records the answer in the O1 gate note. That decision is what protects a rollback: a stopped application leaves the live branch unchanged. The zero-change proof (10.13) runs before R1, but it detects changed row counts and active writers only. An UPDATE, or a DELETE followed by an INSERT, keeps the count and passes the proof, and R1 would then discard it. A rollback after S3 is therefore safe only when the O1 note records that the application stayed stopped.
+The application keeps read access during the freeze. Its writes fail from O3 until S3 of O10: S3 attaches the replacement READWRITE under the live name, so from that moment the application can write again, before O11 starts a pipeline. The customer's named owner decides at O1 whether the application stays stopped until O11, and the kit records the answer in the O1 gate note. That decision is what protects a rollback: a stopped application leaves the live branch unchanged. The zero-change proof (10.13) runs before R1, but it detects changed row counts and active writers only. An UPDATE, or a DELETE followed by an INSERT, keeps the count and passes the proof, and R1 would then discard it. A rollback after S3 is therefore safe only when the O1 note records that the application stayed stopped.
 
-Bridge: if the detach cannot complete and `KILL` is not acceptable, run `lockout` for the minutes the detach needs, then stop it once ATTACH_TYPE is READONLY.
+When the detach cannot complete and `KILL` is not acceptable (`freeze.detach_kill: false`), the step stops: stop the writers, then rerun it.
 
-### 10.8 lockout.py (O3, Path B)
+### 10.8 Removed: the lockout (former Path B)
 
-Loaded only when `freeze.mode = lockout` or `s2rebuild lockout` is called. Owner profile required. Path B is single database in this pass: with `freeze.mode = lockout` and more than one configured database, `check` (P2), `run` and `step` O3, O10 and O11 refuse, and so do `s2rebuild lockout` (with or without `--hold`, before any snapshot or REVOKE) and the print and notebook routes (`owner-sql` O3, O10 and O11, `owner-notebook`, and `gate` O3, O10 and O11 `--pass`), because each database journal holds its own snapshot and the first O11 would give a global grant back while another database is still frozen.
-
-1. Enumerate write-capable accounts from the inventory query in 10.5 at run time (never from a config guess). Exclude runner, owner and `protected_accounts`.
-2. Snapshot each grantee's privileges to `grants_snapshot` and to `grants-snapshot.json` (0600).
-3. Revoke the write privileges of each grantee in one REVOKE per grantee, exactly the privileges it holds from the write list: INSERT, UPDATE, DELETE, ALTER, CREATE, DROP, INDEX, LOCK TABLES, EXECUTE, CREATE PIPELINE, ALTER PIPELINE, DROP PIPELINE, START PIPELINE, CREATE VIEW, DROP VIEW, ALTER VIEW. Global revokes affect every database the account uses; the plan sheet says so and O1 records the customer's acceptance.
-4. Loop: on each pass, (a) re-read the grantees' privileges and log `GRANT RESTORED BY ANOTHER SESSION` with the privilege names if any write privilege reappeared, then revoke again; (b) on every held connection list sessions from those accounts touching the database (`PROCESSLIST` with DB = source or INFO LIKE the source name) and `KILL CONNECTION` each one from the connection that saw it, since KILL reaches only the aggregator the killer is connected to; thread ids are per aggregator, so the same id seen on two connections is two sessions and each connection kills its own; (c) print one line per pass with threads seen, killed, gone, elapsed; (d) write the pass time and whether it was quiet to journal meta (`lockout_last_pass_utc`, `lockout_last_pass_quiet`). A pass is marked not quiet before its first REVOKE or KILL, so a stop in the middle never leaves an earlier quiet pass as the last one. A kill-only pass is never quiet. Passes are `interval_seconds` apart (default 5).
-5. Stop on `--until`, the stop file or Ctrl-C. The loop never restores grants; O11 does, from the snapshot, and verifies `USER_PRIVILEGES` equals the snapshot afterwards.
-6. Quiet proof: after `quiet_passes_required` passes with zero threads, run `quiet-proof`; the O3 gate passes when it passes.
-7. Hold: with `--hold` the loop keeps passing after the quiet proof (re-revoke, kill, one line and one journal record per pass) until S1 of O10 has run, or `--until`, the stop file or Ctrl-C. Before every pass it reads the S1 signal: the shared journal records the S1 DETACH (O10 runs in another process), or the source name is no longer attached on the recorded source STORAGE_ID (a hand or notebook S1). S1 on Path B refuses unless the last pass was quiet within `freeze.quiet_max_age_seconds` (default 60), so the hold must run through O10. S0 and the go decision check that pass too, so a missing, stale or not quiet pass refuses before the go and the re-copy stays open. Once S1 has run the pass no longer counts: the hold ends, and a rerun of O10 behind S1 resumes without one. The printed forward block and the notebook O10 cell, used without the owner profile and so without a hold, check the live state instead: one check per account and scope of the snapshot not given back that it holds none of those write privileges (expect n = 0), before the DETACH. The kit runs the same checks in S1.
-
-The same loop ships as a cell in the generated owner notebook, because a Portal notebook session can see sessions a terminal connection cannot.
+Revoke-and-kill with a quiet proof was the fallback freeze. It failed on the reference night (run lesson 1) and was removed in the final pass (R4) with `lockout.py`, `watch.py`, the `lockout`, `watch` and `quiet-proof` commands, the revoke and restore of `grants.py`, the notebook lockout cell and the Path B checks of the switch. `grants.py` keeps the snapshot and the compare that the O3 reference and C1 use. An online path, if one is wanted, is a different design (change capture), not Path B.
 
 ### 10.9 copy.py (O5, O6)
 
-The reference runner, generalized. Kept as is: hash-bucket predicates (`CRC32(<key_expr>) MOD B = k`), server-side `INSERT INTO replacement.t (cols) SELECT cols FROM source.t WHERE <predicate>`, journal state transitions committed before each statement, delete-then-reinsert reconciliation for started or failed buckets, write guard, redactor, abort deadline, stop file, lock-wait requeue without consuming an attempt, `--retry-failed`, definition diff that ignores only the AUTO_INCREMENT counter, refusal when the replacement holds rows the journal cannot explain, count proof at the end.
+The reference runner, generalized. Kept as is: hash-bucket predicates (`CRC32(<key_expr>) MOD B = k`), server-side `INSERT INTO replacement.t (cols) SELECT cols FROM source.t WHERE <predicate>`, journal state transitions committed before each statement, delete-then-reinsert reconciliation for started or failed buckets, write guard, redactor, stop file, lock-wait requeue without consuming an attempt, `--retry-failed`, definition diff that ignores only the AUTO_INCREMENT counter, refusal when the replacement holds rows the journal cannot explain, count proof at the end.
 
 Changes:
 
 - Names, layout, workers, chunk sizes and the inventory path come from config and the run, not constants. The expected table count check becomes "matches the capture".
 - `CREATE DATABASE <replacement> PARTITIONS <p> SUB_PARTITIONS <s>` from `databases[].layout`; durability flags must equal the source.
-- Bucket cap `max_buckets_per_table` (10.6).
-- Scheduler: a queue per table; a worker takes the next chunk from the first table whose in-flight count is below its limit. `table_concurrency: auto` allows parallel chunks per table, at most half the workers when there are more than 8 (so the rest copy the next tables), and sets the limit to 1 for a table after its first lock wait (error 1205); an integer `copy.table_concurrency` caps every table at that many chunks in flight and skips the serialization; per-table `concurrency` in config overrides either. P2 prints the configured workers beside the leaf cores it read and the worker count the baseline was fitted with.
+- Bucket cap `max_buckets_per_table` (10.6, default 64).
+- Scheduler: a queue per table; a worker takes the next chunk from the first table whose in-flight count is below its limit. `table_concurrency: auto` allows parallel chunks per table, at most half the workers when there are more than 8 (so the rest copy the next tables), and sets the limit to 1 for a table after its first lock wait (error 1205); an integer `copy.table_concurrency` caps every table at that many chunks in flight and skips the serialization; per-table `concurrency` in config overrides either. P2 prints the configured workers beside the leaf cores it read.
 - Lock probe before a chunk on a table that had a lock wait: the reconciliation DELETE runs with `lock_wait_timeout = lock_probe_timeout_seconds`; 1205 means still locked, the chunk is parked for `lock_retry_seconds` and other tables continue.
 - Lock wait cap: the `max_lock_waits`-th lock wait of one chunk in a run fails the chunk as an attempt. Its error and the O6 note name `s2rebuild step O6 --fresh-table <t>`, so a lock that never clears ends O6 INCOMPLETE on its own.
-- Error 1997 ("transaction was already in its commit phase", a node replaced under the chunk by autoscale, fact 40) is a transient: the chunk is marked failed, so its rows are reconciled by the DELETE before the re-insert, and goes to the back of its table's queue without consuming an attempt (`Runner.requeue_transient`, journal event `transient`).
-- Circuit breaker: `copy.max_consecutive_failures` (default 6) chunk failures with no success between them (1997 counted, lock waits not) stop new chunks; the running ones finish, the log and the journal (event `breaker`) carry "chunks are failing in a row; nodes may be restarting, see MV_EVENTS; rerun with --retry-failed when the workspace is steady", and O6 ends INCOMPLETE (exit 2) with that note.
+- A failed chunk (error 1997 when a node is replaced under it, fact 40; 2013 when its connection drops, fact 46) is marked failed, so its rows are reconciled by the DELETE before the re-insert, and queues last in its table. The 1997 requeue without an attempt was removed (K6): autoscale is off for the window.
+- Circuit breaker: `copy.max_consecutive_failures` (default 6) chunk failures with no success between them (lock waits not counted) stop new chunks; the running ones finish, and the log and the journal (event `breaker`) carry "chunks are failing in a row; nodes may be restarting, see MV_EVENTS; rerun with --retry-failed when the workspace is steady".
+- Retry round (B3): at the end of the pass, unless the operator stopped it (Ctrl-C or the stop file), the runner resets the breaker and runs every chunk left once more. The chunks that failed in the pass go last in their table and start no sooner than `RETRY_DELAY_SECONDS` (20 minutes) after their failure, since a client cut off mid INSERT leaves a transaction that may still commit (fact 12; journal event `retry_round`). A chunk that fails in the retry round is not retried again; a breaker there ends O6 INCOMPLETE (exit 2) with the message above. A chunk stopped by its lock-wait cap is not retried: its way out is the fresh-table load. This is the automatic form of the `run --from O6 --retry-failed` that finished I5.
+- Journal failure (K3): when the failure of a chunk cannot be journaled, the pool stops and the worker raises; the chunk stays `started`, so the next run reconciles it, and the journal never disagrees with the server. No retry round follows.
+- Count mismatch (K1): when the count proof differs on a table, the O6 note and the log list that table's buckets with a `reconcile_delete` event in the journal and the way back: wait until 20 minutes after the interruption, then `s2rebuild mark-recopy TABLE --bucket N` and `s2rebuild run --from O6`.
 - Interrupt: the first Ctrl-C stops new chunks while the running ones finish. A later Ctrl-C prints that a hard stop needs kill and that the leaf lock then holds 15 to 20 minutes; the wait goes on, so no worker dies mid INSERT and O6 ends recorded.
 - Copy lock: `<journal>.lock`, an exclusive file lock that carries the holder's pid and purpose. O6 takes it, an O7 re-copy round takes it from its mark through its copy, `mark-recopy` takes it before it checks any journal, and O10 takes it from S0 through S4 (the gate included). A held lock refuses with the holder named. The lock goes with its process, so a holder that died blocks nothing.
 - Reference tables (`CREATE REFERENCE TABLE` in the captured definition): Helios runs an INSERT into a reference table on the master aggregator, where a READ ONLY source has no master instance (error 1777). Each chunk of a reference table runs `CREATE TABLE <replacement>.<t>__stage (<the copy columns from the definition, no keys>)`, `INSERT INTO <t>__stage SELECT ... FROM <source>.<t> WHERE <predicate>`, `INSERT INTO <replacement>.<t> SELECT ... FROM <t>__stage`, `DROP TABLE <t>__stage` (also after a failure), and refuses when the two row counts differ. A staging table left by an interrupted attempt is dropped first. The stage name must be at most 64 characters and not a planned table.
-- Fresh-table fallback, `s2rebuild step O6 --fresh-table TABLE`: `CREATE TABLE <replacement>.<t>__fresh LIKE <replacement>.<t>` (the definition O5 checked), one `INSERT ... SELECT` without predicate, count check, `DROP TABLE <replacement>.<t>`, `ALTER TABLE <replacement>.<t>__fresh RENAME TO <t>`, journal event `manual_load`. Used when a target table is locked by a prepared transaction the kit cannot see. Refused past the abort deadline, while the stop file exists, and when the fresh name is over 64 characters or a planned table. The journal meta `fresh_table:<t>` records the fresh name before the CREATE (`creating`), after the count check (`loaded`, with the table's `recopy_epoch`) and, in one transaction with the chunk rows, `done`. A rerun reuses only the fresh table it recorded; an unrecorded table under that name refuses. A rerun after the rename only writes the journal rows, while `<t>` holds the source count, its `recopy_epoch` is the recorded one and a bucket of it is not done. After a re-copy mark, or a copy run that finished its buckets, the `loaded` record is stale and the rerun loads the table again. A missing `<t>` is never recreated from the source: the load resumes from a complete recorded fresh table or refuses. The chunk rows carry `error = 'fresh-table load'`, so `calibrate` skips them.
-- Progress line every `progress_seconds`: tables done, buckets done, failed, rows done, rows per hour, projected finish against the deadline.
-- Timings per chunk and per table are kept for the report and for `calibrate`.
+- Fresh-table fallback, `s2rebuild step O6 --fresh-table TABLE`: `CREATE TABLE <replacement>.<t>__fresh LIKE <replacement>.<t>` (the definition O5 checked), one `INSERT ... SELECT` without predicate, count check, `DROP TABLE <replacement>.<t>`, `ALTER TABLE <replacement>.<t>__fresh RENAME TO <t>`, journal event `manual_load`. Used when a target table is locked by a prepared transaction the kit cannot see. Refused while the stop file exists, and when the fresh name is over 64 characters or a planned table. The journal meta `fresh_table:<t>` records the fresh name before the CREATE (`creating`), after the count check (`loaded`, with the table's `recopy_epoch`) and, in one transaction with the chunk rows, `done`. A rerun reuses only the fresh table it recorded; an unrecorded table under that name refuses. A rerun after the rename only writes the journal rows, while `<t>` holds the source count, its `recopy_epoch` is the recorded one and a bucket of it is not done. After a re-copy mark, or a copy run that finished its buckets, the `loaded` record is stale and the rerun loads the table again. A missing `<t>` is never recreated from the source: the load resumes from a complete recorded fresh table or refuses. The chunk rows carry `error = 'fresh-table load'`.
+- Progress line every `progress_seconds`: tables done, buckets done, failed, rows done, rows per hour, projected finish, and `slow=table/bucket minutes` for every chunk running longer than `copy.slow_chunk_minutes` (default 30; K7). The read timeout stays as it is.
+- Keep awake (K2): on macOS `run` and `step` start `caffeinate -i -w <pid>`, so the Mac does not sleep while the command runs.
+- Timings per chunk and per table are kept for the report.
 
 ### 10.10 verify.py (O7 stale check, O8)
 
@@ -544,9 +495,9 @@ O2 (admin): `STOP PIPELINE <source>.<name>` for every pipeline in one block (ski
 
 O9 (admin): a source type still without credentials is asked for first, as at P3 (a blank answer skips it); then for each expected pipeline not already in the replacement: replace `<<CREDENTIALS>>` with the SQL literal from the Keychain item (`pipelines.per_pipeline_keychain`, then `credentials_keychain` by source type), else from the environment variable (per-pipeline entry first, then the source-type entry); refuse when no value is held anywhere or a redaction marker remains; `USE <replacement>`; execute the CREATE PIPELINE (pipelines are created stopped) and every server-supplied `ALTER PIPELINE ... SET OFFSETS` statement. Never START. Gate: count equals the capture minus `app_managed_pipelines`, zero Running, and for every pipeline and partition the committed offset in the replacement equals the O2 capture. The block carries one check per pipeline and partition, so the notebook and hand routes hold the same gate as the kit's compare after the block.
 
-O11 (admin): the retention check above, then `START PIPELINE <live>.<name>` for each in one block. Pipelines in the retained copy stay stopped. With the owner profile the kit records `release_started_utc` inside the open owner session, once the retention check and every check of the block ahead of the first statement passed, just before that statement (or just before it is found already done). An O11 that stops part way (a lost reply after a GRANT or a START, a crash) therefore still refuses a rollback. An O11 that stops before its first statement (a failed check, a lost connection, an owner session that cannot open) records nothing and leaves the rollback open; `released_utc` follows once the block and the grants compare passed, or when the gate is recorded by hand.
+O11 (admin): the retention check above, then `START PIPELINE <live>.<name>` for each in one block. Pipelines in the retained copy stay stopped. With the owner profile the kit records `release_started_utc` inside the open owner session, once the retention check and every check of the block ahead of the first statement passed, just before that statement (or just before it is found already done). An O11 that stops part way (a lost reply after a START, a crash) therefore still refuses a rollback. An O11 that stops before its first statement (a failed check, a lost connection, an owner session that cannot open) records nothing and leaves the rollback open; `released_utc` follows once the block passed, or when the gate is recorded by hand.
 
-C1 (runner; owner for the pipeline views and grants): `PIPELINES` state Running for every expected pipeline; `PIPELINES_OFFSETS` LATEST_LOADED_OFFSET advancing between two samples one minute apart for pipelines whose source has new data; `PIPELINES_ERRORS` since the start time empty, or listed by pipeline with the first error message; app-managed pipelines present again, a missing one fails C1. C1 passes only when it saw application writes on the live database (a foreign session, counts moving between the samples, or counts that differ from the copy), or when the operator states that the live database is idle on purpose (`--idle-workload NOTE`, journaled as an `idle_workload` event). Without the owner profile the pipeline and grants checks are recorded as not checked, no owner profile (a `c1_not_checked` event and the step note), and they do not hold C1. The final workbook's Pipelines and Pipeline offsets tabs are written from this.
+C1 (runner; owner for the pipeline views and grants): a writer sample, three `PROCESSLIST` reads of the non-idle sessions on the live database from accounts other than the runner and the owner (it needs PROCESS and refuses without it); the counts of the largest tables twice; the grants compared with the reference O3 took; `PIPELINES` state Running for every expected pipeline; `PIPELINES_OFFSETS` LATEST_LOADED_OFFSET advancing between two samples one minute apart for pipelines whose source has new data; `PIPELINES_ERRORS` since the start time empty, or listed by pipeline with the first error message; app-managed pipelines present again, a missing one fails C1. C1 passes only when it saw application writes on the live database (a foreign session, counts moving between the samples, or counts that differ from the copy), or when the operator states that the live database is idle on purpose (`--idle-workload NOTE`, journaled as an `idle_workload` event). Without the owner profile the pipeline and grants checks are recorded as not checked, no owner profile (a `c1_not_checked` event and the step note), and they do not hold C1. The final workbook's Pipelines and Pipeline offsets tabs are written from this.
 
 Credential values live only in the process environment and in the statement sent to the server. The redactor masks them in logs. The notebook cell asks for them in a variable and deletes it after use.
 
@@ -556,7 +507,7 @@ A state machine driven by `MV_CLOUD_ATTACHED_DATABASES`, `MV_CLOUD_BRANCHES` and
 
 Identity is the record. `switch.identify(session, name)` joins the `MV_CLOUD_BRANCHES` rows of a name (not dropped) with its `MV_CLOUD_ATTACHED_DATABASES` row into one record: DATABASE_NAME, STORAGE_ID, ATTACH_TYPE (create, resume or pitr), COMPUTE_ID (the COMPUTEID inside ATTACH_SYNTAX for a detached record, else LATEST_COMPUTE_ID), ACCESS (READONLY or READWRITE, None when detached), IS_DETACHED, IS_DROPPED, END_VERSION and ATTACH_SYNTAX. The key is name, STORAGE_ID and ATTACH_TYPE (`records_match`; the type is compared where both sides know it); COMPUTE_ID is recorded for the report and never compared, because every attach changes it (fact 44); an unknown name or STORAGE_ID never matches, and ROW_NUMBER is never read because it changes between listings. The journal's `attachments` table stores the whole record per role (source, replacement, retained, live; schema version 3, older rows readable with the record fields unknown). Every DETACH, ATTACH and DROP of the machine, the rollback, C3 and abandon runs behind a comparison of the live record with the recorded one and refuses with both records printed when they differ. The printed blocks and the notebook carry the same comparison as checks on `MV_CLOUD_BRANCHES` (the name holds a record of the recorded STORAGE_ID and ATTACH_TYPE) beside the attachment checks, and record both rows, which complete each other in the journal.
 
-After a switch the two storages carry four records, and that is why a STORAGE_ID alone names nothing: on the original storage the original's own record (create, detached at S1, attachable at its milestone, recorded with its ATTACH_SYNTAX) and the retained copy (resume of that record, attached READONLY under the retained name); on the replacement storage the replacement (create, attached READWRITE under its own name) and the live database (pitr branch of the replacement, attached READWRITE under the live name). Writes are not shared between records on one storage, and a DETACH or DROP of a parent leaves its branch attached with its rows. Those four records exist between S3 and S4 of the switch; S2b drops the original's own record (its data lives on in the retained copy, fact 32) and S4 the replacement (the live branch is independent of it), so after O10 the Portal lists two entries: the live database and the retained copy. A switch made by an older kit left all four, and C3 carries the repair for it.
+After a switch the two storages carry four records, and that is why a STORAGE_ID alone names nothing: on the original storage the original's own record (create, detached at S1, attachable at its milestone, recorded with its ATTACH_SYNTAX) and the retained copy (resume of that record, attached READONLY under the retained name); on the replacement storage the replacement (create, attached READWRITE under its own name) and the live database (pitr branch of the replacement, attached READWRITE under the live name). Writes are not shared between records on one storage, and a DETACH or DROP of a parent leaves its branch attached with its rows. Those four records exist between S3 and S4 of the switch; S2b drops the original's own record (its data lives on in the retained copy, fact 32) and S4 the replacement (the live branch is independent of it), so after O10 the Portal lists two entries: the live database and the retained copy.
 
 Recorded before the switch: the source record (P2, P3 and O3) and the replacement record (O5). S1 records the original's detached record, S2 the retained record, S3 the live record; S2b and S4 are `switch_statement` events, and the listing before and after the switch a `switch_listing` event.
 
@@ -564,8 +515,8 @@ Forward sequence, each statement preceded by its check and followed by a recorde
 
 | # | Check before | Statement | Check after |
 |---|---|---|---|
-| S0 | O8 passed, with every step before it passed; every planned table verified after `freeze_time` and after its newest chunk, at its current `recopy_epoch` (10.10); O9 passed; time remaining at or above the switch allowance; on Path B before S1, the last lockout pass quiet within `freeze.quiet_max_age_seconds`; operator typed the live name (or `--yes`); the S1 before-checks pass once | none | go recorded (`record_go`: the journal part of S0 and the Path B last pass read again, and O6 to O8 not running, in the same journal transaction); the listing of both storages recorded; the copy lock is held from S0 through S4 |
-| S1 | source attached with the recorded STORAGE_ID and the recorded record (READONLY on Path A; READWRITE with a passed quiet proof on Path B, every write privilege the lockout took still revoked (one check per account and scope, expect n = 0), and the last lockout pass in the journal quiet within `freeze.quiet_max_age_seconds`; the printed block carries the journal part as a note and checks the privileges live); no non-idle session on it other than ours; the original storage and the replacement storage each hold one entry (IS_DROPPED = 0), the recorded record, since a branch of either shares its STORAGE_ID (fact 27) | `DETACH DATABASE <source>;` (with `KILL` after `detach_wait_seconds` when `detach_kill` is true) | no attached database named source; the original record (by name and record, never the first row of its storage) is detached with its ATTACH_SYNTAX (the AT MILESTONE form) recorded |
+| S0 | O8 passed, with every step before it passed; every planned table verified after `freeze_time` and after its newest chunk, at its current `recopy_epoch` (10.10); O9 passed; operator typed the live name (or `--yes`); the S1 before-checks pass once | none | go recorded (`record_go`: the journal part of S0 read again, and O6 to O8 not running, in the same journal transaction); the listing of both storages recorded; the copy lock is held from S0 through S4 |
+| S1 | source attached READONLY with the recorded STORAGE_ID and the recorded record; no non-idle session on it other than ours; the original storage and the replacement storage each hold one entry (IS_DROPPED = 0), the recorded record, since a branch of either shares its STORAGE_ID (fact 27) | `DETACH DATABASE <source>;` (with `KILL` after `detach_wait_seconds` when `detach_kill` is true) | no attached database named source; the original record (by name and record, never the first row of its storage) is detached with its ATTACH_SYNTAX (the AT MILESTONE form) recorded |
 | S2 | no attached database named retained | `ATTACH DATABASE <source> AS <retained> READ ONLY STORAGEID <source_sid>;` | retained attached READONLY as a resume record of the original (PREV_DATABASE_NAME the source); one small table count equals the journal's source count; record the retained record |
 | S2b | no attached database named source; the original record is detached with the recorded syntax | the original record's own ATTACH_SYNTAX (attaches it read write under the live name) | the recorded original record attached READWRITE; zero-change proof: COUNT on the three smallest non-empty tables equals the journal's source counts; no foreign non-idle session |
 | S2b | the proof passed | `DROP DATABASE <source>;` | the original record IS_DROPPED = 1; no attached database named source; the original storage holds one entry (IS_DROPPED = 0), the retained record; one small table count in the retained copy |
@@ -575,49 +526,46 @@ Forward sequence, each statement preceded by its check and followed by a recorde
 
 A failed zero-change proof at S2b stops with the original attached read write under the live name, which is the rollback state (`ORIGINAL_ATTACHED`); the operator reconciles, then `step O10` continues at the proof, or stays on the original. Exposure: for the seconds of S2b the live name resolves to the original read write; the O1 decision that the application is stopped and the session check cover it. Dropping the replacement at S4 does not affect the live branch (branches are independent of their parent, facts 6 and 32).
 
-Write boundary: on Path A the application can write from S3, not from O11, because S3 attaches the live name READWRITE. A rollback is safe only while the live branch is unchanged since the copy. The zero-change proof below detects changed row counts and active writers only, not an update that keeps the count, so it backs up the O1 decision that the application stays stopped and does not replace it.
+Write boundary: the application can write from S3, not from O11, because S3 attaches the live name READWRITE. A rollback is safe only while the live branch is unchanged since the copy. The zero-change proof below detects changed row counts and active writers only, not an update that keeps the count, so it backs up the O1 decision that the application stays stopped and does not replace it.
 
 Rollback, only before O11 starts releasing writers, by record:
 
 | # | Check before | Statement | Check after |
 |---|---|---|---|
-| R1 | the zero-change proof: `COUNT(*)` of every planned table on the live name equals the journal `target_count`; no pipeline in state Running on the live name; for every grantee and scope of the lockout snapshot not given back yet, none of those write privileges held; the S1 session query shows no foreign non-idle session on it; then the attached database named source is the recorded live record (name, STORAGE_ID, ATTACH_TYPE pitr, COMPUTE_ID) | `DETACH DATABASE <source>;` | no attached database named source |
+| R1 | the zero-change proof: `COUNT(*)` of every planned table on the live name equals the journal `target_count`; no pipeline in state Running on the live name; the S1 session query shows no foreign non-idle session on it; then the attached database named source is the recorded live record (name, STORAGE_ID, ATTACH_TYPE pitr, COMPUTE_ID) | `DETACH DATABASE <source>;` | no attached database named source |
 | R2a (before S2b ran) | the original record is detached and is the recorded one, with the ATTACH_SYNTAX S1 recorded (read by its record: the storage also lists the retained record, in no fixed order) | the original record's own ATTACH_SYNTAX (`ATTACH DATABASE <source> AT MILESTONE '...' STORAGEID <source_sid> COMPUTEID <source_cid>`) | source attached READWRITE as the recorded original record; the retained copy stays attached read only |
 | R2b (after S2b ran) | the original record is dropped; the retained name holds the recorded retained record READONLY; no attached database named source | `ATTACH DATABASE <retained> AS <source> STORAGEID <original_sid>;` | source attached READWRITE on the original storage as a pitr record of the retained copy; the three smallest tables equal the journal; the retained copy unchanged |
-| R2c (when R2b is refused on the READ ONLY attachment) | the retained name holds the recorded record READONLY | `DETACH DATABASE <retained>;` then the detached retained record's own ATTACH_SYNTAX with `AS <source>` | source attached READWRITE as a resume record of the retained record; counts equal the journal; the report says the retained name is gone and the data is under the live name |
 
-The live test I0b decides between R2b and R2c; the kit tries R2b and takes R2c on the refusal (`switch.read_only_refusal`). No rollback step drops the retained copy. The detached live record left by R1 shares the replacement's STORAGE_ID and stays recoverable by its own ATTACH_SYNTAX; it is never deleted in the Portal by STORAGE_ID. The printed rollback blocks (`O10-rollback.sql` with R2a, `O10-rollback-retained.sql` with R2b and R2c) carry the recorded syntax as R2a once S1 ran; before that the block carries a milestone placeholder and says to generate it again after S1. After the first new write on the live branch, rollback is a new freeze and a reconciliation. The kit refuses the rollback, before any statement, when:
+I0b proved R2b (fact 35); the R2c fallback was never needed and was removed in the final pass (R10). No rollback step drops the retained copy. The detached live record left by R1 shares the replacement's STORAGE_ID and stays recoverable by its own ATTACH_SYNTAX; it is never deleted in the Portal by STORAGE_ID. The printed rollback blocks (`O10-rollback.sql` with R2a, `O10-rollback-retained.sql` with R2b) carry the recorded syntax as R2a once S1 ran; before that the block carries a milestone placeholder and says to generate it again after S1. After the first new write on the live branch, rollback is a new freeze and a reconciliation. The kit refuses the rollback, before any statement, when:
 
 1. O11 started releasing writers according to the journal: `release_started_utc` or `released_utc` is recorded, or O11 is running or passed.
 2. C1 recorded application writes (`app_writes_seen`).
-3. The zero-change proof fails: a planned table holds another row count than the copy, a planned table has no recorded `target_count` (a re-copy clears it until the O6 count proof records it again), a pipeline runs on the live name, a write privilege the lockout took is back, or a foreign non-idle session is active on the live name. The refusal says "reconcile first" and lists what differs.
+3. The zero-change proof fails: a planned table holds another row count than the copy, a planned table has no recorded `target_count` (a re-copy clears it until the O6 count proof records it again), a pipeline runs on the live name, or a foreign non-idle session is active on the live name. The refusal says "reconcile first" and lists what differs.
 4. The position is unknown.
 
 Only the kit records `release_started_utc`. A hand or notebook O11 leaves the journal unaware that the release began, so reason 1 alone cannot cover it. The pipeline and privilege checks of the proof read the live state instead: an O11 that started a pipeline or gave a privilege back refuses the rollback on every route, even with a block written before O11.
 
-Behind S3 (source detached, retained attached, original dropped, or R1 already done) nothing is attached under the live name, so no proof is needed and the kit starts at R2. The printed and notebook rollback blocks carry the same proof as checks before R1: one COUNT check per planned table with the journal count, the pipeline check, one privilege check per lockout grantee and scope, and the session check. The hand and notebook routes therefore refuse the same way. The notebook runs a block in order and cannot skip, so behind S3 its first proof check stops the cell before any statement; the operator finishes by hand from the R2a or R2b check of the printed block.
+Behind S3 (source detached, retained attached, original dropped, or R1 already done) nothing is attached under the live name, so no proof is needed and the kit starts at R2. The printed and notebook rollback blocks carry the same proof as checks before R1: one COUNT check per planned table with the journal count, the pipeline check and the session check. The hand and notebook routes therefore refuse the same way. The notebook runs a block in order and cannot skip, so behind S3 its first proof check stops the cell before any statement; the operator finishes by hand from the R2a or R2b check of the printed block.
 
 Positions (`Position.state`, read from the attachment and branch views, never from memory): not started, source detached, retained attached, original attached read write (S2b attached it, or R2a put it back), original record dropped, switched, switch complete (the replacement gone), live branch detached (R1 ran), rolled back through the retained copy, unknown. `forward` continues from each of the first seven; a rollback through the retained copy ends the switch.
 
-C3 End state (`ownersql.endstate_block`) records the same gate again after C2, plus a write refused on the retained name, and carries the repair for a switch made without S2b and S4 (`SwitchMachine.repair_end_state`, the sequence of fact 34): detach the live name, the original record by its syntax, check, drop, the live record by its syntax, the replacement dropped by its record, the gate. Each part is decided from the live state, so a repair that stopped part way resumes, and the live name is detached only while the original record still needs its attach; with the original dropped and the replacement name free there is nothing to repair, and it refuses before any statement. C5 (`cleanup.py`) is the customer's delete of the retained copy after `retain_until_utc`: DETACH, the record's own syntax read write, a record check, DROP, each behind its check, after the name is typed twice.
+C3 End state (`ownersql.endstate_block`) records the same gate again after C2, plus a write refused on the retained name; it issues reads only, and a third entry refuses with the listing (the repair for a switch made by an older kit was removed in the final pass, R11). C5 (`cleanup.py`) is the customer's delete of the retained copy after `retain_until_utc`: DETACH, the record's own syntax read write, a record check, DROP, each behind its check, after the name is typed twice.
 
 Print mode writes the whole forward block, with the checks as comments and expected results, as one file. Execute mode runs it statement by statement and stops at the first failed check with the observed state printed.
 
-### 10.14 grants.py (Path B, O11)
+### 10.14 grants.py (O3, C1)
 
-Snapshot, revoke, restore and compare, as used by 10.8. Restore issues one GRANT per grantee with exactly the privileges revoked, then compares `USER_PRIVILEGES` to the snapshot and lists any difference. The comparison also runs in C1 even for Path A, to catch a changed grant during the window.
+The read-only reference of other accounts' write privileges per scope: O3 records it after the freeze (`grants.record_reference`) and C1 compares the live privileges with it (`grants.compare`). Nothing is revoked or granted.
 
-### 10.15 watch.py
+### 10.15 Removed: watch.py
 
-`watch`: every `--interval` seconds (default 5) read `PROCESSLIST` and print non-runner, non-idle sessions on the database with user, host, statement kind and the first 100 characters of the statement. Every 60 seconds, read `COUNT(*)` on the largest `--tables` (default 10) and print deltas. Needs PROCESS; the kit refuses to start the watch without it, instead of running blind.
-
-`quiet-proof`: pipelines none Running; no non-idle session from any account except runner and owner; counts and newest timestamps on the largest 10 tables identical across two samples 60 seconds apart. Writes `freeze_time`.
+The writer watch and the quiet proof served Path B (R4). C1 keeps its writer sample in `pipelines.py` (`writer_sample`).
 
 ### 10.16 report_xlsx.py and report_md.py
 
 Profile workbook (P3) and final workbook (C2, also written at O8 and C1). openpyxl. Sheet names cut to 31 characters, invalid characters replaced, uniqueness by numeric suffix, and a name map on the Summary tab.
 
-Summary tab: run id, customer label, database, window, freeze path, every step with status and start and end times, totals (tables, the reference tables, rows, GiB, copy wall time, rows per hour, GiB per hour), verification summary (the latest row per tier and table, so a match after a mismatch counts as a match; the sampled tables and the latest sampled fingerprint per table with its predicate and rows; tables without a time column; tables not fingerprinted), pipelines (count, state, the pipelines not recreated because no credentials were given at the prompt), accounts (write-capable list and Path B actions), switch result (the four records by role), end state (the live entry and the retained entry with name, STORAGE_ID, ATTACH_TYPE, COMPUTE_ID and ATTACH_SYNTAX from the journal attachments; the entries of both storages as O10 recorded them before and after the switch and as C3 recorded them before and after its gate), retention (the retained record, its size, `switched_utc`, `retain_until_utc` and the C5 command), workspace (the state, autoscale and auto-suspend P2 observed; the answer and the accepted autoscale O1 recorded), open items, estimate against actual (final workbook only). A value the journal lacks reads "not recorded".
+Summary tab: run id, customer label, database, window, freeze path, every step with status and start and end times, totals (tables, the reference tables, rows, GiB, copy wall time, rows per hour, GiB per hour), verification summary (the latest row per tier and table, so a match after a mismatch counts as a match; the sampled tables and the latest sampled fingerprint per table with its predicate and rows; tables without a time column; tables not fingerprinted), pipelines (count, state, the pipelines not recreated because no credentials were given at the prompt), accounts (the write-capable list), switch result (the four records by role), end state (the live entry and the retained entry with name, STORAGE_ID, ATTACH_TYPE, COMPUTE_ID and ATTACH_SYNTAX from the journal attachments; the entries of both storages as O10 recorded them before and after the switch and as C3 recorded them before and after its gate), retention (the retained record, its size, `switched_utc`, `retain_until_utc` and the C5 command), workspace (the answers O1 recorded), open items, estimate against actual (final workbook only). A value the journal lacks reads "not recorded".
 
 Per-table tab, top block: table, storage type, copy path ("reference table, copied through a staging table", or INSERT ... SELECT by hash bucket), key kind, column count, rows (source, target, match), size GiB, copy (buckets, chunk rows, worker seconds, wall start and end, rows per second, lock waits, re-copies), tier 1 result, tier 2 (time column, source and target newest), tier 3 (groups compared, mismatches, sampled or full, the sample predicate and rows, SQL for the source side, SQL for the target side), the verification history (every row the journal holds for the table in order, with its tier, time, epoch, both values and the predicate of a sampled row; the Summary shows only the latest), attributes (primary key, unique keys, shard key, sort key, hash and other indexes with names, AUTO_INCREMENT column and counter action, computed columns), callouts (fresh-table load, counter set, serialized after lock wait); the Views tab gives each view its original definer, whether O7 created it and the definer it got; the Routines tab gives each captured routine its kind, original definer, whether O5 or O7 created it, the definer it got and whether `objects.routines.ignore` left it out. Bottom block: the CREATE TABLE statement, one source line per row.
 
@@ -625,13 +573,13 @@ Pipelines tab (both workbooks), one row per pipeline: name, state at capture, so
 
 Pipeline offsets tab (both workbooks), one row per pipeline and source partition: recorded EARLIEST_OFFSET, LATEST_OFFSET, LATEST_LOADED_OFFSET and LATEST_SUCCESSFUL_OFFSET at capture; the final workbook adds the same four at O11 before start and at C1, and the gap column (recorded loaded offset minus EARLIEST_OFFSET at O11; negative means messages were lost to retention).
 
-Profile workbook: same table tabs with current state only, plus per-table estimated minutes (low, expected, high) and the chunk plan; the Summary tab carries the window fit, the abort deadline, the pipeline count by source type and the credential route.
+Profile workbook: same table tabs with current state only, plus per-table minutes at `estimate.rows_per_hour` and the chunk plan; the Summary tab carries the estimate line, the pipeline count by source type and the credential route.
 
 Markdown run report: the Summary tab as text (the end state, retention and workspace sections included), the Views and Routines tabs as one line per object with its definer, the timeline from `events`, and the evidence index (file paths).
 
 ### 10.17 ownersql.py and notebook.py
 
-`ownersql.py` builds the ordered statement list for every admin step from the journal state (names, STORAGE_IDs, pipeline files, the planned tables with their copied row counts and the lockout snapshot for the rollback proof). With the owner profile it executes them with gates; without it, it writes `owner-sql/<step>.sql` and prints the same block. The same module provides `ownerlib`, a single-file, dependency-free version of the gate logic that works with any DB-API cursor.
+`ownersql.py` builds the ordered statement list for every admin step from the journal state (names, STORAGE_IDs, pipeline files, the planned tables with their copied row counts for the rollback proof). With the owner profile it executes them with gates; without it, it writes `owner-sql/<step>.sql` and prints the same block. The same module provides `ownerlib`, a single-file, dependency-free version of the gate logic that works with any DB-API cursor.
 
 A printed block and a notebook cell hold the journal state of the moment they were generated. The O10 forward block carries the part of S0 the journal decides (O8 passed with every step before it passed, `freeze_time`, every planned table verified on the rows now copied): while it would refuse, the block starts with a STOP naming the tables, so the printed and notebook routes refuse what the kit route refuses. `gate O10 --pass` refuses on the same rule.
 
@@ -639,21 +587,9 @@ A block generated before a re-copy holds no STOP. So just before each journal wr
 
 `notebook.py` fills `notebooks/owner-steps.template.ipynb`: cell 1 holds the `ownerlib` source and the run's names and IDs as JSON; one cell per admin step (O2, O3 A with its re-entry block, O3 B loop, O9, O10 forward, O10 rollback, O11, C3, C4). Pipeline definitions with placeholders are embedded; credentials are typed into a variable in the O9 cell and deleted after the call. The notebook connects with `singlestoredb` through `portal.connection_url` and checks the workspace id before running anything. Each cell prints a JSON result block the operator pastes into `s2rebuild gate <ID> --evidence`.
 
-### 10.18 rehearse.py and sample.py (P5)
+### 10.18 Removed: rehearsal, sample databases, calibrate and the bundle
 
-The rehearsal source `<prefix>_src` is either the synthetic set (tables that exercise a single-column key, a composite key, a bigint AUTO_INCREMENT key, a varchar unique key (lock risk), duplicate rows without a key, an empty table, a table with a time column, and one view created after USE of `<prefix>_src` with a body that names no database; filled with exactly the requested row count, the chunking thresholds scaled to it) or, with `--from-database NAME --percent P`, a sample of a real database built by `sample.build` with the configured thresholds. `sample-database SOURCE NAME --percent P` is the same builder on its own: the capture of SOURCE in memory, NAME with the layout of SOURCE, every table by LIKE, one `INSERT ... SELECT` per table with `CRC32(<key expression>) MOD 100 < P` for a table with at least `copy.min_rows_for_chunking` rows (the key columns, or every column with COALESCE for a keyless table, the same expression the chunk predicates use), the whole table for a reference table and for a smaller one, a reference table of a READ ONLY source through a sharded staging table (fact 24), then the views and routines of the capture through the owner session with the definer policy of O7. The sample guard permits the runner write kinds on NAME only; the owner guard USE and the CREATE kinds of O5 and O7 on NAME only.
-
-With the owner profile the rehearsal then runs the real steps through `steps.run_step`, with its own journal, configuration (`rehearsal_config`: no window, the read-only freeze whatever the configured path, no pipeline start at O11 unless `--start-pipelines`, no parallelism change, every file under `customer/runs/<run>/rehearsal/`) and the throwaway names: a P3 capture and the source record as P2 records it; O2; O3 (DETACH and ATTACH READ ONLY of the throwaway source, the write probe, freeze_time); O4 (the capture inside run); O5; O6 with the kill test (SIGKILL of a forked copy process while a chunk is started; the in-process interrupt in the tests) and the resume, which must reconcile exactly the interrupted chunks; O7; O8; O9; then the switch state machine: S0 as reads, S1 and S2, a rollback by the original record's own ATTACH_SYNTAX (R2a, the position `original attached read write`), and O10 through `run_step`, which records the go and continues from that position at the S2b proof through S3, S4 and the two-entry gate. A rollback after S3 goes through the retained copy, after which a switch cannot continue, so the leg rolls back before S2b. Then O11 (nothing started), C1 (the throwaway has no application: an idle workload, recorded), C2 skipped, and C3 with its two-entry gate and the write probe on the retained rehearsal copy. P5 fails when a rehearsed step does not pass, C3 included, with the step's note; the P5 note lists what was not rehearsed (the lockout freeze, pipelines, reference tables, views or routines the source lacks, the pipeline start, the rollback through the retained copy, application writes, C2, C4 and C5). Without the owner profile O2 and O3 are recorded skipped, the copy, the kill test and the verify run, O7 ends pending (the runner creates no view) and P5 stays pending. `timings.json` under `customer/runs/<run>/rehearsal/` is the evidence O1 reads (`p5_status`).
-
-Cleanup drops only names with the rehearsal prefix, limited to what the invocation created, by record: an attached read-write record is dropped behind a record check; the READ ONLY retained copy is detached, re-attached read write by its own ATTACH_SYNTAX and dropped (fact 28); a detached record is re-attached by its syntax and dropped; through the cleanup owner guard (DETACH, ATTACH and DROP DATABASE on the prefixed names only). Without the owner profile the runner drops the attached read-write names and names the rest for `rehearse --cleanup` with the owner profile.
-
-### 10.19 calibrate.py (C2)
-
-Section 10.6 (`estimate.calibrate`; the command and the C2 handler pass the leaf cores P2 recorded, `inventory.recorded_leaf_cores`, so the baseline carries them). Also prints observed rows per hour and GiB per hour for the human summary. Calibration is advisory: when the journal cannot be fitted (fewer than 4 first-pass chunks, a singular or non-positive fit), the baseline in use stays, the Summary of the final workbook and of the run report carries a Calibration line that says so, and C2 passes with that note. C1 and C2 are python steps; `gate` records them by hand only with `--override NOTE`.
-
-### 10.20 bundle.py
-
-Static tree = everything except `customer/`, `dist/`, `.venv/`, `__pycache__/`, `.DS_Store` and the patterns in `customer/bundle-exclude.txt`. Writes `MANIFEST.json` (path, bytes, sha256), then zips to `dist/s2rebuild-<version>.zip`. Before zipping, scans every text file in the static tree for the words in `customer/bundle-denylist.txt` (case-insensitive), for U+2014 and U+2013, and for the pattern `IDENTIFIED BY '` followed by anything other than a placeholder. Any hit fails the command with file and line. `--verify ZIP` unzips to a temporary folder and compares hashes with the manifest inside the zip.
+The final pass removed P5 (`rehearse.py`, `sample.py`, the `rehearse` and `sample-database` commands, the O1 rehearsal check and `--no-rehearsal`; R1), `calibrate` and the baseline file (R5), and `bundle.py` with `docs-flags` (R12; git is the distribution). The engine capture moved to `tools/enginecapture.py`, a development tool for the test fake. The kit is validated by full end-to-end runs on a real database.
 
 ### 10.22 routines.py (P2, P3, O4, O5, O7, O10)
 
@@ -668,9 +604,9 @@ Routines are part of the database: functions, table-valued functions (a FUNCTION
 
 To be observed on the live ladder (I2): the ROUTINE_TYPE value Helios gives a table-valued function and whether aggregates appear in ROUTINES (the kit tells a TVF by RETURNS TABLE in its text and takes SHOW AGGREGATES as the authority); whether SHOW CREATE PROCEDURE and SHOW CREATE FUNCTION carry a DEFINER clause (the kit reads the clause first, else the ROUTINES column); the error number of a missing function in CREATE AGGREGATE and of a missing INTO PROCEDURE target (the fake answers 1305); whether procedures resolve their table names at CREATE (the fake refuses a missing table or view with 1146).
 
-### 10.23 workspace.py (P2, O1)
+### 10.23 Removed: workspace.py
 
-The Management API client over urllib (no new dependency). With `workspace.management_api_key_keychain` set, P2 reads the key from the Keychain (it joins the log redactor), calls `GET /v1/workspaces/<workspace.id>` with it as a bearer token and records the state, the autoscale setting and the auto-suspend setting in the preflight record: the state must be ACTIVE or P2 fails; the plan sheet prints the three; O1 refuses while autoscale is on unless `--accept-autoscale NOTE`, recorded as an event. The field names (`state`, `autoSuspend`, `autoScale`) are a best guess the live ladder confirms (fact 41); the raw fields are recorded so a wrong guess is visible. Without a key P2 prints three questions (ACTIVE, autoscale off, auto-suspend off or a keep-alive job) and O1 records the operator's answer from `--workspace NOTE` as evidence of the go. Tests pass a fake transport; nothing reaches the network.
+The Management API read of the workspace state (R6) guessed its field names. The three questions P2 prints and O1 records (`--workspace NOTE`, `steps.WORKSPACE_QUESTIONS`) are the workspace check.
 
 ### 10.24 projections.py (P3, O4, O7, O10)
 
@@ -680,7 +616,7 @@ Roadmap item R6. A projection is a second sort and shard order kept by the serve
 2. Creation at O7, last: after the views, the procedures, the stale check and the counters, so each projection is built once over its full table and never slows the copy. The owner guard of O7 accepts USE of the replacement and CREATE PROJECTION; the statement is the captured text as it is (fact 45: the table resolves against the current database). A projection that exists is skipped.
 3. Refusal before any O7 statement: a captured definition that does not start with CREATE PROJECTION `<name>` or does not end with FROM `<table>` without a database qualifier.
 4. The gate (`projections.verify`): every captured projection is listed in the replacement and its whitespace-normalized definition equals the capture. The PROJECTIONS count of the replacement goes to the journal (`projection_count`), and S3 expects it on the live name; ATTACH ... AS carries the projections there (fact 45).
-5. `sample-database` creates the captured projections in the sample after its rows, so P5 rehearses them.
+5. (removed with `sample-database`)
 
 ## 11. Helios facts the code relies on
 
@@ -719,15 +655,15 @@ Verified on the reference run or in the documentation. `docs/LESSONS.md` carries
 31. Engine 10.8.0, Portal, October 27: the retained copy appears as "Read Only Legacy"; its `MV_CLOUD_ATTACHED_DATABASES` row says READONLY. Whether a newer read-only attach type exists is an open question for SingleStore; the kit reads ATTACH_TYPE READONLY only.
 32. Engine 10.8.0: dropping the record a `resume` branch continues from leaves that branch whole (every row present, and it survives a detach and a read-only re-attach). The test fake models it. S2b relies on it (the original record is dropped after the retained copy exists) and S4 on fact 6 (the replacement is dropped after the live branch exists, each behind its record check); abandon still refuses a DROP of a replacement that has a branch (`abandon.branches_of_sql`).
 33. Engine 10.8.0: ROW_NUMBER in `MV_CLOUD_BRANCHES` is not stable between listings. The kit never reads it; a record is name, STORAGE_ID and ATTACH_TYPE (`switch.records_match`, fact 44), and the fake renumbers on every listing.
-34. Engine 10.8.0, tpcds3tb (3 TB), October 27: detach of the live name, attach of the original record by syntax, drop, and re-attach of the live record took about 30 seconds. O10 S2b runs the attach by syntax, the proof and the drop while the live name is free, so the switch needs no second outage; C3 keeps the whole sequence as the repair block for a switch made without S2b and S4, and the rollback R2a runs the same attach by syntax.
-35. Engine 10.8.0, October 27: the Portal's database list is the `MV_CLOUD_BRANCHES` rows with IS_DROPPED = 0, attached or detached; a dropped record leaves it and shows the `ATTACH DROPPED DATABASE` form. After the two-entry switch the list holds the live record and the retained record only (`SwitchMachine.gate`, C3 End state); the dropped original record and replacement stay recoverable with that form for the engine's retention period. I0b (October 28, 2026) found it accepted: `ATTACH DATABASE <retained> AS <source> STORAGEID <original>` from the READ ONLY retained copy gives a READWRITE pitr record under the live name with PREV_DATABASE_NAME the retained name and the original rows, and the retained copy stays READ ONLY with its rows. R2b is the rollback after S2b; R2c stays as the fallback on a refusal and was not needed.
+34. Engine 10.8.0, tpcds3tb (3 TB), October 27: detach of the live name, attach of the original record by syntax, drop, and re-attach of the live record took about 30 seconds. O10 S2b runs the attach by syntax, the proof and the drop while the live name is free, so the switch needs no second outage; the rollback R2a runs the same attach by syntax.
+35. Engine 10.8.0, October 27: the Portal's database list is the `MV_CLOUD_BRANCHES` rows with IS_DROPPED = 0, attached or detached; a dropped record leaves it and shows the `ATTACH DROPPED DATABASE` form. After the two-entry switch the list holds the live record and the retained record only (`SwitchMachine.gate`, C3 End state); the dropped original record and replacement stay recoverable with that form for the engine's retention period. I0b (October 28, 2026) found it accepted: `ATTACH DATABASE <retained> AS <source> STORAGEID <original>` from the READ ONLY retained copy gives a READWRITE pitr record under the live name with PREV_DATABASE_NAME the retained name and the original rows, and the retained copy stays READ ONLY with its rows. R2b is the rollback after S2b; the R2c fallback was never needed and was removed.
 36. Engine 10.8.0: `TABLE_STATISTICS` reports no rows for a reference table, so its estimate would be 0 and its plan would schedule nothing. The capture marks each `CREATE [ROWSTORE] REFERENCE TABLE` as `reference` (`inventory.is_reference`) and counts it with `SELECT COUNT(*)` at P3 and O4 whatever `--exact-counts` says; the plan gives it one bucket on the staging path (`TablePlan.copy_path`), the estimate charges its rows at the insert rate twice (`estimate.reference_seconds`), and `tables.csv` and the table tab carry the mark. The test fake answers TABLE_STATISTICS without the reference tables.
 37. Engine 10.8.0: the runner sees no routine in `information_schema.ROUTINES` (fact 21) and no other account's grants, so `routines.capture` and the write-capable account list read through the owner session only: ROUTINES with DEFINER, `SHOW AGGREGATES` in the database, and `SHOW CREATE FUNCTION`, `SHOW CREATE AGGREGATE` or `SHOW CREATE PROCEDURE` per routine. P2 without the owner profile prints "routines: not visible to the runner; owner profile needed" and never "none". The replacement gets the routines in dependency order (`routines.O5_KINDS` after the tables, `routines.O7_KINDS` after the views), and the S3 count is the ROUTINES number the O7 gate recorded (`routines.ROUTINE_COUNT_META`). The test fake lists ROUTINES to the admin only.
-38. Engine 10.8.0, Portal, October 27: the Portal may show 0 rows for the tables of a READ ONLY attachment (the frozen source). The kit's own counts in the journal and the O4 capture are the reference; `freeze.finish_freeze` logs `PORTAL_ROWS_NOTE` after the probe. On Path A the O4 capture records `PIPELINES_READ_ONLY_NOTE` instead of listing `PIPELINES` (empty there, fact 23), `inventory.pipeline_drift` compares nothing and the drift report carries the note; O9 replays the O2 capture.
+38. Engine 10.8.0, Portal, October 27: the Portal may show 0 rows for the tables of a READ ONLY attachment (the frozen source). The kit's own counts in the journal and the O4 capture are the reference; `freeze.finish_freeze` logs `PORTAL_ROWS_NOTE` after the probe. The O4 capture records `PIPELINES_READ_ONLY_NOTE` instead of listing `PIPELINES` (empty there, fact 23), `inventory.pipeline_drift` compares nothing and the drift report carries the note; O9 replays the O2 capture.
 39. Engine 10.8.0, tpcds3tb, October 27: a sampled fingerprint with `CRC32(key) MOD 100 < p` reads every row, so a 5 percent sample cost as much as a full fingerprint, and one session fingerprinted one side of one table at a time. Tier 3 samples a contiguous range on the first sort key column or the time column (`MIN` and `MAX` from the source, the same predicate on both sides), so segment elimination skips the rest, and runs on `verify.sessions` connections, largest table first with its two sides at once (`Verifier.tier3_all`); `--yes` accepts the recorded result without a rerun when no chunk was copied since (`verify.recorded_state`).
-40. Helios, run 20261026-1301, October 26: autoscale replaces nodes one at a time (MV_EVENTS: SYSTEM_VAR_CHANGED, NEW_MASTER_AGGREGATOR, NODE_DETACHED, NODE_OFFLINE per leaf) and every chunk in flight fails with error 1997 "transaction was already in its commit phase"; 28 chunks were lost that way, and P3 once failed at a connection reset while the workspace was scaling. Run with autoscale off: P2 reads the setting through the Management API when a key is configured and O1 refuses while it is on (`--accept-autoscale NOTE` overrides, recorded). The copy treats 1997 as a transient (`copy.is_commit_phase`: reconciled and requeued without an attempt), `copy.max_consecutive_failures` failures in a row trip the breaker and end O6 INCOMPLETE, and a driver reset (2003, 2004, 2006, 2013) ends a command with one plain line and exit 2.
-41. Helios, October 25: auto-suspend counts queries from connections as activity, not load batches; a workspace suspended while loads ran with no connection open. The kit's own keep-alive (`connect.KeepAlive`) sends `SELECT 1` on its own runner connection every `workspace.keepalive_minutes` while a step runs; between commands the plan (P4) records that auto-suspend is off for the window, or that a notebook job of the customer runs the same query every 15 minutes. The Management API field names the kit reads for the workspace (`GET /v1/workspaces/<id>`: `state`, `autoSuspend`, `autoScale`) are a best guess to confirm in the live ladder (I4); P2 records the raw fields, so a wrong name shows as "not reported" in the journal and on the plan sheet.
-42. Helios, S-8 at 4X (240 leaf cores), tpcds3tb, October 27: 270 M row chunks into 16 partitions took about 18 minutes at 4 workers (3.5 B rows per hour, leaf CPU about 17 percent) and 50 to 53 minutes at 12 workers (3.7 B rows per hour, CPU about 26 percent); client concurrency is not the limit. The estimate therefore scales its rates by the leaf cores P2 reads from `MV_NODES` against the baseline's (`estimate.scale_factor`), downward without limit and upward at most `estimate.scale_up_cap` (default 1.0), and the plan sheet carries the note as the planning line (section 10.6).
+40. Helios, run 20261026-1301, October 26: autoscale replaces nodes one at a time (MV_EVENTS: SYSTEM_VAR_CHANGED, NEW_MASTER_AGGREGATOR, NODE_DETACHED, NODE_OFFLINE per leaf) and every chunk in flight fails with error 1997 "transaction was already in its commit phase"; 28 chunks were lost that way, and P3 once failed at a connection reset while the workspace was scaling. Run with autoscale off (O1 records the operator's answer). A failed chunk is reconciled before it runs again, `copy.max_consecutive_failures` failures in a row trip the breaker, one retry round follows at the end of the pass, and a driver reset (2003, 2004, 2006, 2013) ends a command with one plain line and exit 2.
+41. Helios, October 25: auto-suspend counts queries from connections as activity, not load batches; a workspace suspended while loads ran with no connection open. The kit's own keep-alive (`connect.KeepAlive`) sends `SELECT 1` on its own runner connection every `workspace.keepalive_minutes` while a step runs; between commands the plan (P4) records that auto-suspend is off for the window, or that a notebook job of the customer runs the same query every 15 minutes. The Management API read of the workspace guessed its field names and was removed in the final pass; O1 records the operator's answers instead.
+42. Helios, S-8 at 4X (240 leaf cores), tpcds3tb, October 27: 270 M row chunks into 16 partitions took about 18 minutes at 4 workers (3.5 B rows per hour, leaf CPU about 17 percent) and 50 to 53 minutes at 12 workers (3.7 B rows per hour, CPU about 26 percent); client concurrency is not the limit. The estimate is therefore the rows over the rows per hour a whole run measured on the workspace (`estimate.rows_per_hour`, section 10.6).
 43. Engine 10.8.0, a 3 TB database, October 27: DETACH of the idle database took 73 seconds at O3 and 10 seconds on `abandon`; ATTACH READWRITE took 8 seconds. `freeze.detach_wait_seconds` (default 120) is above the idle detach time, so the escalation to `DETACH ... KILL` (10.7) is for a database with writers, not for the upload; the estimate's freeze allowance of 10 minutes covers O3; the 30 seconds of fact 34 are four such statements with the live name free.
 44. Engine 10.8.0, October 27 (I0b): every attach gives a record a new COMPUTE_ID, a re-attach of the same record by its own ATTACH_SYNTAX included: the original record detached at S1 with COMPUTE_ID ...:4008 came back at S2b as the same `create` row, READWRITE, with ...:4014, and its ATTACH_SYNTAX became the plain `ATTACH DATABASE <name> STORAGEID <id> COMPUTEID <new id>` form. The COMPUTEID inside a detached record's syntax equals its LATEST_COMPUTE_ID, the AT MILESTONE value has the form `YYYY-MM-DD HH_MM_SS.ffffff`, and the name is in backticks. So the kit identifies a record by name, STORAGE_ID and ATTACH_TYPE, never by COMPUTE_ID, which it records for the report only; the state checks after a DROP or DETACH read the records of the name on the storage, a record not dropped first. I0b also confirmed: a detached record re-attaches by the plain `ATTACH DATABASE <name> STORAGEID <id>` (the same record, read write), `READ ONLY` before `AT MILESTONE` attaches it read only, DROP DATABASE of a detached record fails with 1008 ("database doesn't exist"), and an INSERT on a READ ONLY attachment can fail with 2719 ("attached as a readonly database"), which the write probe accepts by its message.
 45. Engine 10.8.0, October 28 (I5 section 6.4, throwaway databases): `information_schema.PROJECTIONS` (PROJECTION_SCHEMA, PROJECTION_NAME, BASE_TABLE_NAME, CREATE_TIME, CREATE_USER, STATUS) lists the projections of a database, a READ ONLY attachment and a retained `resume` record included, so O4 captures them after the freeze. `SHOW CREATE PROJECTION <name> FOR TABLE `db`.`table`` gives the definition with an unqualified FROM; `SHOW PROJECTIONS` needs a current database and `ON TABLE`, and lists nothing while STATUS is `Created` (it becomes `Sync` shortly after), so the kit lists from information_schema. `CREATE PROJECTION` resolves its table against the current database: without `USE` it fails with 1046 ("No database selected") even when FROM names the database, so the kit issues USE of the replacement and the captured text as it is. `ATTACH ... AS` carries a projection to the new branch with the same definition, and it stays on the live name after the DROP of the replacement (S4). A projection is not part of SHOW CREATE TABLE, so CREATE TABLE ... LIKE does not copy it.
@@ -739,7 +675,7 @@ Deliverables:
 
 - `README.md`: title, one paragraph on purpose, the flow diagram, "who runs what" table, then the steps in order with the exact command, what to expect and the gate. Install, configuration pointer, troubleshooting (lock waits, detach waits, grants restored by another session, name collisions, pipelines the application recreates), lessons pointer.
 - `docs/STEPS.md`: the full catalog, one section per step: purpose, identity, inputs, outputs, statements issued, gate, how to re-enter, what to do when it fails. The O2, O9 and O11 sections repeat the pipeline and offsets explanation from section 10.12 in plain words, including the two credential routes and the retention check.
-- `docs/CONFIG.md`: every key with type, default and the steps that read it; every flag from `docs-flags`; environment variables; exit codes.
+- `docs/CONFIG.md`: every key with type, default and the steps that read it; every flag; environment variables; exit codes.
 - `docs/CODE-GUIDE.md`: module map with one paragraph each, the data flow from config to journal to reports, how to add a step, section 14, and a short section on the transform hook (10.21) as the place for future replacement changes.
 - `docs/LESSONS.md`: section 11 in plain words plus the run lessons; the two lists hold the same number of facts (a test checks it).
 - `docs/COVERAGE.md`: the coverage grid, one row per object kind with how it is migrated or what to do instead.
@@ -763,29 +699,28 @@ Offline tests under `tests/` with a fake DB-API connection (port the 27 referenc
 - journal: schema creation, migrations, step transitions, chunk transitions, plan check refusal.
 - steps: order, `--from` refusal when earlier steps are not passed, gate recording, exit codes.
 - guard: statement allowances per step; source scan for forbidden words per module.
-- copy: predicate shapes, bucket cap, coverage of buckets 0..B−1, resume with reconciliation, lock-wait requeue, auto serialization after 1205, the lock-wait cap, a second Ctrl-C, abort deadline, stop file, fresh-table fallback with its refusals, its resume after each failure point and its reload over a stale loaded record, count proof.
+- copy: predicate shapes, bucket cap, coverage of buckets 0..B−1, resume with reconciliation, lock-wait requeue, auto serialization after 1205, the lock-wait cap, a second Ctrl-C, stop file, the retry round after a failure, the slow-chunk line, the mismatch hint, fresh-table fallback with its refusals, its resume after each failure point and its reload over a stale loaded record, count proof.
 - verify: tier selection, grouped fingerprint comparison and the bucket mapping, budget and sampling, verified_at rule.
 - postcopy: the definer choice per view, views created in rounds, source names refused, the O7 block without the owner profile, counter statements.
 - pipelines: EXTENDED row parsing (CREATE plus ALTER statements across rows), placeholder substitution, refusal on missing credential or redaction marker, no START issued, offsets-equal check after replay, retention gap detection per partition, app-managed pipelines excluded from the count gate.
 - switch: state machine on a fake attachment table, out-of-order refusal, rollback checks, the zero-change proof, refusal after application writes or once O11 started.
-- lockout and grants: enumeration, snapshot, revoke list, restore equals snapshot, restored-by-another detection.
-- estimate: the fit reproduces the reference constants from a fixture journal within 2 percent; scheduling simulation; bands; window fit.
+- connect: TCP keep-alive on the socket, the connect retry on name resolution.
+- estimate: the estimate line and the plan sheet.
 - reports: workbook opens, Summary first, one tab per table, long names mapped, CREATE TABLE at the bottom.
-- bundle: manifest hashes, denylist hit fails, dash check fails, verify passes on its own zip.
 - style: no dashes, no denylisted words, author line in every module, docstring first lines.
 - engine: every `information_schema` query the kit holds names only columns of the capture; the fake answers the capture's error texts.
-- identity and endstate: the branch record everywhere, the two-entry switch, S2b's proof, the rollback legs, C3's gate and repair, C5's refusals and delete.
-- routines, prompts, workspace, rehearse, report: the capture and creation order of routines, the credential and name prompts with the Keychain writer replaced, the Management API client with a fake transport, the keep-alive clock, the breaker, the statement-log walk of the rehearsal, the report rows.
-- docs: the flag table equals `docs-flags`, every configuration key documented, every command named, every step sectioned, the guide PDF current, the fact counts equal.
+- identity and endstate: the branch record everywhere, the two-entry switch, S2b's proof, the rollback legs, C3's gate, C5's refusals and delete.
+- routines, prompts, report: the capture and creation order of routines, the credential and name prompts with the Keychain writer replaced, the keep-alive clock, the breaker, the report rows, the C4 gate of `account-sql --drop --execute`.
+- docs: every flag the documents name exists, every configuration key documented, every command named, every step sectioned, the guide PDF current, the fact counts equal.
 
 Acceptance for the hand-back:
 
 1. `python -m pytest` passes offline.
-2. `s2rebuild --help` lists every command in section 8; `s2rebuild docs-flags` matches `docs/CONFIG.md`.
+2. `s2rebuild --help` lists every command in section 8; every flag `docs/CONFIG.md` names exists.
 3. `s2rebuild profile --dry-run` on the fixture inventory writes a profile workbook with a Summary tab and one tab per table.
 4. `s2rebuild run --dry-run --from O1 --to O11` prints every statement for every step on the fixture, with gates marked as pending where a person is needed.
 5. `s2rebuild owner-sql O10` prints the forward block with checks and expected results.
-6. `s2rebuild bundle` produces a zip that `bundle --verify` accepts, and the denylist scan is clean.
+6. The denylist scan of the static tree is clean (`tests/test_style.py`).
 7. README, STEPS, CONFIG, CODE-GUIDE, LESSONS and the flow diagram exist; the PDF builds.
 8. No file in the static tree contains a customer name, a credential, a dash character, or an AI tool name.
 
@@ -798,7 +733,7 @@ Listed for `docs/CODE-GUIDE.md`. Each names the module and the one place to edit
 | Replacement definition | Partition layout only; `transform.apply` is a pass-through | Fill in `transform.py` for keys, indexes, storage, renames (section 10.21); the hook, config keys and report block already exist |
 | Chunking strategy | Hash buckets, `CRC32(key) MOD B`, complete coverage by construction | Range chunking on a sort-key prefix with segment elimination for multi-billion-row tables; add a `RangePlan` in `copy.py` with NULL and open-ended buckets, and a coverage test |
 | Bucket cap | 32 per table | Raise for restart granularity, lower for scan cost; `copy.max_buckets_per_table` |
-| Freeze default | Read-only attachment | `freeze.mode: lockout`; the lockout loop also runs as a bridge during a slow detach |
+| Freeze | Read-only attachment, the only freeze | An online path would be change capture, a different design |
 | Switch order | Retained branch first, then the original record dropped (S2b), then live, then the replacement dropped (S4) | Live first saves one step; the current order keeps the live name unambiguous and ends with two entries |
 | Replacement after switch | Dropped at S4, inside the switch, after S3's checks; the live branch is independent of it | Leave it attached and drop it at C3 (the pre-1.0 flow): one more entry on the workspace and a DROP in the close-out instead of the window |
 | Verification depth | Count, newest, grouped fingerprint; a table over `full_fingerprint_max_rows` sampled as a range | Full fingerprint on every table (`full_fingerprint_max_rows` above the largest table, or `step O8 --full TABLE`) or count only |
@@ -867,10 +802,10 @@ FROM `db`.`table` [WHERE `col` >= lo AND `col` <= cut] GROUP BY grp;   -- O8 tie
 SELECT SUM(NUM_CPUS) ... FROM information_schema.MV_NODES WHERE TYPE = 'LEAF';   -- P2: the leaf cores the estimate scales by
 SELECT VARIABLE_NAME, VARIABLE_VALUE FROM information_schema.GLOBAL_VARIABLES WHERE VARIABLE_NAME LIKE 'PASSWORD_%';   -- P1 (owner): the policy
 SELECT 1;   -- the keep-alive thread, every workspace.keepalive_minutes while a step runs
-SELECT @@memsql_version AS v;   -- engine-capture (owner), with COLUMNS of information_schema per view the kit reads
+SELECT @@memsql_version AS v;   -- tools/enginecapture.py (owner), with COLUMNS of information_schema per view the kit reads
 ```
 
-Runner writes (replacement only; `sample-database` issues the same CREATE DATABASE, CREATE TABLE LIKE, staging and INSERT ... SELECT forms naming the sample, with `WHERE CRC32(key_expr) MOD 100 < P`):
+Runner writes (replacement only):
 
 ```sql
 CREATE DATABASE `replacement` PARTITIONS 32 SUB_PARTITIONS 512;
@@ -916,22 +851,22 @@ SELECT DATABASE_NAME, STORAGE_ID, ATTACH_TYPE, LATEST_COMPUTE_ID, PREV_DATABASE_
 FROM information_schema.MV_CLOUD_BRANCHES WHERE DATABASE_NAME = %s AND IS_DROPPED = 0;   -- identify: the records of a name, joined with the attachment row
 SELECT ... FROM information_schema.MV_CLOUD_BRANCHES WHERE DATABASE_NAME = %s AND STORAGE_ID = %s AND IS_DROPPED = 0 AND IS_DETACHED = 0;  -- record checks of the blocks (IS_DETACHED = 1 for the detached original)
 SELECT COUNT(*) AS n FROM information_schema.MV_CLOUD_ATTACHED_DATABASES
-WHERE DATABASE_NAME = %s AND (STORAGE_ID <> %s OR ATTACH_TYPE <> %s);   -- repair and abandon identity: expect 0 before a DROP
+WHERE DATABASE_NAME = %s AND (STORAGE_ID <> %s OR ATTACH_TYPE <> %s);   -- abandon identity: expect 0 before a DROP
 SELECT COUNT(*) AS n FROM information_schema.MV_CLOUD_BRANCHES
-WHERE DATABASE_NAME = %s AND IS_DROPPED = 0 AND IS_DETACHED = 0 AND LATEST_COMPUTE_ID <> %s;  -- C3 and repair identity: no other record under the name, expect 0
+WHERE DATABASE_NAME = %s AND IS_DROPPED = 0 AND IS_DETACHED = 0 AND LATEST_COMPUTE_ID <> %s;  -- C3 identity: no other record under the name, expect 0
 SELECT COUNT(*) AS n FROM information_schema.MV_CLOUD_BRANCHES
-WHERE STORAGE_ID = %s AND LATEST_COMPUTE_ID = %s AND IS_DROPPED = 0 AND IS_DETACHED = 0 AND DATABASE_NAME <> %s;  -- repair identity: expect 0
+WHERE STORAGE_ID = %s AND LATEST_COMPUTE_ID = %s AND IS_DROPPED = 0 AND IS_DETACHED = 0 AND DATABASE_NAME <> %s;  -- record identity: expect 0
 SELECT COUNT(*) AS n FROM information_schema.MV_CLOUD_BRANCHES
-WHERE STORAGE_ID = %s AND LATEST_COMPUTE_ID = %s AND IS_DROPPED = 0 AND IS_DETACHED = 1;  -- repair identity: the record not detached, expect 0
+WHERE STORAGE_ID = %s AND LATEST_COMPUTE_ID = %s AND IS_DROPPED = 0 AND IS_DETACHED = 1;  -- record identity: the record not detached, expect 0
 SELECT COUNT(*) = 0 AS n FROM information_schema.MV_CLOUD_BRANCHES
-WHERE DATABASE_NAME = %s AND STORAGE_ID = %s AND LATEST_COMPUTE_ID = %s AND IS_DROPPED = 0 AND IS_DETACHED = 0;  -- repair: 1 skips the replacement DROP
-DROP DATABASE `source`;                                                 -- O10 S2b (the original record) and the C3 repair
-DROP DATABASE `replacement`;                                            -- O10 S4 and the C3 repair, by record
+WHERE DATABASE_NAME = %s AND STORAGE_ID = %s AND LATEST_COMPUTE_ID = %s AND IS_DROPPED = 0 AND IS_DETACHED = 0;  -- 1 skips the replacement DROP
+DROP DATABASE `source`;                                                 -- O10 S2b (the original record)
+DROP DATABASE `replacement`;                                            -- O10 S4, by record
 SELECT COUNT(*) AS n FROM information_schema.MV_CLOUD_BRANCHES WHERE STORAGE_ID = %s AND IS_DROPPED = 0;  -- the two-entry gate: 1 per storage
-ATTACH DATABASE `retained` AS `source` STORAGEID <original_sid>;         -- rollback R2b (after S2b); R2c: DETACH `retained`, then its syntax with AS `source`
+ATTACH DATABASE `retained` AS `source` STORAGEID <original_sid>;         -- rollback R2b (after S2b)
 DETACH DATABASE `retained`; DROP DATABASE `retained`;                   -- C5 cleanup --delete only, after the record's own syntax re-attached it read write
 SELECT DATABASE_NAME, STORAGE_ID, ATTACH_TYPE, LATEST_COMPUTE_ID, IS_DETACHED, IS_DROPPED, ATTACH_SYNTAX
-FROM information_schema.MV_CLOUD_BRANCHES WHERE DATABASE_NAME = %s AND STORAGE_ID = %s AND LATEST_COMPUTE_ID = %s;  -- S2b, S4, repair, C5: expect IS_DROPPED = 1 after a DROP
+FROM information_schema.MV_CLOUD_BRANCHES WHERE DATABASE_NAME = %s AND STORAGE_ID = %s AND LATEST_COMPUTE_ID = %s;  -- S2b, S4, C5: expect IS_DROPPED = 1 after a DROP
 SELECT COUNT(*) AS n FROM information_schema.MV_CLOUD_BRANCHES WHERE PREV_DATABASE_NAME = %s AND STORAGE_ID = %s AND IS_DROPPED = 0;  -- abandon: no branch of the replacement, expect 0
 SELECT COUNT(*) AS n FROM information_schema.VIEWS
 WHERE TABLE_SCHEMA = %s AND SUBSTRING_INDEX(DEFINER, '@', 1) = %s;      -- C4: views of the live database the runner defines, expect 0
@@ -947,20 +882,18 @@ Plan sheet, printed by `s2rebuild plan`:
 
 ```
 SingleStore Database Rebuild Kit    run 20261101-0500    database acme_orders_db
-Window     2026-11-01 05:00Z to 13:00Z (8 h 00 m)
-Deadline   10:58Z abort for the copy (end minus 60 m restart, 30 m buffer, 4 m longest chunk)
-Freeze     Path A read-only attachment; application stop owner: <name>
-Estimate   copy 61 m expected (52 m low, 70 m high) for 95 tables, 3.05 B rows, 938 GiB
-           total O2 to O11: 2 h 05 m expected (1 h 47 m low, 2 h 24 m high)   FITS, 3 h 03 m spare at high
-           planning estimate: rates scaled by 0.50 for 120 leaf cores against the baseline's 240; from 4 to 12 workers the reference workspace stayed near 3.5 B rows per hour
+Window     2026-11-01T05:00:00Z to 2026-11-01T13:00:00Z (8 h 00 m); no step stops on it
+Freeze     read-only attachment; application stop owner: <name>
+Estimate   copy about 1 h 16 m: 3.05 B rows in 95 tables, 938 GiB, at 2.40 B rows per hour (estimate.rows_per_hour)
 Pipelines  33 captured (31 KAFKA, 2 S3); route 1 (kit replays); credentials: KAFKA env set, S3 env not set
-           retention stated by customer: KAFKA 7 d; window plus release 3 h; margin OK
-Accounts   write-capable: app_user, app_user_2, retention_job (Path B would revoke these on every database)
+           retention stated by customer: KAFKA 168 h, margin OK; stop to start (the copy estimate): 1 h 16 m; app-managed: 0
+Accounts   write-capable: app_user, app_user_2, retention_job
 Routines   12 routines (9 functions, 0 TVFs, 2 aggregates, 1 procedures), 1 ignored by configuration: procedure nightly_rollup
-Rehearsal  2026-10-30 run 20261030-2100: copy 00:08, kill test resumed, switch 00:03
+Projections 1 projection (created at O7)
+Workspace  answered at O1 with --workspace NOTE: is the workspace ACTIVE (not suspended, resuming or scaling)?; is autoscale off for the window?; is auto-suspend off for the window, or a keep-alive job in place between the commands?
 ```
 
-Go sheet before S3 of the switch: verification summary per tier, pipelines ready, time remaining against the deadline, and the prompt "Type the live database name to continue".
+Go sheet before S3 of the switch: verification summary per tier, pipelines ready, and the prompt "Type the live database name to continue".
 
 ## Appendix C: report layouts
 

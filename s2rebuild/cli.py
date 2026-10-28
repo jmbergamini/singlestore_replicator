@@ -3,7 +3,7 @@
 Author: John Bergamini
 
 Section 8 of the architecture: every command and global flag is declared here so that
-`s2rebuild --help` and `s2rebuild docs-flags` describe the whole kit. Commands whose module
+`s2rebuild --help` describes the whole kit. Commands whose module
 lands in a later milestone refuse with exit 1 and name the milestone. Exit codes: 0 done,
 1 refused or configuration error, 2 incomplete, 3 verification mismatch, 4 gate pending or
 failed. Statements issued by this module: none.
@@ -13,17 +13,17 @@ import contextlib
 import datetime as dt
 import json
 import os
-import sqlite3
+import subprocess
 import sys
 import traceback
 from pathlib import Path
 
-from . import __title__, __version__, abandon, bundle, cleanup, copy as copy_module, enginecapture, estimate, freeze, grants, inventory, lockout, notebook, ownersql, pipelines, postcopy, rehearse, report_md, report_xlsx, routines, sample, steps, switch, watch
-from .common import EXIT_DONE, EXIT_GATE, EXIT_INCOMPLETE, EXIT_MISMATCH, EXIT_REFUSED, KitError, check_run_id, parse_utc, run_date, unique_run_id, utc_now
-from .sqlutil import ident, secret_forms, sql_literal
+from . import __title__, __version__, abandon, cleanup, copy as copy_module, estimate, freeze, inventory, notebook, ownersql, pipelines, postcopy, report_md, report_xlsx, routines, steps, switch
+from .common import EXIT_DONE, EXIT_GATE, EXIT_INCOMPLETE, EXIT_REFUSED, KitError, check_run_id, run_date, unique_run_id, utc_now
+from .sqlutil import secret_forms, sql_literal
 from .config import load_config
 from .connect import DRIVER_RESET_LINE, Log, Redactor, Secrets, Session, SessionFactory, driver_errno, is_driver_error
-from .journal import Journal, read_only_uri
+from .journal import Journal
 from .sqlutil import read_guard
 
 ENV_RUN = 'S2REBUILD_RUN'
@@ -33,26 +33,16 @@ GLOBAL_FLAGS = ('--config', '--run', '--db', '--dry-run', '--yes', '--verbose', 
 # command: (step label, help text, where it arrives; None when implemented here)
 COMMANDS = [
     ('check', 'P2', 'Connect as runner (and owner if configured), check privileges, engine version, source layout and '
-                    'STORAGE_ID, free target names, compute cores times 8 at or above the partition count, the workspace state and '
-                    'settings through the Management API when a key is configured; needs P1 recorded', None),
+                    'STORAGE_ID, free target names, compute cores times 8 at or above the partition count; prints the three workspace '
+                    'questions O1 records the answers to; needs P1 recorded', None),
     ('account-sql', 'P1, C4', 'Print the CREATE USER and GRANT block for the runner account; --execute runs it with the '
                               'owner profile; --drop prints or executes the DROP USER block and the zero-privilege check', None),
     ('profile', 'P3', 'Inventory, sizes, estimate and the profile workbook for the configured databases', None),
-    ('plan', 'P4', 'Print the plan sheet: window, abort deadline, freeze path, step owners, estimate with bands', None),
-    ('rehearse', 'P5', 'Create throwaway databases (synthetic, or a sample of a real database) and run O2 to O11, C1 and C3 on them '
-                       'through the real steps: freeze, copy with a kill test, verify, switch with a rollback leg, release, end state; clean up', None),
-    ('sample-database', 'P5, lab', 'Build NAME as a percent sample of SOURCE: every table by LIKE, the rows whose CRC32 of the key MOD 100 '
-                                   'is under the percent, reference and small tables whole, then the views and routines with the owner profile', None),
+    ('plan', 'P4', 'Print the plan sheet: window, freeze, step owners, the estimate line', None),
     ('run', 'O1 to O11', 'Run the outage steps in order and stop at the first failed gate', None),
     ('step', 'any', 'Run one step by id', None),
     ('gate', 'admin, human', 'Record a gate result for a step the kit did not execute itself', None),
     ('status', 'any', 'Board of steps per database: status, start, end, evidence path', None),
-    ('watch', 'O3, C1', 'Writer watch: non-runner sessions with statement kind every --interval seconds and count deltas '
-                        'on the largest --tables tables every 60 seconds', None),
-    ('quiet-proof', 'O3 Path B', 'Pipelines none Running, no non-idle session from another account, counts and newest '
-                                 'timestamps stable across two samples; writes freeze_time to the journal', None),
-    ('lockout', 'O3 Path B', 'Snapshot grants, revoke write privileges from every write-capable account, hold connections, '
-                             'kill loop until --until, the stop file, Ctrl-C or, with --hold, S1 of O10; owner profile required', None),
     ('owner-sql', 'O2, O3, O9, O10, O11, C3, C4', 'Print the ordered SQL block for an admin step with its precondition '
                                                    'queries and expected results; also written under owner-sql/', None),
     ('owner-notebook', 'any admin step', 'Generate owner-steps.ipynb for the run with one cell per admin step', None),
@@ -63,14 +53,8 @@ COMMANDS = [
     ('abandon', 'before O10', 'Back out a run stopped before the switch: the source READWRITE again on its recorded STORAGE_ID, '
                               'the replacement dropped, the run closed; --execute --note TEXT runs it with the owner profile', None),
     ('report', 'C2', 'Final Excel and Markdown for a run', None),
-    ('calibrate', 'C2', 'Fit the throughput model from a journal and write customer/baseline.json', None),
     ('cleanup', 'C5', 'List what the run left after C3 (the live record, the retained copy, its record, size and retain-until date); '
                       '--delete NAME deletes the retained copy after the date, by its record, after the name is typed again; --yes does not apply', None),
-    ('bundle', 'packaging', 'Write MANIFEST.json, check the denylist, zip the static tree to dist/; --verify ZIP checks a zip', None),
-    ('engine-capture', 'tests', 'Read the engine version, the column list of every information_schema view the kit reads, SHOW '
-                                'AGGREGATES, the PASSWORD_ variables and, with --fixture-database, the runner-versus-owner row counts, '
-                                'with the owner profile; writes tests/engine/helios-<version>.json for the test fake', None),
-    ('docs-flags', 'docs', 'Print the flag table as Markdown for docs/CONFIG.md', None),
 ]
 COMMAND_NAMES = [c[0] for c in COMMANDS]
 
@@ -114,7 +98,7 @@ def build_parser():
     """The complete command line of section 8."""
     collected = {}
     parser = Parser(prog='s2rebuild', description='%s %s. Rebuild a SingleStore Helios database into a new partition '
-                    'layout and switch it over inside one outage window. Steps P1 to P5 prepare, O1 to O11 run inside '
+                    'layout and switch it over inside one outage window. Steps P1 to P4 prepare, O1 to O11 run inside '
                     'the window, C1 to C4 close out. Exit codes: 0 done, 1 refused or configuration error, 2 incomplete '
                     '(rerun with the same run id to resume), 3 verification mismatch, 4 gate pending or failed (a person '
                     'is needed).' % (__title__, __version__))
@@ -130,7 +114,6 @@ def build_parser():
     p['account-sql'].add_argument('--execute', action='store_true', help='run the block with the owner profile')
     p['account-sql'].add_argument('--drop', action='store_true', help='the DROP USER block and the zero-privilege check (C4)')
     p['profile'].add_argument('--exact-counts', action='store_true', help='run COUNT(*) per table instead of estimates')
-    p['profile'].add_argument('--baseline', metavar='FILE', help='throughput baseline file to use instead of the configured one')
     p['profile'].add_argument('--all-databases', action='store_true',
                               help='add a system sheet with every database in the workspace for ranking and sequencing')
     p['profile'].add_argument('--inventory', metavar='DIR', help='read a saved capture instead of connecting (required for --dry-run without a prior capture)')
@@ -138,29 +121,12 @@ def build_parser():
     p['profile'].add_argument('--step', choices=['P3', 'O4'], default='P3', help='P3 profile before the window (default) or O4 freeze capture with drift')
     p['profile'].add_argument('--redo', action='store_true', help='capture again although the step passed; logs what it rewrites (O4: the copy plan)')
     p['plan'].add_argument('--inventory', metavar='DIR', help='read a saved capture instead of the run inventory')
-    p['plan'].add_argument('--baseline', metavar='FILE', help='throughput baseline file to use instead of the configured one')
-    p['rehearse'].add_argument('--keep', action='store_true', help='leave the throwaway databases for inspection')
-    p['rehearse'].add_argument('--prefix', metavar='NAME', help='rehearsal database prefix, starting with s2rebuild_rehearsal_ (default s2rebuild_rehearsal_<run id>)')
-    p['rehearse'].add_argument('--rows', metavar='N', type=int, default=1000000, help='rows in the keyed and keyless tables (default 1000000)')
-    p['rehearse'].add_argument('--cleanup', action='store_true', help='drop the rehearsal databases of the prefix and exit (asks first unless --yes)')
-    p['rehearse'].add_argument('--from-database', metavar='NAME', help='build the rehearsal source as a sample of this database (sample-database) '
-                                                                        'instead of the synthetic tables')
-    p['rehearse'].add_argument('--percent', metavar='N', type=int, default=1, help='with --from-database: the sample percent (default 1)')
-    p['rehearse'].add_argument('--start-pipelines', action='store_true', help='start the recreated pipelines at the rehearsed O11 '
-                                                                               '(default: created stopped, never started)')
-    p['sample-database'].add_argument('source', metavar='SOURCE', help='the database to sample')
-    p['sample-database'].add_argument('name', metavar='NAME', help='the sample to create; must not be a replacement or retained name of the configured run (a configured source name is allowed while it does not exist)')
-    p['sample-database'].add_argument('--percent', metavar='N', type=int, required=True, help='the rows to take: CRC32 of the key MOD 100 under N '
-                                                                                                '(1 to 100; 100 copies every table whole)')
-    p['sample-database'].add_argument('--tables', metavar='LIST', help='comma-separated tables that get rows (every table is still created)')
     p['run'].add_argument('--from', dest='from_id', metavar='ID', default='O1', help='first step to run (default O1)')
     p['run'].add_argument('--to', dest='to_id', metavar='ID', default='O11', help='last step to run (default O11)')
     p['run'].add_argument('--redo', action='store_true', help='run steps that already passed')
     p['run'].add_argument('--retry-failed', action='store_true', help='O6: also rerun chunks parked after copy.max_attempts failures')
-    p['run'].add_argument('--no-rehearsal', metavar='NOTE', help='O1 only: start without rehearsal evidence; the note is recorded as an event and in the O1 note')
     p['run'].add_argument('--workspace', metavar='NOTE', help='O1 only: the answers to the three workspace questions of P2 (ACTIVE, autoscale off, '
                                                              'auto-suspend off or a keep-alive job); recorded as evidence of the go')
-    p['run'].add_argument('--accept-autoscale', metavar='NOTE', help='O1 only: go on although P2 read autoscale on; the note is recorded')
     p['run'].add_argument('--mode', choices=['production', 'test'], help='O1 only: override run.mode; production asks for a replacement or '
                                                                          'retained name the configuration leaves to the kit, test applies the defaults')
     p['run'].add_argument('--new', action='store_true', help='start a new run at O1 instead of resuming the most recent one; with --run ID '
@@ -169,10 +135,8 @@ def build_parser():
     p['step'].add_argument('--redo', action='store_true', help='run the step even when it already passed')
     p['step'].add_argument('--fresh-table', metavar='TABLE', help='O6 only: load one table with the fresh-table fallback')
     p['step'].add_argument('--retry-failed', action='store_true', help='O6: also rerun chunks parked after copy.max_attempts failures')
-    p['step'].add_argument('--no-rehearsal', metavar='NOTE', help='O1 only: start without rehearsal evidence; the note is recorded as an event and in the O1 note')
     p['step'].add_argument('--workspace', metavar='NOTE', help='O1 only: the answers to the three workspace questions of P2 (ACTIVE, autoscale off, '
                                                               'auto-suspend off or a keep-alive job); recorded as evidence of the go')
-    p['step'].add_argument('--accept-autoscale', metavar='NOTE', help='O1 only: go on although P2 read autoscale on; the note is recorded')
     p['step'].add_argument('--mode', choices=['production', 'test'], help='O1 only: override run.mode; production asks for a replacement or '
                                                                           'retained name the configuration leaves to the kit, test applies the defaults')
     p['step'].add_argument('--idle-workload', metavar='NOTE', help='C1 only: pass without application writes seen; why the live database is idle')
@@ -187,13 +151,6 @@ def build_parser():
     p['gate'].add_argument('--note', metavar='TEXT', required=True, help='what was observed')
     p['gate'].add_argument('--evidence', metavar='FILE', help='file with the evidence (notebook output, query result)')
     p['gate'].add_argument('--override', metavar='NOTE', help='C1 and C2 only: record the gate of a close-out step the kit could not pass, and why')
-    p['watch'].add_argument('--interval', metavar='N', type=int, default=5, help='seconds between process list samples (default 5)')
-    p['watch'].add_argument('--tables', metavar='N', type=int, default=10, help='largest tables to count every 60 seconds (default 10)')
-    p['watch'].add_argument('--until', metavar='TIME', help='stop time, ISO 8601 UTC (default: until Ctrl-C)')
-    p['lockout'].add_argument('--until', metavar='TIME', help='stop time, ISO 8601 UTC (default: the abort deadline)')
-    p['lockout'].add_argument('--kill-only', action='store_true', help='keep killing sessions without revoking or snapshotting grants')
-    p['lockout'].add_argument('--hold', action='store_true',
-                              help='Path B: keep the loop running after the quiet proof until S1 of O10 has run (the source left its STORAGE_ID)')
     p['owner-sql'].add_argument('--rollback', action='store_true', help='O10 only: print the rollback block R1 to R3 instead of the forward block')
     p['owner-sql'].add_argument('step_id', metavar='ID', help='admin step id: %s' % ', '.join(steps.OWNER_SQL_STEPS))
     p['abandon'].add_argument('--execute', action='store_true', help='run the block with the owner profile (needs --note)')
@@ -202,15 +159,6 @@ def build_parser():
                                                                  'then the name is typed again at the prompt (owner profile)')
     p['mark-recopy'].add_argument('table', metavar='TABLE', help='table name as recorded in the journal')
     p['mark-recopy'].add_argument('--bucket', metavar='N', type=int, help='one bucket instead of every bucket of the table')
-    p['calibrate'].add_argument('--journal', metavar='FILE', help='journal to fit (default: the run journal)')
-    p['calibrate'].add_argument('--until', metavar='TIME', help='use chunks that ended before this ISO 8601 UTC time')
-    p['calibrate'].add_argument('--size-gib', metavar='N', type=float, help='total primary files GiB copied, for the GiB per hour figure')
-    p['calibrate'].add_argument('--all-attempts', action='store_true', help='include re-copied chunks (default: first-pass chunks only)')
-    p['bundle'].add_argument('--verify', metavar='ZIP', help='unzip to a temporary folder and compare hashes with the manifest')
-    p['bundle'].add_argument('--include-customer', action='store_true', help='add customer/ to the zip')
-    p['engine-capture'].add_argument('--fixture-database', metavar='NAME',
-                                     help='a database to read SHOW AGGREGATES in and to count ROUTINES and PIPELINES rows as the owner and as the runner')
-    p['engine-capture'].add_argument('--out', metavar='FILE', help='write the capture here instead of tests/engine/helios-<version>.json')
     return parser
 
 
@@ -222,6 +170,7 @@ RUN_NEW, RUN_EXISTING, RUN_NEW_IF_NONE, RUN_FIRST = 'new', 'existing', 'new_if_n
 
 def newest_first(run_dirs):
     """Run directories ordered by the newest change inside them (directory or journal file), newest first."""
+
     def _changed(path):
         times = [path.stat().st_mtime]
         times.extend(child.stat().st_mtime for child in path.rglob('journal.sqlite'))
@@ -355,7 +304,7 @@ class Invocation:
         """
         if not db.defaulted:
             return db
-        recorded = {'replacement': journal.get_meta('replacement_db') or journal.get_meta('target_db'), 'retained': journal.get_meta('retained_db')}
+        recorded = {'replacement': journal.get_meta('replacement_db'), 'retained': journal.get_meta('retained_db')}
         changes = {role: name for role, name in recorded.items() if role in db.defaulted and name and name != getattr(db, role)}
         if not changes:
             return db
@@ -465,6 +414,27 @@ def _header(inv, command):
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
+CAFFEINATE = ('caffeinate', '-i', '-w')
+
+
+def keep_awake(log, dry_run, platform=None, popen=subprocess.Popen):
+    """K2: on macOS start caffeinate -i -w <pid>, so the Mac does not sleep while this command runs; it ends with the process.
+
+    A sleeping Mac is the likeliest real interruption of a copy (LESSONS fact 12). Nothing in a
+    dry run or on another platform; a missing caffeinate is logged, never fatal. Returns the
+    process or None.
+    """
+    if dry_run or (platform or sys.platform) != 'darwin':
+        return None
+    try:
+        proc = popen(list(CAFFEINATE) + [str(os.getpid())], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError as exc:
+        log('caffeinate could not start (%s); keep the Mac awake and on power by hand' % type(exc).__name__)
+        return None
+    log('caffeinate -i -w %d started: the Mac stays awake while this command runs' % os.getpid())
+    return proc
+
+
 def cmd_run(args, env, out, state):
     """run: O1 to O11 in order for the selected databases.
 
@@ -482,11 +452,12 @@ def cmd_run(args, env, out, state):
         inv.refuse_abandoned()
         log = inv.open_log('run')
         log(_header(inv, 'run'))
+        keep_awake(log, inv.dry_run)
         sessions = inv.open_sessions()
         return steps.run_steps(inv.config, inv.databases, inv.journals, log, run_id=inv.run_id, from_id=args.from_id,
                                to_id=args.to_id, redo=args.redo, dry_run=inv.dry_run, yes=args.yes, verbose=args.verbose,
-                               sessions=sessions, options={'retry_failed': args.retry_failed, 'env': env, 'no_rehearsal': args.no_rehearsal,
-                                                           'workspace': args.workspace, 'accept_autoscale': args.accept_autoscale,
+                               sessions=sessions, options={'retry_failed': args.retry_failed, 'env': env,
+                                                           'workspace': args.workspace,
                                                            'mode': args.mode})
     finally:
         inv.close()
@@ -501,8 +472,9 @@ def cmd_step(args, env, out, state):
         inv.refuse_abandoned()
         log = inv.open_log('step-%s' % step.id)
         log(_header(inv, 'step ' + step.id))
-        options = {'retry_failed': args.retry_failed, 'env': env, 'no_rehearsal': args.no_rehearsal, 'workspace': args.workspace,
-                   'accept_autoscale': args.accept_autoscale, 'mode': args.mode}
+        keep_awake(log, inv.dry_run)
+        options = {'retry_failed': args.retry_failed, 'env': env, 'workspace': args.workspace,
+                   'mode': args.mode}
         if args.fresh_table:
             options['fresh_table'] = args.fresh_table
         if args.idle_workload:
@@ -534,8 +506,8 @@ def _gate_warnings(inv, step):
     """The warning lines of a gate whose step has preconditions that are not passed, one per database (steps.unmet_preconditions).
 
     A gate records what a person observed, so it is recorded anyway; the warning says what to pass.
-    The O1 gate also warns for a journal in which O1 never ran: its checks (P2, rehearsal) and its
-    records (window, deadline, names, configuration hash) are missing there.
+    The O1 gate also warns for a journal in which O1 never ran: its check (P2) and its records
+    (window, names, configuration hash) are missing there.
     """
     lines = []
     for db in inv.databases:
@@ -545,8 +517,8 @@ def _gate_warnings(inv, step):
             lines.append('warning: %s: earlier steps are not passed: %s; the %s gate is recorded anyway, since it records what a person '
                          'observed. %s' % (db.source, ', '.join(missing), step.id, steps.missing_hint(missing, db, run_id=inv.run_id)))
         if step.id == 'O1' and journal.get_meta('config_hash') is None:
-            lines.append('warning: %s: O1 has not run in this journal, so its checks (P2, rehearsal evidence) and its records (window, '
-                         'deadline, names, configuration hash) are missing; run s2rebuild run --from O1 --to O1 --redo --db %s%s, then record the go '
+            lines.append('warning: %s: O1 has not run in this journal, so its check (P2) and its records (window, '
+                         'names, configuration hash) are missing; run s2rebuild run --from O1 --to O1 --redo --db %s%s, then record the go '
                          'again' % (db.source, db.source, steps.run_flag(inv.run_id)))
     return lines
 
@@ -559,8 +531,6 @@ def cmd_gate(args, env, out, state):
     C1 and C2, python steps, are gated only with --override NOTE.
     """
     step = steps.gate_step(args.step_id, args.override)
-    if args.passed and step.id in steps.PATH_B_SINGLE_DATABASE_STEPS:
-        steps.path_b_single_database(load_config(args.config, env=env))
     evidence = None
     if args.evidence:
         evidence_path = Path(args.evidence)
@@ -659,19 +629,16 @@ def _evidence_result(evidence, step_id, run_id, passed):
     if data.get('run_id') and str(data['run_id']) != str(run_id):
         raise KitError('The evidence belongs to run %s, not %s' % (data['run_id'], run_id))
     status = str(data.get('status', 'passed'))
-    if passed and 'grant_snapshot' not in data and status != 'passed':
+    if passed and status != 'passed':
         raise KitError('The evidence reports status "%s"; a gate cannot pass on it' % status)
     return data
 
 
 def _import_evidence(ctx, step_id, result, log):
-    """Bring what a notebook result carries into the journal: the O2 pipeline capture, the lockout snapshot, observed attachments."""
+    """Bring what a notebook result carries into the journal: the O2 pipeline capture and observed attachments."""
     if step_id == 'O2' and result.get('capture'):
         directory = pipelines.import_capture(ctx, result['capture'])
         log('O2 pipeline capture imported from the notebook result into %s' % directory)
-    if step_id == 'O3' and result.get('grant_snapshot'):
-        written = grants.record_snapshot(ctx.journal, result['grant_snapshot'])
-        log('grants snapshot from the notebook lockout recorded: %d new account row(s); existing rows are kept' % written)
     for att in result.get('attachments') or []:
         row = att.get('row') or {}
         if att.get('role') in ('source', 'replacement', 'retained', 'live') and row.get('STORAGE_ID'):
@@ -700,25 +667,6 @@ def cmd_status(args, env, out, state):
         return EXIT_DONE
     finally:
         inv.close()
-
-
-def _baseline_for(config, override=None):
-    """The baseline: --baseline FILE, else the configured file when present, else the shipped default."""
-    if override:
-        path = Path(override)
-        if not path.is_file():
-            raise KitError('Baseline file not found: %s' % path)
-        return estimate.load_baseline(path)
-    configured = config.estimate.baseline
-    return estimate.load_baseline(config.resolve(configured) if configured else None)
-
-
-def _rehearsal_note(config):
-    runs_dir = config.runs_dir()
-    if not runs_dir.is_dir():
-        return None
-    found = sorted(p.parent.name for p in runs_dir.glob('*/rehearsal') if p.is_dir())
-    return ('run %s has rehearsal evidence' % found[-1]) if found else None
 
 
 def _open_sessions(inv, env):
@@ -798,13 +746,12 @@ def cmd_profile(args, env, out, state):
         log(_header(inv, 'profile ' + step_id))
         for line in notes:
             log(line)
-        baseline = _baseline_for(inv.config, args.baseline)
         if inv.dry_run and inv.run_id == DRY_RUN_ID and not args.out:
             raise KitError('No run exists yet; a dry run needs --out FILE for the workbook')
         exit_code = EXIT_DONE
         captured, sessions = [], []
         try:
-            # every capture and its estimate first, so the window fit is one for the run: the databases in sequence (section 10.6)
+            # every capture and its estimate first, then the files
             for db in inv.databases:
                 journal = inv.journals[db.source]
                 target_dir = inventory.inventory_dir(inv.config, inv.run_id, db, step_id)
@@ -839,14 +786,13 @@ def cmd_profile(args, env, out, state):
                         inventory.write(data, target_dir, plans)
                         raise
                 pipeline_count = len(data['pipelines']['items']) if data.get('pipelines', {}).get('captured') else 0
-                est = estimate.estimate(plans, inv.config, baseline, pipeline_count, leaf_cores=inventory.recorded_leaf_cores(journal))
+                est = estimate.estimate(plans, inv.config, pipeline_count)
                 captured.append((db, journal, target_dir, out_path, data, plans, est, runner_session))
-            fit = estimate.run_fit([c[6] for c in captured], inv.config.window)
             for db, journal, target_dir, out_path, data, plans, est, runner_session in captured:
                 if not inv.dry_run:
                     journal.step_start(step_id)
                 try:
-                    _write_profile(inv.config, inv.run_id, journal, inv.dry_run, db, step_id, data, plans, est, fit, baseline, target_dir, out_path,
+                    _write_profile(inv.config, inv.run_id, journal, inv.dry_run, db, step_id, data, plans, est, target_dir, out_path,
                                    runner_session if args.all_databases else None, log, env, all_databases=args.all_databases)
                     if not inv.dry_run:
                         journal.set_meta('inventory_dir_' + step_id, str(target_dir))
@@ -868,8 +814,6 @@ def cmd_profile(args, env, out, state):
                 if not inv.dry_run:
                     # the last journal write, as in run_step: a stop before it leaves the step not passed
                     journal.step_end(step_id, 'passed', '%s captured %d tables; workbook %s' % (step_id, len(plans), out_path), str(out_path))
-                if fit is not None and not fit.fits:
-                    exit_code = EXIT_GATE
         finally:
             for s in sessions:
                 if s is not None:
@@ -895,7 +839,7 @@ def _ask_pipeline_credentials(inv, db, data, log, env):
     prompts.pipeline_credentials(pipes['items'], inv.config, inv.journals[db.source], log, env, inv.log.redactor, step='P3')
 
 
-def _write_profile(config, run_id, journal, dry_run, db, step_id, data, plans, est, fit, baseline, target_dir, out_path, runner_session, log, env,
+def _write_profile(config, run_id, journal, dry_run, db, step_id, data, plans, est, target_dir, out_path, runner_session, log, env,
                    all_databases=False):
     """The files of a profile: the inventory, drift.json and plan.json (O4), the workbook; a dry run writes the workbook only.
 
@@ -904,8 +848,7 @@ def _write_profile(config, run_id, journal, dry_run, db, step_id, data, plans, e
     if not dry_run:
         inventory.write(data, target_dir, plans)
         log('%s: inventory written to %s (%d tables, %d buckets)' % (db.source, target_dir, len(plans), sum(p.n_buckets for p in plans)))
-    for line in estimate.fit_lines(est, fit):
-        log.plain('    ' + line)
+    log.plain('    ' + estimate.estimate_line(est))
     if step_id == 'O4':
         before_dir = inventory.inventory_dir(config, run_id, db, 'P3')
         if (before_dir / inventory.INVENTORY_FILE).is_file():
@@ -918,12 +861,12 @@ def _write_profile(config, run_id, journal, dry_run, db, step_id, data, plans, e
             log('    drift: no P3 inventory to compare against')
         if not dry_run:
             inventory.write_private(target_dir / 'plan.json', json.dumps([p.describe() for p in plans], indent=1))
-    report_xlsx.write_profile_workbook(out_path, data, plans, est, fit, config, db, run_id, baseline, steps_board=journal.steps_board(), env=env)
+    report_xlsx.write_profile_workbook(out_path, data, plans, est, config, db, run_id, steps_board=journal.steps_board(), env=env)
     if all_databases:
         if runner_session is None:
             log('    --all-databases needs a live connection; skipped in this mode')
         else:
-            rows = inventory.system_profile(runner_session, config, baseline, estimate)
+            rows = inventory.system_profile(runner_session, config)
             report_xlsx.write_system_sheet(out_path, rows)
             log('    system sheet: %d databases' % len(rows))
     log('%s: workbook written to %s (Summary plus %d table tabs)' % (db.source, out_path, len(plans)))
@@ -934,10 +877,9 @@ def handle_o4(step, ctx):
 
     profile --step O4 stays for a rerun (--redo) and for --exact-counts or --all-databases. The
     runner session reads behind the read guard; the owner session, when configured, reads the
-    routines and the write-capable accounts (on Path A the source is READ ONLY, so no pipeline
+    routines and the write-capable accounts (the source is READ ONLY, so no pipeline
     view is read; O9 replays the O2 capture). A load target the replacement will not hold
-    (routines.pipeline_target_refusals) fails the step with its capture kept for review. With
-    a window, the fit lines are printed; the abort deadline of O6 keeps the time limit. A dry run
+    (routines.pipeline_target_refusals) fails the step with its capture kept for review. A dry run
     reads nothing and writes nothing. Statements issued: the reads of inventory.capture.
     """
     config, db, journal, log = ctx.config, ctx.db, ctx.journal, ctx.log
@@ -949,14 +891,11 @@ def handle_o4(step, ctx):
         return steps.Outcome(steps.STUB, 'dry run: the freeze capture reads the source and writes inventory/O4; '
                                         's2rebuild profile --step O4 --dry-run shows the plan from a saved capture')
     out_path = config.runs_dir() / ctx.run_id / db.source / 'reports' / 'freeze-capture.xlsx'
-    baseline = _baseline_for(config)
     env = ctx.options.get('env') or {}
     runner = ctx.runner_session(read_guard('runner O4'))
     owner = ctx.owner_session(read_guard('owner O4')) if ctx.owner_configured else None
-    # the rehearsal passes a no-op pause for the session samples of its throwaway source (ctx.options['capture_sleep'])
-    pause = {'sleep': ctx.options['capture_sleep']} if ctx.options.get('capture_sleep') else {}
     try:
-        data = inventory.capture(runner, db, config, owner, log=log, step='O4', **pause)
+        data = inventory.capture(runner, db, config, owner, log=log, step='O4')
     finally:
         for s in (runner, owner):
             if s is not None:
@@ -969,134 +908,43 @@ def handle_o4(step, ctx):
             inventory.write(data, target_dir, plans)  # kept for review, as profile does
             return steps.Outcome(steps.FAILED, str(exc), EXIT_GATE)
     pipeline_count = len(data['pipelines']['items']) if data.get('pipelines', {}).get('captured') else 0
-    cores = inventory.recorded_leaf_cores(journal)
-    est = estimate.estimate(plans, config, baseline, pipeline_count, leaf_cores=cores)
-    fit = _o4_run_fit(config, ctx.run_id, db, est, baseline, cores, log)
-    _write_profile(config, ctx.run_id, journal, False, db, 'O4', data, plans, est, fit, baseline, target_dir, out_path, None, log, env)
+    est = estimate.estimate(plans, config, pipeline_count)
+    _write_profile(config, ctx.run_id, journal, False, db, 'O4', data, plans, est, target_dir, out_path, None, log, env)
     journal.set_meta('inventory_dir_O4', str(target_dir))
     if data.get('attachment'):
         journal.record_attachment_row('source', dict(data['attachment'], DATABASE_NAME=db.source))
-    note = 'O4 captured %d tables; workbook %s' % (len(plans), out_path)
-    if fit is not None and not fit.fits:
-        note += '; the estimate at the high band does not fit the window (see the fit lines above); O6 keeps the abort deadline'
-    return steps.Outcome(steps.PASSED, note)
+    return steps.Outcome(steps.PASSED, 'O4 captured %d tables; workbook %s' % (len(plans), out_path))
 
 
-def _o4_run_fit(config, run_id, db, est, baseline, leaf_cores, log):
-    """The run's window fit at O4: this database's fresh estimate with the other configured databases from their newest capture
-    (O4, else P3); a database without a capture is left out with a log line. None without a window."""
-    if config.window is None:
-        return None
-    estimates = [est]
-    for other in config.databases:
-        if other.source == db.source:
-            continue
-        source = next((d for d in (inventory.inventory_dir(config, run_id, other, s) for s in ('O4', 'P3'))
-                       if (d / inventory.INVENTORY_FILE).is_file()), None)
-        if source is None:
-            log('    fit: %s has no capture yet; the run fit leaves it out' % other.source)
-            continue
-        data = inventory.load(source)
-        count = len(data['pipelines']['items']) if data.get('pipelines', {}).get('captured') else 0
-        estimates.append(estimate.estimate(inventory.plan_tables(data, config, other), config, baseline, count, leaf_cores=leaf_cores))
-    return estimate.run_fit(estimates, config.window)
-
-
-def _journal_facts(inv, db):
-    """(workspace facts, skipped pipeline source types, leaf cores) from the run's journal for db, read only; (None, set(), None)
-    without a journal.
-
-    The plan sheet prints the Workspace line P2 recorded and the pipelines the operator skipped
-    at the P3 credential prompt; the estimate scales its rates by the leaf cores P2 recorded.
-    """
-    from . import workspace
+def _skipped_types(inv, db):
+    """The pipeline source types the operator skipped at the P3 credential prompt, from the run's journal for db, read only; an empty set
+    without a journal."""
     path = inv.journal_path(db)
     if inv.dry_run or not path.exists():
-        return None, set(), None
+        return set()
     journal = Journal(path, read_only=True)
     try:
-        return workspace.recorded(journal), pipelines.skipped_types(journal), inventory.recorded_leaf_cores(journal)
-    finally:
-        journal.close()
-
-
-def _leaf_cores_at(journal_path):
-    """The leaf cores P2 recorded in the journal at journal_path, read only; None when the file is not a kit journal."""
-    try:
-        journal = Journal(journal_path, read_only=True)
-    except KitError:
-        return None
-    try:
-        return inventory.recorded_leaf_cores(journal)
+        return pipelines.skipped_types(journal)
     finally:
         journal.close()
 
 
 def cmd_plan(args, env, out, state):
-    """plan: print the P4 plan sheet from the run's P3 inventory (or --inventory DIR); the window fit is one for the run."""
+    """plan: print the P4 plan sheet from the run's P3 inventory (or --inventory DIR)."""
     inv = Invocation(args, env, out, state, run_mode=RUN_EXISTING, dry_run=bool(args.inventory) or args.dry_run)
     try:
-        baseline = _baseline_for(inv.config, args.baseline)
-        sheets = []
         for db in inv.databases:
             source = Path(args.inventory) if args.inventory else inventory.inventory_dir(inv.config, inv.run_id, db, 'P3')
             data = inventory.load(source)
             plans = inventory.plan_tables(data, inv.config, db)
             pipeline_count = len(data['pipelines']['items']) if data.get('pipelines', {}).get('captured') else 0
-            facts, skipped, cores = _journal_facts(inv, db)
-            est = estimate.estimate(plans, inv.config, baseline, pipeline_count, leaf_cores=cores)
-            sheets.append((db, data, est, facts, skipped))
-        fit = estimate.run_fit([s[2] for s in sheets], inv.config.window)
-        for db, data, est, facts, skipped in sheets:
-            for line in estimate.plan_sheet(inv.config, db, inv.run_id, data, est, fit, _rehearsal_note(inv.config), env,
-                                            workspace=facts, skipped=skipped):
+            est = estimate.estimate(plans, inv.config, pipeline_count)
+            for line in estimate.plan_sheet(inv.config, db, inv.run_id, data, est, env, skipped=_skipped_types(inv, db)):
                 print(line, file=out)
             print('', file=out)
         return EXIT_DONE
     finally:
         inv.close()
-
-
-def cmd_calibrate(args, env, out, state):
-    """calibrate: fit the throughput constants from a journal and write the baseline file."""
-    if args.journal:
-        config = load_config(args.config, env=env)
-        journal_path = Path(args.journal)
-        run_id = journal_path.parent.parent.name if journal_path.parent.parent.name else None
-    else:
-        inv = Invocation(args, env, out, state, run_mode=RUN_EXISTING, dry_run=False)
-        try:
-            if len(inv.databases) != 1:
-                raise KitError('calibrate works on one journal; pass --db NAME or --journal FILE')
-            config = inv.config
-            journal_path = inv.journal_path(inv.databases[0])
-            run_id = inv.run_id
-        finally:
-            inv.close()
-    cal = estimate.calibrate(journal_path, until=args.until, first_pass_only=not args.all_attempts, workers=config.copy.workers,
-                             compute_size=config.workspace.compute_size, run_id=run_id, leaf_cores=_leaf_cores_at(journal_path))
-    size = args.size_gib
-    if size is None:
-        try:
-            conn = sqlite3.connect(read_only_uri(journal_path), uri=True)
-            try:
-                total = conn.execute('SELECT SUM(size_gib) FROM tables').fetchone()[0]
-            finally:
-                conn.close()
-            size = float(total) if total else None
-        except sqlite3.DatabaseError:
-            size = None
-    for line in estimate.calibration_lines(cal, size):
-        print(line, file=out)
-    if args.dry_run:
-        print('DRY RUN: baseline not written.', file=out)
-        return EXIT_DONE
-    if not config.estimate.baseline:
-        print('estimate.baseline is null in the configuration; baseline not written.', file=out)
-        return EXIT_DONE
-    path = estimate.write_baseline(config.resolve(config.estimate.baseline), cal.baseline)
-    print('baseline written to %s' % path, file=out)
-    return EXIT_DONE
 
 
 def cmd_mark_recopy(args, env, out, state):
@@ -1185,76 +1033,17 @@ def cmd_resume(args, env, out, state):
         inv.close()
 
 
-def _protected_users(config):
-    users = {config.runner.user}
-    if config.owner is not None:
-        users.add(config.owner.user)
-    users.update(config.freeze.lockout.protected_accounts)
-    return users
-
-
-def cmd_watch(args, env, out, state):
-    """watch: the writer watch on one database."""
-    inv = Invocation(args, env, out, state, run_mode=RUN_EXISTING)
-    try:
-        if len(inv.databases) != 1:
-            raise KitError('watch works on one database; pass --db NAME')
-        db = inv.databases[0]
-        inv.open_journals()
-        log = inv.open_log('watch')
-        data, plans, _ = inv.plans_for(db)
-        sessions = inv.open_sessions()
-        session = sessions.runner(read_guard('runner watch'))
-        if inv.dry_run:
-            session.query(inventory.PROCESSLIST_SQL, (db.source, '%' + db.source + '%'))
-            for p in sorted(plans, key=lambda p: -p.est_rows)[:args.tables]:
-                session.query('SELECT COUNT(*) AS n FROM ' + '`%s`.`%s`' % (db.source, p.name))
-            log('DRY RUN: the watch would repeat these statements every %d s (counts every 60 s); no connection was opened' % args.interval)
-            return EXIT_DONE
-        until = parse_utc(args.until, '--until') if args.until else None
-        watch.watch(session, db.source, plans, _protected_users(inv.config), log, interval=args.interval, tables=args.tables, until=until)
-        return EXIT_DONE
-    finally:
-        inv.close()
-
-
-def cmd_quiet_proof(args, env, out, state):
-    """quiet-proof: the Path B proof that the source is quiet; writes freeze_time on success."""
-    inv = Invocation(args, env, out, state, run_mode=RUN_EXISTING)
-    try:
-        if len(inv.databases) != 1:
-            raise KitError('quiet-proof works on one database; pass --db NAME')
-        db = inv.databases[0]
-        inv.open_journals()
-        log = inv.open_log('quiet-proof')
-        data, plans, _ = inv.plans_for(db)
-        sessions = inv.open_sessions()
-        session = sessions.runner(read_guard('runner quiet-proof'))
-        owner = sessions.owner(read_guard('owner quiet-proof')) if inv.config.owner is not None else None
-        if inv.dry_run:
-            session.query(inventory.PROCESSLIST_SQL, (db.source, '%' + db.source + '%'))
-            if owner is not None:
-                owner.query(inventory.PIPELINES_SQL, (db.source,))
-            log('DRY RUN: the quiet proof would take these samples twice, 60 s apart; no connection was opened')
-            return EXIT_DONE
-        passed, _ = watch.quiet_proof(session, owner, db.source, plans, _protected_users(inv.config), inv.journals[db.source], log)
-        return EXIT_DONE if passed else EXIT_GATE
-    finally:
-        inv.close()
-
-
 def cmd_report(args, env, out, state):
     """report: write the final workbook and the Markdown run report for the run."""
     inv = Invocation(args, env, out, state, run_mode=RUN_EXISTING)
     try:
         inv.open_journals(read_only=not inv.dry_run, report_only=True)
-        baseline = _baseline_for(inv.config)
         for db in inv.databases:
             data, plans, _ = inv.plans_for(db)
             reports = inv.config.runs_dir() / inv.run_id / db.source / 'reports'
             suffix = '-dry-run' if inv.dry_run else ''
             xlsx = report_xlsx.write_final_workbook(reports / ('final%s.xlsx' % suffix), data, plans, inv.journals[db.source], inv.config, db,
-                                                    inv.run_id, baseline, env)
+                                                    inv.run_id, env)
             md = report_md.write_run_report(reports / ('run-report%s.md' % suffix), data, plans, inv.journals[db.source], inv.config, db, inv.run_id)
             print('%s: final workbook %s and run report %s written' % (db.source, xlsx, md), file=out)
         return EXIT_DONE
@@ -1294,8 +1083,6 @@ def cmd_owner_sql(args, env, out, state):
         raise KitError('owner-sql covers %s; %s is not an admin step with a block' % (', '.join(steps.OWNER_SQL_STEPS), step_id))
     if args.rollback and step_id != 'O10':
         raise KitError('--rollback applies to O10 only')
-    if step_id in steps.PATH_B_SINGLE_DATABASE_STEPS:
-        steps.path_b_single_database(load_config(args.config, env=env))
     inv = Invocation(args, env, out, state, run_mode=RUN_EXISTING)
     try:
         inv.open_journals(read_only=not inv.dry_run)
@@ -1318,7 +1105,6 @@ def cmd_owner_sql(args, env, out, state):
 
 def cmd_owner_notebook(args, env, out, state):
     """owner-notebook: generate owner-steps.ipynb for the run with one cell per admin step; a dry run prints what it would write and writes nothing."""
-    steps.path_b_single_database(load_config(args.config, env=env))
     inv = Invocation(args, env, out, state, run_mode=RUN_EXISTING)
     try:
         inv.open_journals()
@@ -1331,7 +1117,7 @@ def cmd_owner_notebook(args, env, out, state):
                 print('DRY RUN: %s: would write the notebook to %s (%d blocks: %s; pipeline capture from %s); nothing was written' % (
                     db.source, path, len(blocks), ', '.join(blocks), inputs['capture_step'] or 'none yet'), file=out)
                 continue
-            path = notebook.generate(path, names, inv.config, blocks, inputs['grants'], items=inputs['pipelines'], capture_step=inputs['capture_step'])
+            path = notebook.generate(path, names, inv.config, blocks, items=inputs['pipelines'], capture_step=inputs['capture_step'])
             notebook.first_cell_compiles(path)
             print('%s: notebook written to %s (%d blocks, mode 0600, first cell compiles; pipeline capture from %s)' % (
                 db.source, path, len(blocks), inputs['capture_step'] or 'none yet'), file=out)
@@ -1373,13 +1159,24 @@ def cmd_account_sql(args, env, out, state):
 
             def _substitute(sql):
                 return sql.replace("'%s'" % ownersql.PASSWORD_PLACEHOLDER, sql_literal(password))
-            ownersql.execute_block(block, owner, log, inv.journals[db.source], _substitute)
+            results = ownersql.execute_block(block, owner, log, inv.journals[db.source], _substitute)
         finally:
             owner.close()
         print('%s executed with the owner profile' % ('C4 account removal' if args.drop else 'P1 account creation'), file=out)
+        if args.drop:
+            _record_c4(inv, results, log)
         return EXIT_DONE
     finally:
         inv.close()
+
+
+def _record_c4(inv, results, log):
+    """B6: the C4 gate after account-sql --drop --execute, in every selected journal: the privileges before the DROP USER and after it."""
+    observed = dict(results)
+    note = 'C4 by account-sql --drop --execute: DROP USER %s; privileges before: %s; after: %s' % (
+        inv.config.runner.user, observed.get('runner account still has privileges', 'not read'), observed.get('zero privileges remain', 'not read'))
+    steps.record_gate(inv.journals, 'C4', True, note)
+    log('gate C4 recorded as PASS for run %s, database(s) %s: %s' % (inv.run_id, ', '.join(inv.journals), note))
 
 
 def _runner_password(inv, db, owner, log):
@@ -1449,168 +1246,6 @@ def cmd_cleanup(args, env, out, state):
         inv.close()
 
 
-def cmd_lockout(args, env, out, state):
-    """lockout: Path B revoke and kill loop with the quiet proof (owner profile required); --hold passes on until S1 of O10 has run.
-
-    Path B is single database (steps.path_b_single_database): with several configured databases
-    the command refuses before any run, journal or connection is opened, so no snapshot is taken
-    and no REVOKE is issued that no O11 of the run could give back.
-    """
-    steps.path_b_single_database(load_config(args.config, env=env))
-    inv = Invocation(args, env, out, state, run_mode=RUN_EXISTING)
-    try:
-        if len(inv.databases) != 1:
-            raise KitError('lockout works on one database; pass --db NAME')
-        db = inv.databases[0]
-        until = parse_utc(args.until, '--until') if args.until else None
-        if until is not None and until <= utc_now():
-            raise KitError('--until %s is not in the future' % args.until)
-        inv.open_journals()
-        log = inv.open_log('lockout')
-        sessions = inv.open_sessions()
-        ctx = _step_context(inv, db, log)
-        if inv.dry_run or inv.config.owner is None:
-            outcome = lockout.handle_o3_lockout(steps.REGISTRY['O3'], ctx)
-            return outcome.exit_code if inv.config.owner is None and not inv.dry_run else EXIT_DONE
-        if until is None:
-            until = lockout.default_until(inv.journals[db.source], inv.config)
-            if until is not None and until <= utc_now():
-                raise KitError('the abort deadline %s is already past; pass --until to run the lockout anyway' % until.isoformat())
-        data, plans, _ = copy_module.load_plans(ctx)
-        run_dir = inv.config.runs_dir() / inv.run_id / db.source
-        run_dir.mkdir(parents=True, exist_ok=True)
-        admin, held, snap = lockout.prepare(sessions, db, inv.config, inv.journals[db.source], log, run_dir / 'grants-snapshot.json',
-                                            kill_only=args.kill_only)
-        runner = sessions.runner(read_guard('runner lockout'))
-
-        def _quiet():
-            ok, _ = watch.quiet_proof(runner, admin, db.source, plans, lockout.protected_users(inv.config), inv.journals[db.source], log)
-            return ok
-        hold = (lambda: switch.s1_ran(admin, inv.journals[db.source], db.source)) if args.hold else None
-        summary = lockout.run_lockout(held, db.source, snap, inv.journals[db.source], log, inv.config, until=until,
-                                      stop_file=copy_module.stop_file_for(inv.journal_path(db)), quiet_hook=_quiet, skip_grants=args.kill_only,
-                                      hold_hook=hold)
-        return EXIT_DONE if summary['quiet_proof'] or summary['s1_ran'] else EXIT_GATE
-    finally:
-        inv.close()
-
-
-def cmd_rehearse(args, env, out, state):
-    """rehearse: P5 throwaway copy and switch with a kill test."""
-    inv = Invocation(args, env, out, state, run_mode=RUN_NEW_IF_NONE)
-    try:
-        if len(inv.databases) != 1:
-            raise KitError('rehearse works on one configured database; pass --db NAME')
-        db = inv.databases[0]
-        inv.open_journals()
-        log = inv.open_log('rehearse')
-        sessions = inv.open_sessions()
-        ctx = _step_context(inv, db, log)
-        prefix = rehearse.check_prefix(args.prefix or rehearse.default_prefix(inv.run_id), inv.config)
-        if args.cleanup:
-            owner = inv.config.owner is not None and not inv.dry_run
-            session = sessions.owner(rehearse.cleanup_guard(prefix)) if owner else sessions.runner(rehearse.rehearsal_guard(prefix))
-            try:
-                if inv.dry_run:
-                    for name in rehearse.rehearsal_names(prefix).values():
-                        session.execute('DROP DATABASE ' + '`%s`' % name)
-                    return EXIT_DONE
-                found = rehearse.existing_names(session, prefix, records=owner)
-                if not found:
-                    log('rehearsal cleanup: no database with the prefix %s exists' % prefix)
-                    return EXIT_DONE
-                if not _confirm('Drop %s? Type yes: ' % ', '.join(found), args.yes):
-                    raise KitError('rehearse --cleanup would drop %s; pass --yes or confirm at a terminal' % ', '.join(found))
-                rehearse.cleanup(session, prefix, log, owner=owner)
-            finally:
-                session.close()
-            return EXIT_DONE
-        outcome = rehearse.run(ctx, prefix, rows=args.rows, keep=args.keep, from_database=args.from_database, percent=args.percent,
-                               start_pipelines=args.start_pipelines)
-        log('rehearsal: ' + outcome.note)
-        return outcome.exit_code
-    finally:
-        inv.close()
-
-
-def cmd_sample_database(args, env, out, state):
-    """sample-database SOURCE NAME --percent N: build NAME as a sample of SOURCE with the runner (views and routines with the owner profile).
-
-    No run is opened: the sample is a tool for the rehearsal and the lab. The log goes to the
-    terminal, redacted as every command's log is. A dry run opens no connection and prints what
-    the command would do; the table statements need the capture, so none is printed.
-    """
-    config = load_config(args.config, env=env)
-    sample.check_names(args.source, args.name, config)
-    tables = [t.strip() for t in str(args.tables or '').split(',') if t.strip()]
-    for table in tables:
-        ident(table)
-    percent = sample.check_percent(args.percent)
-    users = [config.runner.user] + ([config.owner.user] if config.owner is not None else [])
-    redactor = Redactor([config.workspace.host, str(config.resolve(config.workspace.ca_file))], soft=users)
-    state['redactor'] = redactor
-    log = Log(redactor=redactor, stream=out, verbose=state['verbose'])
-    state['log'] = log
-    if args.dry_run:
-        log('DRY RUN: sample-database would capture %s and build %s as a %d percent sample of it (every table by LIKE, the rows by CRC32 of the '
-            'key MOD 100 under %d, reference and small tables whole, then the views and routines%s); no connection was opened and the table '
-            'statements need the capture, so none is printed' % (args.source, args.name, percent, percent,
-                                                                  '' if config.owner is not None else ', which need the owner profile'))
-        return EXIT_DONE
-    sessions = SessionFactory(config, env, log, False)
-    try:
-        summary = sample.build(sessions.runner, sessions.owner if config.owner is not None else None, args.source, args.name, percent, config, log,
-                               tables or None)
-    finally:
-        sessions.close()
-    for line in sample.summary_lines(summary):
-        log(line)
-    return EXIT_DONE
-
-
-def _flag_rows(parser, command):
-    rows = []
-    for action in parser._actions:  # noqa: SLF001 - argparse offers no public walk
-        if isinstance(action, argparse._HelpAction) or isinstance(action, argparse._VersionAction):  # noqa: SLF001
-            continue
-        if isinstance(action, argparse._SubParsersAction):  # noqa: SLF001
-            continue
-        if action.option_strings:
-            flag = ', '.join(action.option_strings)
-            if action.metavar:
-                flag += ' ' + action.metavar
-        else:
-            flag = action.metavar or action.dest
-        default = action.default
-        if default in (argparse.SUPPRESS, None, False):
-            default = ''
-        rows.append((command, flag, str(default), (action.help or '').replace('|', 'or')))
-    return rows
-
-
-def docs_flags_markdown(parser=None):
-    """The Markdown flag table for docs/CONFIG.md: global flags, then every command."""
-    parser = parser or build_parser()
-    rows = _flag_rows(parser, '(global)')
-    subparsers = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction))  # noqa: SLF001
-    for name in COMMAND_NAMES:
-        sub_rows = [r for r in _flag_rows(subparsers.choices[name], name)
-                    if r[1].split(',')[0].split(' ')[0] not in GLOBAL_FLAGS]
-        if not sub_rows:
-            sub_rows = [(name, '', '', '(global flags only)')]
-        rows.extend(sub_rows)
-    lines = ['| Command | Flag | Default | Description |', '|---|---|---|---|']
-    for command, flag, default, help_text in rows:
-        lines.append('| %s | %s | %s | %s |' % (command, ('`%s`' % flag) if flag else '', default, help_text))
-    return '\n'.join(lines) + '\n'
-
-
-def cmd_docs_flags(args, env, out, state):
-    """docs-flags: print the flag table."""
-    print(docs_flags_markdown(), file=out, end='')
-    return EXIT_DONE
-
-
 def cmd_check(args, env, out, state):
     """check: the P2 preflight for every selected database (connection, privileges, layout, STORAGE_ID, names, compute size).
 
@@ -1622,8 +1257,6 @@ def cmd_check(args, env, out, state):
     step = steps.REGISTRY['P2']
     inv = Invocation(args, env, out, state, run_mode=RUN_NEW_IF_NONE)
     try:
-        # a configuration that can never run is refused first, before the journal rules and before anything is written
-        steps.path_b_single_database(inv.config)
         inv.open_journals(create=False)
         if not inv.dry_run:
             _entry_checks(inv, step)
@@ -1641,69 +1274,20 @@ def cmd_check(args, env, out, state):
         inv.close()
 
 
-def cmd_bundle(args, env, out, state):
-    """bundle: MANIFEST.json, the denylist and style scan, the zip under dist/; --verify ZIP checks a zip against its manifest."""
-    root = bundle.kit_root()
-    if args.verify:
-        problems = bundle.verify(args.verify)
-        for line in problems:
-            print('MISMATCH: ' + line, file=out)
-        if problems:
-            return EXIT_MISMATCH
-        print('verify passed: every file in %s matches its manifest hash' % args.verify, file=out)
-        return EXIT_DONE
-    result = bundle.build(root, include_customer=args.include_customer, dry_run=args.dry_run)
-    for line in result['lines']:
-        print(line, file=out)
-    return EXIT_DONE
-
-
-def cmd_engine_capture(args, env, out, state):
-    """engine-capture: read the engine with the owner profile and write tests/engine/helios-<version>.json (reads only; no run is opened).
-
-    The owner session reads the version, the view columns, the PASSWORD_ variables and, with
-    --fixture-database, SHOW AGGREGATES and the ROUTINES and PIPELINES counts; the runner session
-    counts the same two views, so the file records what the runner sees against the owner. A dry
-    run prints the statements and writes nothing.
-    """
-    config = load_config(args.config, env=env)
-    if config.owner is None and not args.dry_run:
-        raise KitError('engine-capture needs connections.owner in the configuration: the view columns and SHOW AGGREGATES are read with the owner profile')
-    fixture = args.fixture_database
-    if fixture is not None:
-        ident(fixture)  # the shape check before any connection opens; the name itself never reaches the file
-    log = Log(state['redactor'], stream=out, verbose=state['verbose'])
-    sessions = SessionFactory(config, env, log, args.dry_run)
-    try:
-        owner = sessions.owner(read_guard('owner engine-capture'))
-        runner = sessions.runner(read_guard('runner engine-capture')) if fixture else None
-        data = enginecapture.capture(owner, fixture, runner)
-    finally:
-        sessions.close()
-    if args.dry_run:
-        print('DRY RUN: engine-capture issued the reads above and writes nothing', file=out)
-        return EXIT_DONE
-    path = Path(args.out) if args.out else enginecapture.default_path(bundle.kit_root(), data['engine_version'])
-    written = enginecapture.write_capture(data, path)
-    for line in enginecapture.summary_lines(data, written):
-        print(state['redactor'](line), file=out)
-    return EXIT_DONE
-
-
 def not_implemented(name, milestone):
     """A handler that refuses a command whose module lands in a later milestone."""
+
     def _handler(args, env, out, state):
         print('REFUSED: %s is not available in this build; it arrives in %s. Nothing was run.' % (name, milestone), file=out)
         return EXIT_REFUSED
     return _handler
 
 
-DISPATCH = {'run': cmd_run, 'step': cmd_step, 'gate': cmd_gate, 'status': cmd_status, 'docs-flags': cmd_docs_flags,
-            'profile': cmd_profile, 'plan': cmd_plan, 'calibrate': cmd_calibrate, 'mark-recopy': cmd_mark_recopy, 'pause': cmd_pause,
-            'resume': cmd_resume, 'watch': cmd_watch, 'quiet-proof': cmd_quiet_proof, 'report': cmd_report, 'owner-sql': cmd_owner_sql,
-            'owner-notebook': cmd_owner_notebook, 'account-sql': cmd_account_sql, 'lockout': cmd_lockout, 'rehearse': cmd_rehearse,
-            'check': cmd_check, 'bundle': cmd_bundle, 'abandon': cmd_abandon, 'engine-capture': cmd_engine_capture, 'cleanup': cmd_cleanup,
-            'sample-database': cmd_sample_database}
+DISPATCH = {'run': cmd_run, 'step': cmd_step, 'gate': cmd_gate, 'status': cmd_status,
+            'profile': cmd_profile, 'plan': cmd_plan, 'mark-recopy': cmd_mark_recopy, 'pause': cmd_pause,
+            'resume': cmd_resume, 'report': cmd_report, 'owner-sql': cmd_owner_sql,
+            'owner-notebook': cmd_owner_notebook, 'account-sql': cmd_account_sql,
+            'check': cmd_check, 'abandon': cmd_abandon, 'cleanup': cmd_cleanup}
 for _name, _label, _help, _milestone in COMMANDS:
     if _milestone is not None:
         DISPATCH[_name] = not_implemented(_name, _milestone)

@@ -9,7 +9,6 @@ import unittest
 from unittest import mock
 
 from s2rebuild import copy as C
-from s2rebuild import estimate as E
 from s2rebuild import inventory as I
 from s2rebuild import steps
 from s2rebuild import verify as V
@@ -146,7 +145,6 @@ class SqlTests(unittest.TestCase):
         cfg = config_from()
         self.assertEqual(V.fingerprint_groups(plan, cfg), 3)
         self.assertEqual(V.fingerprint_groups(I.TablePlan('t', ['a'], 10, 'row', [], '', 1), cfg), 64)
-        self.assertAlmostEqual(V.fingerprint_cost_seconds(plan, E.DEFAULT_BASELINE), 2 * 25_000_000 * E.DEFAULT_SCAN_S_PER_ROW)
 
 
 class TierTests(unittest.TestCase):
@@ -285,7 +283,6 @@ class StaleCheckAndHandlersTests(unittest.TestCase):
         self.assertIn('Copy wall expected', summary)
         self.assertIn('Rows per hour actual', summary)
         self.assertEqual(summary['Write-capable'], 'none found')
-        self.assertEqual(summary['Path B action'], 'none (Path A read-only attachment)')
         self.assertIn('pass-through', summary['Replacement definition'])
         self.assertEqual(summary['t_single'], 'identical')
         self.assertIsInstance(single['Source count'], int, 'tier 1 counts are numbers')
@@ -342,7 +339,8 @@ class StaleCheckAndHandlersTests(unittest.TestCase):
 
     def test_f4_o7_recopy_fault_points_resume_from_o6_and_end_with_o6_to_o8_passed(self):
         """A failure before, after, or after and before the journal update, at the re-copy DELETE and at the re-copy INSERT of the
-        bucket O7 marked: O7 stops with O6 pending; the operator's run --from O6 reconciles the bucket, O7 and O8 pass, no row doubled."""
+        bucket O7 marked: the retry round of O7's re-copy copies the bucket again (B3) and O7 passes; a kill at the journal write stops
+        O7 with O6 pending instead, and the operator's run --from O6 reconciles the bucket. O7 and O8 pass, no row doubled."""
         for statement in ('DELETE', 'INSERT'):
             for point in FAULT_POINTS:
                 with self.subTest(statement=statement, point=point):
@@ -351,14 +349,19 @@ class StaleCheckAndHandlersTests(unittest.TestCase):
                     fired = arm_recopy(self, h, 't_comp', statement, point)
                     out7 = h.step('O7', redo=False)
                     self.assertEqual(len(fired), 1, 'the fault fired')
-                    self.assertEqual(out7.status, steps.INCOMPLETE, h.text())
-                    self.assertIn('rerun O6 to finish the marked buckets, then O7', out7.note)
-                    self.assertEqual({s: h.journal.step_status(s) for s in ('O6', 'O7')}, {'O6': 'pending', 'O7': 'pending'})
-                    self.assertEqual(h.journal.events('counter'), [], 'no counter is set before the re-copy completes')
+                    if point == 'journal':
+                        self.assertEqual(out7.status, steps.INCOMPLETE, h.text())
+                        self.assertIn('rerun O6 to finish the marked buckets, then O7', out7.note)
+                        self.assertEqual({s: h.journal.step_status(s) for s in ('O6', 'O7')}, {'O6': 'pending', 'O7': 'pending'})
+                        self.assertEqual(h.journal.events('counter'), [], 'no counter is set before the re-copy completes')
+                    else:
+                        self.assertEqual(out7.status, steps.PASSED, h.text())
+                        self.assertEqual(len(h.journal.events('retry_round')), 1)
                     self.assertEqual(run_from_o6(h), EXIT_DONE, h.text())
                     self.assertEqual({s: h.journal.step_status(s) for s in ('O6', 'O7', 'O8')}, {'O6': 'passed', 'O7': 'passed', 'O8': 'passed'})
                     assert_reinserted_once(self, h, 't_comp', start)
-                    self.assertNotIn('[O7] Post-copy (python; runner) database %s: already passed' % SRC, h.text())
+                    if point == 'journal':
+                        self.assertNotIn('[O7] Post-copy (python; runner) database %s: already passed' % SRC, h.text())
 
     def test_f4_o7_crash_after_its_recopy_round_resumes_from_o6_and_sets_the_counter_after_the_recopy(self):
         """A kill -9 stand-in at the journal write that marks O6 passed after O7's completed re-copy round, and one before, after, or

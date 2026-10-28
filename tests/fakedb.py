@@ -269,12 +269,10 @@ def _literal_compare(value, literal):
 
 
 def evaluate_predicate(pred, row):
-    """CRC32(expr) MOD n = k, CRC32(expr) MOD n < k (the sample of sample-database), a column range `c` >= lo AND `c` <= hi (the sampled
-    fingerprint), or one column equal to a literal."""
-    m = re.fullmatch(r'CRC32\((.*)\) MOD (\d+) (=|<) (\d+)', pred)
+    """CRC32(expr) MOD n = k, a column range `c` >= lo AND `c` <= hi (the sampled fingerprint), or one column equal to a literal."""
+    m = re.fullmatch(r'CRC32\((.*)\) MOD (\d+) = (\d+)', pred)
     if m:
-        remainder = crc32(key_text(m.group(1), row)) % int(m.group(2))
-        return remainder == int(m.group(4)) if m.group(3) == '=' else remainder < int(m.group(4))
+        return crc32(key_text(m.group(1), row)) % int(m.group(2)) == int(m.group(3))
     m = re.fullmatch(r"`([^`]+)` >= ('(?:[^']|'')*'|-?[\d.]+) AND `([^`]+)` <= ('(?:[^']|'')*'|-?[\d.]+)", pred)
     if m:
         assert m.group(1) == m.group(3), pred
@@ -1176,10 +1174,6 @@ class FakeCursor:
         if source_sid is None or source_sid not in db.storage:
             raise FakeDisconnect('unknown storage for ' + parent)
         parent_att = db.attachment(parent)
-        if alias and parent_att is not None and parent_att['ATTACH_TYPE'] == 'READONLY' and db.refuse_read_only_branch:
-            # the R2b question I0b answers: whether a branch of a READ ONLY attachment is refused; the number and text are the fake's
-            # placeholders until the live test records them in the error table
-            raise FakeDisconnect(2720, 'Cannot branch a database that is attached read only (fake placeholder; I0b records the real error)')
         if alias:
             new_sid = source_sid if db.branch_keeps_storage_id else db.new_sid()
             db.storage.setdefault(new_sid, name)
@@ -1264,7 +1258,6 @@ class FakeDB:
         self.branch_keeps_storage_id = True  # ATTACH x AS y keeps x's STORAGE_ID; y gets its own COMPUTE_ID and branch record
         self.new_compute_on_attach = True  # a re-attach of a record (its own syntax, or by STORAGEID) gives it a new COMPUTE_ID
         self.refuse_read_only_drop = True  # DROP DATABASE of a READ ONLY attachment is error 2720
-        self.refuse_read_only_branch = False  # ATTACH ... AS from a READ ONLY attachment (rollback R2b): Helios accepts it (I0b); on means R2c runs
         self.lock_tables = set()
         self.lock_hits = 0
         self.lock_wait_settings = []

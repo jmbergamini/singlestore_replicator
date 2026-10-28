@@ -29,7 +29,7 @@ import json
 import re
 
 from . import copy as copy_module
-from . import estimate, inventory, ownersql, projections, report_md, report_xlsx, routines, steps, verify
+from . import inventory, ownersql, projections, report_md, report_xlsx, routines, steps, verify
 from .common import EXIT_GATE, EXIT_INCOMPLETE, EXIT_MISMATCH, EXIT_REFUSED, KitError
 from .sqlutil import ident, qualified, read_guard, runner_guard, strip_literals, strip_quoted
 
@@ -369,10 +369,10 @@ def set_counters(session, target_db, tables, journal, log):
     return actions
 
 
-def _write_final_reports(ctx, data, plans, baseline):
+def _write_final_reports(ctx, data, plans):
     """Write the final workbook and the Markdown report for the run; returns the workbook path."""
     reports = ctx.config.runs_dir() / ctx.run_id / ctx.db.source / 'reports'
-    xlsx = report_xlsx.write_final_workbook(reports / 'final.xlsx', data, plans, ctx.journal, ctx.config, ctx.db, ctx.run_id, baseline)
+    xlsx = report_xlsx.write_final_workbook(reports / 'final.xlsx', data, plans, ctx.journal, ctx.config, ctx.db, ctx.run_id)
     report_md.write_run_report(reports / 'run-report.md', data, plans, ctx.journal, ctx.config, ctx.db, ctx.run_id)
     ctx.log('final workbook %s and run report %s written' % (xlsx, reports / 'run-report.md'))
     return xlsx
@@ -434,10 +434,9 @@ def handle_o7(step, ctx):
             outcome = routines.place(ctx, data, routines.O7_KINDS, 'O7')
             if outcome is not None:
                 return outcome
-        baseline = estimate.load_baseline(ctx.config.resolve(ctx.config.estimate.baseline) if ctx.config.estimate.baseline else None)
         recopies = 0
         while True:
-            verifier = verify.Verifier(session, ctx.db.source, ctx.db.replacement, plans, ctx.journal, ctx.config, baseline, ctx.log)
+            verifier = verify.Verifier(session, ctx.db.source, ctx.db.replacement, plans, ctx.journal, ctx.config, ctx.log)
             results = verify.stale_check(verifier)
             for line in verify.summary_lines(results):
                 ctx.log('stale check %d: %s' % (recopies + 1, line))
@@ -458,8 +457,6 @@ def handle_o7(step, ctx):
                 recopies += 1
                 ctx.log('stale check: %d table(s) marked for re-copy (round %d): %s' % (len(targets), recopies, ', '.join(tables)))
                 runner = copy_module.Runner(plans, statements, ctx.journal, ctx.runner_connector(), ctx.log, ctx.config.copy,
-                                            abort_at=copy_module.resolve_abort_at(ctx.journal, ctx.config,
-                                                                                  copy_module.longest_chunk_seconds(plans, ctx.config, ctx.journal)),
                                             stop_file=copy_module.stop_file_for(ctx.journal_path), retry_failed=True)
                 complete = runner.copy()
             if not complete:
@@ -519,9 +516,8 @@ def handle_o8(step, ctx):
             verify.dry_run_statements(session, ctx.db.source, ctx.db.replacement, plans, ctx.config)
             return steps.Outcome(steps.PASSED, 'dry run: verification statements for %d tables printed' % len(plans))
         ctx.journal.check_plan(plans, ctx.db.source, ctx.db.replacement)
-        baseline = estimate.load_baseline(ctx.config.resolve(ctx.config.estimate.baseline) if ctx.config.estimate.baseline else None)
         tiers = list(ctx.config.verify.tiers)
-        verifier = verify.Verifier(session, ctx.db.source, ctx.db.replacement, plans, ctx.journal, ctx.config, baseline, ctx.log,
+        verifier = verify.Verifier(session, ctx.db.source, ctx.db.replacement, plans, ctx.journal, ctx.config, ctx.log,
                                    connector=ctx.runner_connector())
         if named:
             results = _o8_rerun(verifier, plans, ctx)
@@ -530,7 +526,7 @@ def handle_o8(step, ctx):
             if recorded is not None:
                 to_accept, _ = verify.tables_to_accept(ctx.journal, plans, tiers)
                 lines = verify.accept_recorded(ctx.journal, to_accept, ctx.log)
-                _write_final_reports(ctx, data, plans, baseline)
+                _write_final_reports(ctx, data, plans)
                 return steps.Outcome(steps.PASSED, 'recorded result accepted without a rerun: no chunk was copied since the last O8 run%s' % (
                     ('; ' + '; '.join(lines)) if lines else ''))
             if ctx.yes:
@@ -538,7 +534,7 @@ def handle_o8(step, ctx):
             results = verifier.run()
         for line in verify.summary_lines(results):
             ctx.log(line)
-        _write_final_reports(ctx, data, plans, baseline)
+        _write_final_reports(ctx, data, plans)
         targets = verify.recopy_targets(results, plans)
         if targets:
             tables = sorted({t for t, _ in targets})

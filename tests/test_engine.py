@@ -1,24 +1,20 @@
-"""s2rebuild tests test_engine: the engine capture round trip, the column assertion over the kit's queries, the ATTACH forms and the branch records.
+"""s2rebuild tests test_engine: the column assertion over the kit's queries, the ATTACH forms and the branch records.
 
 Author: John Bergamini
 """
 import inspect
-import json
-import tempfile
 import unittest
-from pathlib import Path
 
-from s2rebuild import abandon, copy as copy_module, enginecapture, freeze, grants, inventory, lockout, ownersql, pipelines, postcopy, routines, steps, switch, verify
+from s2rebuild import abandon, copy as copy_module, freeze, grants, inventory, ownersql, pipelines, postcopy, routines, steps, switch, verify
 from s2rebuild.sqlutil import GuardError, classify
-from tests.fakedb import CAPTURE, FakeDB, FakeDisconnect, check_columns
-from tests.helpers import config_from, fake_driver, run_cli, write_config
+from tests.fakedb import CAPTURE, FakeDisconnect, check_columns
+from tests.helpers import config_from
 from tests.test_copy import SRC, fake_db, fixture_rows
-from tests.test_switch import OWNER
 
 ENV = {'S2REBUILD_RUNNER_PASSWORD': 'fixture-password', 'S2REBUILD_OWNER_PASSWORD': 'owner-fixture'}
 SID = '1028600672070281646:7367158985892520834'
 T_COMP_ROWS = len(fixture_rows()['t_comp'])
-MODULES = (inventory, pipelines, switch, freeze, ownersql, postcopy, grants, lockout, abandon, copy_module, verify, enginecapture, routines)
+MODULES = (inventory, pipelines, switch, freeze, ownersql, postcopy, grants, abandon, copy_module, verify, routines)
 
 
 def kit_queries():
@@ -48,62 +44,13 @@ def modeled_switch(fake):
 
 
 class CaptureTests(unittest.TestCase):
-    def test_capture_round_trips_through_the_command_and_the_fake(self):
-        """engine-capture on the fake writes the file the fake was built from; the file loads back into a fake; the error table is kept by hand."""
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        config_path, _ = write_config(tmp.name, mutate=OWNER)
-        fake = fake_db()
-        fake.routines.append({'ROUTINE_NAME': 'f_one', 'ROUTINE_TYPE': 'FUNCTION'})
-        fake.pipelines.append({'PIPELINE_NAME': 'p_one', 'STATE': 'Stopped'})
-        fake.globals['PASSWORD_MIN_LENGTH'] = '14'
-        fake.aggregates_defined.append('agg_one')
-        fake_driver(self, fake)
-        out = Path(tmp.name) / 'engine' / 'capture.json'
-        code, text = run_cli(['engine-capture', '--fixture-database', SRC, '--out', str(out), '--config', str(config_path)], env=ENV)
-        self.assertEqual(code, 0, text)
-        self.assertIn('engine-capture: engine 10.8.0, %d views with columns, 0 without' % len(enginecapture.VIEWS), text)
-        self.assertIn('fixture database: ROUTINES owner 1 runner 0; PIPELINES owner 1 runner 0', text, 'facts 10 and 21 on the fake')
-        self.assertEqual(fake.writes, [], 'the capture issues reads only')
-        raw = out.read_text(encoding='utf8')
-        for secret in (SRC, 'owner-fixture', 'fixture-password', 'svc-'):
-            self.assertNotIn(secret, raw, 'no database name, host or credential in the capture')
-        data = json.loads(raw)
-        self.assertEqual(data['engine_version'], '10.8.0')
-        self.assertEqual(data['views'], CAPTURE['views'], 'the fake answers the column lists from the capture it was built from')
-        self.assertIsNotNone(data['captured'])
-        self.assertIsNone(data['seeded'])
-        self.assertEqual(data['show_aggregates']['columns'], ['Aggregates_in_<fixture database>', 'Type'])
-        self.assertEqual(data['password_variables']['values'], {'PASSWORD_MIN_LENGTH': '14'})
-        self.assertEqual(data['runner_versus_owner']['fixture_database'], enginecapture.FIXTURE_PLACEHOLDER)
-        self.assertEqual(data['attach']['types'], ['create', 'resume', 'pitr'])
-        self.assertEqual(sorted(data['errors']), sorted(CAPTURE['errors']))
-        # the file loads back into a fake: a captured column answers, an absent one is error 1054 as the server would give it
-        again = FakeDB(SRC, {'t_empty': {'create': 'CREATE TABLE `t_empty` (\n  `p` varchar(10) DEFAULT NULL\n)'}}, capture=data)
-        cur = again.connect('ops_owner').cursor()
-        cur.execute(inventory.ATTACHMENT_SQL, (SRC,))
-        self.assertEqual(cur.fetchall()[0]['STORAGE_ID'], SID)
-        with self.assertRaises(FakeDisconnect) as refused:
-            cur.execute('SELECT PIPELINE_NAME, BATCH_ROWS_WRITTEN FROM information_schema.PIPELINES_BATCHES_SUMMARY WHERE DATABASE_NAME = %s', (SRC,))
-        self.assertEqual(refused.exception.args, (1054, "Unknown column 'BATCH_ROWS_WRITTEN' in 'field list'"))
-        # the error table is hand-maintained: an edit survives the next capture
-        data['errors']['2720']['message'] = 'edited by hand'
-        out.write_text(json.dumps(data), encoding='utf8')
-        code, text = run_cli(['engine-capture', '--out', str(out), '--config', str(config_path)], env=ENV)
-        self.assertEqual(code, 0, text)
-        self.assertEqual(json.loads(out.read_text(encoding='utf8'))['errors']['2720']['message'], 'edited by hand')
-        code, text = run_cli(['engine-capture', '--dry-run', '--out', str(out.with_name('dry.json')), '--config', str(config_path)], env=ENV)
-        self.assertEqual(code, 0, text)
-        self.assertIn('DRY RUN: engine-capture issued the reads above and writes nothing', text)
-        self.assertFalse(out.with_name('dry.json').exists())
-
     def test_every_kit_query_names_only_captured_columns(self):
         """The inventory, pipeline, switch, freeze, branch and owner-block queries name columns the capture lists; an absent column is 1054."""
         queries = kit_queries()
         self.assertGreaterEqual(len(queries), 40, [q[:2] for q in queries])
         names = {q[1] for q in queries}
         for wanted in ('ATTACHMENT_SQL', 'BATCHES_SQL', 'ERRORS_SQL', 'OFFSETS_SQL', 'BRANCH_SQL', 'BRANCH_OF_SQL', 'PIPELINES_RUNNING_SQL',
-                       'attached_elsewhere_sql', 'inventory_attachment_sql', 'other_storage_sql', 'VIEW_COLUMNS_SQL'):
+                       'attached_elsewhere_sql', 'inventory_attachment_sql', 'other_storage_sql'):
             self.assertIn(wanted, names)
         problems = []
         for module, name, sql in queries:

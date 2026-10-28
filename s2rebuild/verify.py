@@ -23,7 +23,6 @@ import re
 import threading
 import time
 
-from . import estimate
 from .common import KitError
 from .sqlutil import ident, qualified, read_guard
 
@@ -165,11 +164,6 @@ def fingerprint_sql(db, plan, groups, predicate=None, value_columns=VALUE_COLUMN
     return sql + ' GROUP BY grp'
 
 
-def fingerprint_cost_seconds(plan, baseline):
-    """Two scans of the table at the baseline scan rate."""
-    return 2.0 * plan.est_rows * baseline.scan_s_per_row
-
-
 def sessions_for(config):
     """verify.sessions, or copy.workers when the key is not set."""
     return int(config.verify.sessions or config.copy.workers)
@@ -227,7 +221,7 @@ class Verifier:
     seconds (time.monotonic; the tests inject one).
     """
 
-    def __init__(self, session, source_db, target_db, plans, journal, config, baseline=None, log=None, connector=None,
+    def __init__(self, session, source_db, target_db, plans, journal, config, log=None, connector=None,
                  clock=time.monotonic):
         self.session = session
         self.source_db = source_db
@@ -235,7 +229,6 @@ class Verifier:
         self.plans = plans
         self.journal = journal
         self.config = config
-        self.baseline = baseline or estimate.DEFAULT_BASELINE
         self.log = log or (lambda msg: None)
         self.connector = connector
         self.clock = clock

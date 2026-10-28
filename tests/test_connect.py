@@ -6,6 +6,7 @@ import io
 import os
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -132,6 +133,61 @@ class SecretsTests(unittest.TestCase):
             self.assertEqual(captured['password'], PASSWORD)
 
 
+class ConnectionTests(unittest.TestCase):
+    def secrets(self, tmp):
+        root = Path(tmp)
+        (root / 'certs').mkdir()
+        (root / 'certs' / 'singlestore_bundle.pem').write_text('not a real certificate')
+        return Secrets.from_config(config_from(root=root), 'runner', env={'S2REBUILD_RUNNER_PASSWORD': PASSWORD})
+
+    def test_b1_every_connection_gets_tcp_keepalive_on_its_socket(self):
+        import socket
+
+        class Sock:
+            def __init__(self):
+                self.options = []
+
+            def setsockopt(self, level, option, value):
+                self.options.append((level, option, value))
+
+        class Conn:
+            _sock = Sock()
+        with tempfile.TemporaryDirectory() as tmp:
+            conn = self.secrets(tmp).connect(connector=lambda **kw: Conn())
+        options = conn._sock.options
+        self.assertIn((socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1), options)
+        idle = socket.TCP_KEEPALIVE if sys.platform == 'darwin' else socket.TCP_KEEPIDLE
+        self.assertIn((socket.IPPROTO_TCP, idle, 60), options)
+        self.assertIn((socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 30), options)
+
+    def test_b5_connect_retries_name_resolution_then_fails_with_the_host(self):
+        lost = RuntimeError(2003, "Can't connect to MySQL server on 'svc' ([Errno 8] nodename nor servname provided, or not known)")
+        calls, sleeps = [], []
+
+        def connector(**kw):
+            calls.append(1)
+            if len(calls) < 3:
+                raise lost
+            return 'conn'
+        with tempfile.TemporaryDirectory() as tmp:
+            s = self.secrets(tmp)
+            self.assertEqual(s.connect(connector=connector, sleep=sleeps.append), 'conn', 'the third attempt connects')
+            self.assertEqual(sleeps, [20, 20])
+            calls.clear()
+            sleeps.clear()
+
+            def never(**kw):
+                calls.append(1)
+                raise lost
+            with self.assertRaisesRegex(KitError, 'Cannot connect to %s: name resolution failed after 4 attempts over 60 s' % s.host):
+                s.connect(connector=never, sleep=sleeps.append)
+            self.assertEqual((len(calls), sleeps), (4, [20, 20, 20]))
+            denied = RuntimeError(1045, 'Access denied')
+            with self.assertRaises(RuntimeError):
+                s.connect(connector=lambda **kw: (_ for _ in ()).throw(denied), sleep=sleeps.append)
+            self.assertEqual(sleeps, [20, 20, 20], 'any other error is raised at once')
+
+
 class SessionTests(unittest.TestCase):
     def test_session_applies_the_guard(self):
         conn = FakeConn(responses={'SELECT COUNT(*) AS n FROM `src`.`t`': [{'n': 3}]},
@@ -187,9 +243,9 @@ class LogTests(unittest.TestCase):
 
 class KeepAliveTests(unittest.TestCase):
     def test_w8_keep_alive_sends_select_1_on_schedule_with_a_fake_clock(self):
-        """The thread opens one runner connection at its first SELECT 1 and sends one every workspace.keepalive_minutes of the
-        injected clock (a minute per reading); stop() ends it and closes the connection. A ping that fails is counted and logged,
-        never raised; run_step starts no thread for a dry run or 0 minutes."""
+        """The thread sends SELECT 1 every workspace.keepalive_minutes of the injected clock (a minute per reading), each on a
+        connection of its own that it closes (B4); stop() ends it. A ping that fails is counted and logged with its error number
+        and the redacted message, never raised; run_step starts no thread for a dry run or 0 minutes."""
         import threading
         from s2rebuild import steps
         ticks = [0.0]
@@ -219,17 +275,17 @@ class KeepAliveTests(unittest.TestCase):
         self.assertTrue(done.wait(5), 'two pings on the fake clock')
         keepalive.stop()
         self.assertEqual([sql for sql, _ in conn.statements][:2], ['SELECT 1', 'SELECT 1'])
-        self.assertEqual(len(opens), 1, 'one connection, opened at the first ping and reused')
+        self.assertEqual(len(opens), 2, 'a fresh connection per ping')
         self.assertGreaterEqual(keepalive.sent[1] - keepalive.sent[0], 15 * 60, 'the second ping waits the interval on the clock')
-        self.assertTrue(conn.closed, 'stop() closes the connection')
+        self.assertTrue(conn.closed, 'each ping closes its connection')
         self.assertIn('keep-alive: SELECT 1 sent', out.getvalue())
 
         def refuse():
-            raise RuntimeError('cannot connect to svc-secret-host.example')
+            raise RuntimeError(2003, 'cannot connect to svc-secret-host.example')
         failing = KeepAlive(refuse, 15, Log(Redactor([HOST]), stream=out), clock=clock, poll=0.001)
         failing.ping()
         self.assertEqual((failing.failures, failing.sent), (1, []))
-        self.assertIn('keep-alive: SELECT 1 failed (RuntimeError); the next one opens a new connection', out.getvalue())
+        self.assertIn("keep-alive: SELECT 1 failed: RuntimeError error 2003: (2003, 'cannot connect to <redacted>')", out.getvalue())
         self.assertNotIn(HOST, out.getvalue())
         cfg = config_from(lambda d: d['workspace'].update(keepalive_minutes=0))
         ctx = steps.StepContext(cfg, cfg.databases[0], None, 'run', Log(stream=out), sessions=object())

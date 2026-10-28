@@ -151,11 +151,11 @@ class CredentialPromptTests(unittest.TestCase):
         rows = dict(report_xlsx.final_summary_rows(inv, h.plans(), h.journal, h.config, h.db, h.run_id))
         self.assertTrue(rows['Not recreated (no credentials given)'].startswith('p1 (KAFKA); recreate from '), rows['Not recreated (no credentials given)'])
         self.assertIn('recreate-with-placeholders.sql', rows['Not recreated (no credentials given)'])
-        est = estimate.estimate(h.plans(), h.config, estimate.DEFAULT_BASELINE, 2)
-        sheet = '\n'.join(estimate.plan_sheet(h.config, h.db, h.run_id, inv, est, None, skipped=P.skipped_types(h.journal)))
+        est = estimate.estimate(h.plans(), h.config, 2)
+        sheet = '\n'.join(estimate.plan_sheet(h.config, h.db, h.run_id, inv, est, skipped=P.skipped_types(h.journal)))
         self.assertIn('not recreated at O9 (no credentials given at the P3 prompt; the count gate leaves them out): p1 (KAFKA)', sheet)
         self.assertIn('KAFKA Keychain item %s, env set' % KAFKA_ITEM, '\n'.join(estimate.plan_sheet(
-            h.config, h.db, h.run_id, inv, est, None, env={'S2REBUILD_KAFKA_CREDENTIALS': 'x'})))
+            h.config, h.db, h.run_id, inv, est, env={'S2REBUILD_KAFKA_CREDENTIALS': 'x'})))
 
     def test_o9_asks_stores_and_replays_and_a_failed_keychain_write_stops_before_any_statement(self):
         """Credentials typed at O9 are stored in the Keychain item and injected at CREATE PIPELINE, never printed; a Keychain write that
@@ -312,7 +312,7 @@ class NamesAndO4Tests(unittest.TestCase):
         self.assertEqual(quiet.journals['second_db'].get_meta('replacement_db'), 'second_db_rebuild_20261101')
         self.assertIn('retained second_db_retained_20261101 (replacement and retained by the kit\'s date default: run.mode test)', quiet.text())
         flagged = StepHarness(self, two).ready_for_o1()
-        flagged.options = dict(flagged.options, mode='test')
+        flagged.options = dict(flagged.options or {}, mode='test')
         self.assertEqual(flagged.run(), EXIT_GATE, flagged.text())
         self.assertEqual(flagged.journals['second_db'].get_meta('retained_db'), 'second_db_retained_20261101')
         scripted(self, [None])

@@ -2,7 +2,7 @@
 
 Author: John Bergamini
 
-Section 3 of the architecture fixes the step ids P1 to P5, O1 to O11 and C1 to C4. This
+Section 3 of the architecture fixes the step ids P1 to P4, O1 to O11 and C1 to C4. This
 module holds them with kind, identity, gate text and preconditions, builds the Guard each
 step runs behind (section 10.4), and drives `run`, `step` and `gate`. Python steps whose
 module lands in a later milestone are registered as stubs: a dry run names them and issues
@@ -71,21 +71,17 @@ REGISTRY = {s.id: s for s in [
           'Connection, privileges, source layout, STORAGE_ID recorded, target names free, compute size fits the partition count',
           'inventory', 'M5', ('P1',)),
     _step('P3', 'Profile', (PYTHON,), (RUNNER, OWNER),
-          'Inventory JSON, profile Excel, estimate with bands, window fit printed', 'inventory', 'M2', ('P2',)),
+          'Inventory JSON, profile Excel, estimate line printed', 'inventory', 'M2', ('P2',)),
     _step('P4', 'Plan', (DECISION,), (PEOPLE,),
-          'Freeze path, window, abort deadline, named owner for application stopped, pipeline credential handover, '
+          'Window, named owner for application stopped, pipeline credential handover, '
           'retained name, retention days recorded in config', 'estimate', 'M2', ('P3',)),
-    _step('P5', 'Rehearsal', (PYTHON, ADMIN), (RUNNER, OWNER),
-          'Throwaway copy and switch completed, kill test resumed, timings recorded under customer/runs/',
-          'rehearse', 'M4', ('P4',)),
     _step('O1', 'Start', (PYTHON, DECISION), (RUNNER,),
-          'Window and deadline recorded, P2 passed in this run, rehearsal evidence present or waived with --no-rehearsal NOTE, '
-          'go recorded', 'steps', 'M1'),
+          'P2 passed in this run, workspace answers recorded, go recorded', 'steps', 'M1'),
     _step('O2', 'Stop pipelines', (ADMIN,), (OWNER,),
           'No pipeline in state Running; every definition captured with a credentials placeholder; offsets captured after the stop',
           'pipelines', 'M4', ('O1',)),
     _step('O3', 'Freeze', (ADMIN,), (OWNER,),
-          'Path A: write probe refused and ATTACH_TYPE = READONLY. Path B: quiet proof passed the configured number of times',
+          'Write probe refused and ATTACH_TYPE = READONLY',
           'freeze', 'M4', ('O2',)),
     _step('O4', 'Freeze capture', (PYTHON,), (RUNNER,),
           'Inventory captured after the freeze; drift against P3 reviewed; copy plan written', 'inventory', 'M2', ('O3',)),
@@ -104,13 +100,12 @@ REGISTRY = {s.id: s for s in [
           'Live name resolves to the replacement branch with the target layout; retained copy attached read only',
           'switch', 'M4', ('O9',)),
     _step('O11', 'Release', (ADMIN, HUMAN), (OWNER, CUSTOMER),
-          'Retention check passed per partition; pipelines started; grants match the snapshot (Path B); '
-          'application restarted and writing', 'pipelines', 'M4', ('O10',)),
+          'Retention check passed per partition; pipelines started; application restarted and writing', 'pipelines', 'M4', ('O10',)),
     _step('C1', 'Verify after release', (PYTHON,), (RUNNER,),
-          'Writer watch shows the application on the live database; pipelines Running with offsets advancing; no pipeline errors',
-          'watch', 'M4', ('O11',)),
-    _step('C2', 'Report and calibrate', (PYTHON,), (RUNNER,),
-          'Final Excel and Markdown written; baseline recalibrated from the journal, or kept with a note when the journal cannot be fitted',
+          'Writer sample shows the application on the live database; pipelines Running with offsets advancing; no pipeline errors',
+          'pipelines', 'M4', ('O11',)),
+    _step('C2', 'Report', (PYTHON,), (RUNNER,),
+          'Final Excel and Markdown written',
           'report_xlsx', 'M5', ('C1',)),
     _step('C3', 'End state', (ADMIN,), (OWNER,),
           'Exactly two entries across both storages, the live record and the retained record; the live name resolves to the live record; '
@@ -150,13 +145,12 @@ OWNER_ALLOWANCES = {
     'O9': (('USE', 'CREATE PIPELINE', 'ALTER PIPELINE'), ('replacement',), {}, {}),
     # O10: DROP DATABASE only on the original record (S2b) and the replacement (S4), never the retained copy
     'O10': (('DETACH DATABASE', 'ATTACH DATABASE'), ('source', 'replacement', 'retained'), {'DROP DATABASE': ('source', 'replacement')}, {}),
-    'O11': (('START PIPELINE', 'GRANT', 'SET GLOBAL'), ('source',), {}, {}),
-    # C3: the End state gate issues reads; the repair block for a switch made without S2b and S4 names the source and the replacement
-    'C3': (('DETACH DATABASE', 'ATTACH DATABASE', 'DROP DATABASE'), ('source', 'replacement'), {'DETACH DATABASE': ('source',)}, {}),
+    'O11': (('START PIPELINE', 'SET GLOBAL'), ('source',), {}, {}),
+    # C3: the End state gate issues reads only
+    'C3': ((), (), {}, {}),
     'C4': (('DROP USER',), (), {}, {}),
     # C5 (s2rebuild cleanup): the customer's delete of the retained copy, by its record: DETACH, ATTACH by syntax, DROP on that name only
     'cleanup': (('DETACH DATABASE', 'ATTACH DATABASE', 'DROP DATABASE'), ('retained',), {}, {}),
-    'lockout': (('REVOKE', 'GRANT', 'KILL CONNECTION'), ('source',), {}, {}),
     'abandon': (('DETACH DATABASE', 'ATTACH DATABASE', 'DROP DATABASE'), ('source', 'replacement'),
                 {'DETACH DATABASE': ('source',), 'ATTACH DATABASE': ('source',), 'DROP DATABASE': ('replacement',)}, {}),
 }
@@ -274,9 +268,7 @@ def admin_pending(step, ctx):
     """Fallback handler for an admin step without a module handler: print the pointer and wait for the gate."""
     lines = ['identity: %s' % step.identity_label]
     if step.id == 'O3':
-        mode = ctx.config.freeze.mode
-        lines.append('freeze path: %s' % ('A, read-only attachment (DETACH then ATTACH READ ONLY)' if mode == 'readonly'
-                                           else 'B, lockout (revoke and kill loop with quiet proof)'))
+        lines.append('freeze: read-only attachment (DETACH then ATTACH READ ONLY)')
     lines.append('SQL block: s2rebuild owner-sql %s' % step.id)
     return gate_pending(step, ctx, lines)
 
@@ -291,17 +283,23 @@ def human_pending(step, ctx):
     return gate_pending(step, ctx, ['done by: %s' % step.identity_label])
 
 
-def o1_readiness(ctx):
-    """The O1 readiness lines and the problems a real run refuses on; returns (lines, problems, waiver).
+# The three workspace questions P2 prints and O1 records the answers to (--workspace NOTE).
+WORKSPACE_QUESTIONS = (
+    'is the workspace ACTIVE (not suspended, resuming or scaling)?',
+    'is autoscale off for the window?',
+    'is auto-suspend off for the window, or a keep-alive job in place between the commands?',
+)
+WORKSPACE_HINT = 'record the answers at O1 with --workspace NOTE'
 
-    P2 must be passed in this run's journal (s2rebuild check records it). Rehearsal evidence is P5
-    passed in this journal, or a rehearsal of any run whose timings record P5 passed
-    (_rehearsal_evidence). Without either, the operator may waive it with --no-rehearsal NOTE
-    (ctx.options['no_rehearsal']); waiver is that note, else None. Reads the journal and the
-    runs folder only.
+
+def o1_readiness(ctx):
+    """The O1 readiness lines and the problems a real run refuses on; returns (lines, problems).
+
+    P2 must be passed in this run's journal (s2rebuild check records it). The workspace answers
+    (ctx.options['workspace']) are printed with the three questions. Reads the journal only.
     """
     journal = ctx.journal
-    lines, problems, waiver = [], [], None
+    lines, problems = [], []
     p2 = journal.step('P2') or {}
     if p2.get('status') == 'passed':
         lines.append('P2 preflight: passed in this run at %s' % (p2.get('ended_utc') or 'an unrecorded time'))
@@ -309,19 +307,10 @@ def o1_readiness(ctx):
         state = p2.get('status') or 'not run'
         lines.append('P2 preflight: not passed in this run (%s)' % state)
         problems.append('P2 is not passed in this run (%s); run s2rebuild check%s for this run first' % (state, run_flag(ctx.run_id)))
-    note = str(ctx.options.get('no_rehearsal') or '').strip()
-    if journal.step_status('P5') == 'passed':
-        lines.append('rehearsal evidence: P5 passed in this run')
-    elif _rehearsal_evidence(ctx):
-        lines.append('rehearsal evidence: a passed rehearsal under %s' % ctx.config.runs_dir())
-    elif note:
-        waiver = note
-        lines.append('rehearsal evidence: none found; waived with --no-rehearsal: %s' % note)
-    else:
-        lines.append('rehearsal evidence: none found')
-        problems.append('no rehearsal evidence (P5 passed in this run, or a passed rehearsal under %s); run s2rebuild rehearse, '
-                        'or waive it with --no-rehearsal NOTE' % ctx.config.runs_dir())
-    return lines, problems, waiver
+    answer = str(ctx.options.get('workspace') or '').strip()
+    lines.append('workspace: ' + '; '.join(WORKSPACE_QUESTIONS))
+    lines.append('workspace answer: ' + (answer or 'none recorded; ' + WORKSPACE_HINT))
+    return lines, problems
 
 
 def run_mode(ctx):
@@ -344,7 +333,7 @@ def o1_names(ctx, mode, ask=True):
     and every later command reads them back from the journal (cli.Invocation.apply_recorded_names).
     """
     db = ctx.db
-    recorded = ctx.journal.get_meta('replacement_db') or ctx.journal.get_meta('target_db')
+    recorded = ctx.journal.get_meta('replacement_db')
     if not db.defaulted or recorded or mode != 'production':
         note = ''
         if db.defaulted and not recorded:
@@ -360,50 +349,26 @@ def o1_names(ctx, mode, ask=True):
 
 
 def o1_start(step, ctx):
-    """O1: check the window, P2 and the rehearsal evidence, record window and deadline, then wait for the go decision.
+    """O1: check P2, record the window and the workspace answers, then wait for the go decision.
 
-    The window is optional. Without one there is no abort deadline: O1 records that, and the copy,
-    the switch and the lockout run without a time limit. With one, a past deadline fails the gate.
-    A real run then refuses, before any journal write, when P2 is not passed in this run or there
-    is no rehearsal evidence and no --no-rehearsal NOTE (o1_readiness); a dry run reports both and
-    goes on. A waiver is recorded as a no_rehearsal event and in the O1 note. The names come from
-    o1_names: in production mode a name the configuration left to the kit is typed here.
+    The window is optional and informational: no step stops on it. A real run refuses, before any
+    journal write, when P2 is not passed in this run (o1_readiness); a dry run reports it and goes
+    on. The workspace answer (--workspace NOTE) is recorded as a workspace event. The names come
+    from o1_names: in production mode a name the configuration left to the kit is typed here.
     """
     config = ctx.config
     window = config.window
-    deadline = None
     mode = run_mode(ctx)
     names, typed, lines = o1_names(ctx, mode, ask=False)
     if window is None:
-        lines.append('window: none configured, so no abort deadline; the copy and the switch run without a time limit')
+        lines.append('window: none configured; the copy and the switch run without a time limit')
     else:
-        longest, longest_note = 0.0, 'no capture yet, so no longest-chunk allowance; O6 recomputes it from the plan'
-        try:
-            from . import copy as copy_module
-            _, plans, _ = copy_module.load_plans(ctx)
-            longest = copy_module.longest_chunk_seconds(plans, config, ctx.journal)
-            longest_note = 'longest modeled chunk %s' % format_duration(longest)
-        except KitError:
-            pass
-        deadline = window.abort_deadline(longest)
-        lines.append('window: %s to %s (%s)' % (iso(window.start), iso(window.end), format_duration(window.duration.total_seconds())))
-        lines.append('abort deadline: %s (end minus %d m restart allowance, %d m buffer; %s)' % (
-            iso(deadline), window.restart_allowance_minutes, window.buffer_minutes, longest_note))
-    lines.append('freeze path: %s' % ('A read-only attachment' if config.freeze.mode == 'readonly' else 'B lockout'))
-    now = utc_now()
-    if deadline is not None and now >= deadline:
-        if ctx.dry_run:
-            lines.append('abort deadline is in the past relative to now (%s); a real run stops here' % iso(now))
-        else:
-            for line in lines:
-                ctx.log.plain('    ' + line)
-            return Outcome(FAILED, 'abort deadline %s is already past' % iso(deadline), EXIT_GATE)
-    readiness, problems, waiver = o1_readiness(ctx)
+        lines.append('window: %s to %s (%s); no step stops on it' % (iso(window.start), iso(window.end),
+                                                                    format_duration(window.duration.total_seconds())))
+    lines.append('freeze: read-only attachment')
+    readiness, problems = o1_readiness(ctx)
     lines.extend(readiness)
-    from . import workspace
-    workspace_lines, workspace_problems, workspace_events = workspace.o1_guard(ctx, workspace.recorded(ctx.journal))
-    lines.extend(workspace_lines)
-    problems.extend(workspace_problems)
+    answer = str(ctx.options.get('workspace') or '').strip()
     if problems:
         if ctx.dry_run:
             lines.append('a real run refuses here: ' + '; '.join(problems))
@@ -423,44 +388,18 @@ def o1_start(step, ctx):
         journal.set_meta('config_hash', config.config_hash())
         if typed:
             journal.event('names', 'O1 names typed in production mode: replacement %s, retained %s' % names[1:])
-        # empty values clear a window an earlier O1 recorded; resolve_abort_at ignores an empty deadline
+        # empty values clear a window an earlier O1 recorded
         journal.set_meta('window_start', iso(window.start) if window else '')
         journal.set_meta('window_end', iso(window.end) if window else '')
-        journal.set_meta('abort_deadline', iso(deadline) if deadline else '')
-        journal.set_meta('freeze_mode', config.freeze.mode)
-        if window is None:
-            journal.event('window', 'none configured; no abort deadline')
-        else:
-            journal.event('window', 'start=%s end=%s deadline=%s' % (iso(window.start), iso(window.end), iso(deadline)))
-        if waiver:
-            journal.event('no_rehearsal', 'O1 without rehearsal evidence: %s' % waiver)
-        for kind, detail in workspace_events:
-            journal.event(kind, detail)
+        journal.event('window', 'start=%s end=%s' % (iso(window.start), iso(window.end)) if window else 'none configured')
+        if answer:
+            journal.event('workspace', 'O1 workspace answer: ' + answer)
     outcome = gate_pending(step, ctx, lines + ['go decision recorded by the operator'])
     if typed:
         outcome.note += '; names typed at O1: replacement %s, retained %s' % names[1:]
-    if waiver:
-        outcome.note += '; rehearsal waived with --no-rehearsal: %s' % waiver
-    for kind, detail in workspace_events:
-        outcome.note += '; ' + detail
+    if answer:
+        outcome.note += '; O1 workspace answer: ' + answer
     return outcome
-
-
-def _rehearsal_evidence(ctx):
-    """True when some run holds a rehearsal whose timings.json records a passed P5 (a dry run writes none)."""
-    import json
-    runs_dir = ctx.config.runs_dir()
-    if not runs_dir.exists():
-        return False
-    for p in runs_dir.iterdir():
-        timings = p / 'rehearsal' / 'timings.json'
-        if timings.is_file():
-            try:
-                if json.loads(timings.read_text(encoding='utf8')).get('p5_status') == 'passed':
-                    return True
-            except ValueError:
-                continue
-    return False
 
 
 def register(step_id, handler):
@@ -504,7 +443,7 @@ def check_run_names(journal, db):
     O1 writes source_db, replacement_db and retained_db to meta; a later invocation with
     another config, or with defaulted names computed on another day, must not continue on it.
     """
-    recorded = (journal.get_meta('source_db'), journal.get_meta('replacement_db') or journal.get_meta('target_db'),
+    recorded = (journal.get_meta('source_db'), journal.get_meta('replacement_db'),
                 journal.get_meta('retained_db'))
     for label, have, want in zip(('source', 'replacement', 'retained'), recorded, db.names):
         if have is not None and have != want:
@@ -527,26 +466,6 @@ def config_change_text(db, recorded, current):
     return ('Journal for %s records configuration hash %s from O1, but the configuration now hashes to %s: it changed after O1. '
             'Put the configuration of this run back, or record the change with --accept-config-change NOTE, which keeps both '
             'hashes and the note in the journal' % (db.source, recorded[:12], current[:12]))
-
-
-# The steps that refuse freeze.mode lockout with more than one configured database (path_b_single_database).
-PATH_B_SINGLE_DATABASE_STEPS = ('O3', 'O10', 'O11')
-
-
-def path_b_single_database(config):
-    """Refuse freeze.mode lockout with more than one configured database: Path B is single database in this pass.
-
-    Each database journal holds its own lockout snapshot and O11 gives it back per database, so
-    a global grant restored by the first O11 releases writers on a database still frozen. check
-    (P2), run, and step O3, O10 and O11 call this before anything is journaled; owner-sql O3, O10
-    and O11, owner-notebook, and gate O3, O10 and O11 --pass call it before a database is chosen,
-    a block is written or a gate is recorded; lockout (with or without --hold) calls it before a
-    snapshot is taken or a REVOKE is issued. Issues nothing.
-    """
-    if config.freeze.mode == 'lockout' and len(config.databases) > 1:
-        raise KitError('freeze.mode lockout (Path B) is single database in this pass, and the configuration has %d databases (%s); '
-                       'configure one database, or use freeze.mode readonly (Path A) for several' % (
-                           len(config.databases), ', '.join(db.source for db in config.databases)))
 
 
 def unmet_preconditions(step, journal):
@@ -670,8 +589,6 @@ def run_step(step, ctx, redo=False):
     runs from before the handler to the end of the step (start_keepalive).
     """
     journal, log = ctx.journal, ctx.log
-    if step.id in PATH_B_SINGLE_DATABASE_STEPS:
-        path_b_single_database(ctx.config)
     header = '[%s] %s (%s; %s) database %s' % (step.id, step.title, step.kind_label, step.identity_label, ctx.db.source)
     passed_before = journal.step_status(step.id) == 'passed'
     missing = unmet_preconditions(step, journal)
@@ -749,7 +666,6 @@ def run_steps(config, databases, journals, log, run_id=None, from_id='O1', to_id
     walks every step, prints the gates that need a person and returns 0.
     """
     step_ids = outage_range(from_id, to_id)
-    path_b_single_database(config)
     for db in databases:
         check_run_names(journals[db.source], db)
     pending, failed, stubs = [], [], []

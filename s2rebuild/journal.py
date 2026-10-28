@@ -1,19 +1,19 @@
-"""s2rebuild journal: the SQLite run journal with migrations, step and chunk transitions.
+"""s2rebuild journal: the SQLite run journal, step and chunk transitions.
 
 Author: John Bergamini
 
 One journal per run per database (section 9 of the architecture): WAL mode, synchronous
-FULL, every write behind one lock. The schema carries a schema_version row in meta and a
-migration list; a journal written by the reference runner (no version row) or by an earlier
-version of the kit is upgraded in place. A re-copy (mark_recopy) reopens the evidence built on
+FULL, every write behind one lock. The schema carries a schema_version row in meta. A journal
+belongs to one run, so there is one schema: a journal written by an older kit is refused, never
+upgraded (OLDER_KIT). A re-copy (mark_recopy) reopens the evidence built on
 the copy: it increments the table's recopy_epoch, and every verification row carries the epoch
 it verified. A mark, the start of O6 to O8 and the go decision of O10 (record_go) each read the
 switch state in their own BEGIN IMMEDIATE transaction, so of a re-copy and a go only the first
 to commit goes ahead. The attachments table holds the branch record per role (source,
 replacement, retained, live): name, STORAGE_ID, COMPUTE_ID, the attachment type, the record type
 (create, resume, pitr), the ATTACH_SYNTAX and whether it is detached; a row of either attachment
-view completes the latest row of the same record (schema version 3). A verification row carries
-the sampling predicate and the rows in the sample when tier 3 sampled (schema version 4).
+view completes the latest row of the same record. A verification row carries the sampling
+predicate and the rows in the sample when tier 3 sampled.
 Statements issued by this module: SQLite statements against the journal file only.
 """
 import json
@@ -24,6 +24,7 @@ from pathlib import Path
 from .common import KitError, iso, utc_now
 
 SCHEMA_VERSION = 4
+OLDER_KIT = 'This journal was written by an older kit; finish or abandon that run with the kit version that started it.'
 MEMORY = ':memory:'
 STEP_STATUSES = ('pending', 'running', 'passed', 'failed', 'skipped')
 CHUNK_STATES = ('pending', 'started', 'done', 'failed')
@@ -36,7 +37,7 @@ PIPELINE_FIELDS = ('state_at_capture', 'source_type', 'source_location', 'target
                    'duplicate_handling', 'definition_file', 'app_managed', 'created_in_replacement_utc',
                    'started_utc', 'state_after_start')
 
-# Column lists drive both CREATE TABLE and the add-missing-column migration.
+# Column lists drive CREATE TABLE.
 COLUMNS = {
     'meta': [('key', 'TEXT PRIMARY KEY'), ('value', 'TEXT NOT NULL')],
     'steps': [('step_id', 'TEXT PRIMARY KEY'), ('status', 'TEXT NOT NULL'), ('started_utc', 'TEXT'),
@@ -70,10 +71,6 @@ COLUMNS = {
     'events': [('ts', 'TEXT NOT NULL'), ('kind', 'TEXT NOT NULL'), ('detail', 'TEXT NOT NULL')],
 }
 TABLE_CONSTRAINTS = {'chunks': 'PRIMARY KEY (table_name, bucket)'}
-# Columns a later schema version added to a version 1 journal, by the version that added them.
-ADDED_COLUMNS = {2: {'tables': [('recopy_epoch', 'INTEGER NOT NULL DEFAULT 0')], 'verification': [('epoch', 'INTEGER')]},
-                 3: {'attachments': [('record_type', 'TEXT'), ('attach_syntax', 'TEXT'), ('is_detached', 'INTEGER')]},
-                 4: {'verification': [('predicate', 'TEXT'), ('sample_rows', 'INTEGER')]}}
 # Steps whose evidence a re-copy invalidates, with the note mark_recopy records when it reopens them.
 RECOPY_REOPENS = (('O6', 'buckets of %s marked for re-copy; rerun O6'),
                   ('O7', 'counters and stale check predate the re-copy of %s; rerun O7 after O6'),
@@ -143,10 +140,10 @@ def _open_error(path, exc):
 class Journal:
     """The run journal. Open with a path, or MEMORY for a throwaway in-memory journal.
 
-    read_only opens an existing journal without migrating it (status). A version 1 journal opens
-    as it is, since status reads only the steps; a journal without every table (the reference
-    runner's) is refused with the command that upgrades it. Every sqlite failure while opening
-    becomes a KitError that names the path.
+    A new file gets every table and the schema version; an existing journal must carry this
+    schema version (check_schema), else it is refused with OLDER_KIT. read_only opens an existing
+    journal without writing (status). Every sqlite failure while opening becomes a KitError that
+    names the path.
     """
 
     def __init__(self, path, read_only=False):
@@ -155,26 +152,22 @@ class Journal:
         try:
             if read_only:
                 self.conn = _open_read_only(self.path, check_same_thread=False, isolation_level=None)
-                self._check_read_only_schema()
+                self.check_schema()
             else:
                 if self.path != MEMORY:
                     Path(self.path).parent.mkdir(parents=True, exist_ok=True)
                 self.conn = sqlite3.connect(self.path, check_same_thread=False, isolation_level=None)
+                if self._existing_tables():
+                    try:
+                        self.check_schema()  # before the WAL pragma, so a refused journal is left byte for byte as it was
+                    except KitError:
+                        self.conn.close()
+                        raise
                 self.conn.execute('PRAGMA journal_mode=WAL')
                 self.conn.execute('PRAGMA synchronous=FULL')
-                self._migrate()
+                self._create_or_check()
         except sqlite3.DatabaseError as exc:
             raise _open_error(self.path, exc)
-
-    def _check_read_only_schema(self):
-        tables = self._existing_tables()
-        missing = sorted(set(COLUMNS) - tables)
-        if missing:
-            raise KitError('Journal %s uses an older schema (no %s table); open it once with a writable command '
-                           'such as s2rebuild step or run to upgrade it' % (self.path, missing[0]))
-        row = self.conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
-        if row is not None and int(row[0]) > SCHEMA_VERSION:
-            raise KitError('Journal schema version %s is newer than this kit supports (%d); upgrade the kit' % (row[0], SCHEMA_VERSION))
 
     @classmethod
     def dry_run_copy(cls, path):
@@ -190,7 +183,7 @@ class Journal:
                     src.backup(journal.conn)
                 finally:
                     src.close()
-                journal._migrate()
+                journal.check_schema()
             except sqlite3.DatabaseError as exc:
                 journal.close()
                 raise _open_error(path, exc)
@@ -203,69 +196,31 @@ class Journal:
     def _existing_columns(self, table):
         return [r[1] for r in self.conn.execute('PRAGMA table_info(%s)' % table)]
 
-    def _migrate(self):
+    def _create_or_check(self):
+        """A new file: every table of section 9 and the schema version, in one transaction. An existing journal: check_schema."""
         with self.lock:
-            tables = self._existing_tables()
-            version = 0
-            if 'meta' in tables:
-                row = self.conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
-                version = int(row[0]) if row else 0
-            if version > SCHEMA_VERSION:
-                raise KitError('Journal schema version %d is newer than this kit supports (%d); upgrade the kit' % (
-                    version, SCHEMA_VERSION))
-            if version < 1:
-                self._migrate_to_1()
-            if version < 2:
-                self._migrate_to_2()
-            if version < 3:
-                self._migrate_to_3()
-            if version < 4:
-                self._migrate_to_4()
-            self.conn.execute("INSERT INTO meta (key, value) VALUES ('schema_version', ?) "
-                              'ON CONFLICT(key) DO UPDATE SET value = excluded.value', (str(SCHEMA_VERSION),))
-
-    def _migrate_to_1(self):
-        """Version 1: every table of section 9; add columns missing from a reference-runner journal."""
-        self.conn.execute('BEGIN')
-        try:
-            existing = self._existing_tables()
-            for name in COLUMNS:
-                if name not in existing:
+            if self._existing_tables():
+                self.check_schema()
+                return
+            self.conn.execute('BEGIN')
+            try:
+                for name in COLUMNS:
                     self.conn.execute(create_table_sql(name))
-                else:
-                    have = set(self._existing_columns(name))
-                    for col, decl in COLUMNS[name]:
-                        if col not in have:
-                            self.conn.execute('ALTER TABLE %s ADD COLUMN %s %s' % (name, col, decl.replace(' PRIMARY KEY', '')))
-            self.conn.execute('COMMIT')
-        except Exception:
-            self.conn.execute('ROLLBACK')
-            raise
+                self.conn.execute("INSERT INTO meta (key, value) VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),))
+                self.conn.execute('COMMIT')
+            except Exception:
+                self.conn.execute('ROLLBACK')
+                raise
 
-    def _migrate_to_2(self):
-        """Version 2: tables.recopy_epoch and verification.epoch, added to a version 1 journal when missing."""
-        self._add_columns(2)
-
-    def _migrate_to_3(self):
-        """Version 3: the branch record per attachment (record_type, attach_syntax, is_detached); rows written before stay readable with NULLs."""
-        self._add_columns(3)
-
-    def _migrate_to_4(self):
-        """Version 4: the sampling predicate and the rows in the sample on verification rows; older rows read NULL (a full fingerprint)."""
-        self._add_columns(4)
-
-    def _add_columns(self, version):
-        self.conn.execute('BEGIN')
-        try:
-            for name, columns in ADDED_COLUMNS[version].items():
-                have = set(self._existing_columns(name))
-                for col, decl in columns:
-                    if col not in have:
-                        self.conn.execute('ALTER TABLE %s ADD COLUMN %s %s' % (name, col, decl))
-            self.conn.execute('COMMIT')
-        except Exception:
-            self.conn.execute('ROLLBACK')
-            raise
+    def check_schema(self):
+        """Refuse a journal of another schema: a newer one names the version, an older one (or one without every table) gets OLDER_KIT."""
+        tables = self._existing_tables()
+        row = self.conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone() if 'meta' in tables else None
+        version = int(row[0]) if row else 0
+        if version > SCHEMA_VERSION:
+            raise KitError('Journal schema version %d is newer than this kit supports (%d); upgrade the kit' % (version, SCHEMA_VERSION))
+        if version < SCHEMA_VERSION or set(COLUMNS) - tables:
+            raise KitError('%s (%s)' % (OLDER_KIT, self.path))
 
     def schema_version(self):
         """The schema version recorded in meta (0 for a journal written before versioning)."""
@@ -422,11 +377,8 @@ class Journal:
                 raise
 
     def check_plan(self, plans, source_db, target_db):
-        """Refuse to resume with a journal that belongs to another pair or another chunk plan.
-
-        Reads replacement_db, falling back to target_db for a journal written by the reference runner.
-        """
-        recorded_target = self.get_meta('replacement_db') or self.get_meta('target_db')
+        """Refuse to resume with a journal that belongs to another pair or another chunk plan."""
+        recorded_target = self.get_meta('replacement_db')
         if self.get_meta('source_db') != source_db or recorded_target != target_db:
             raise KitError('Journal belongs to a different source/replacement pair; refusing to resume with it')
         recorded = {r[0]: r for r in self._q('SELECT table_name, n_buckets, key_expr, columns_json FROM tables')}
@@ -629,7 +581,7 @@ class Journal:
         (record_go) before its first statement, so an O10 that stopped before the go (a Ctrl-C at the
         typed-name prompt, a lost owner connection, a stop during S0) issued nothing and does not count,
         even when it is failed or still running. Every O10 refusal that issues nothing comes before the
-        go (S0 with the Path B last lockout pass, the S1 before-checks, the go transaction), so it
+        go (S0, the S1 before-checks, the go transaction), so it
         does not count either. While it waits for the go, O10 holds the copy lock and
         record_go reads S0's journal part again, so a re-copy in that window is refused or refuses the
         go. A gate is how a person reports a hand or notebook O10, so any O10 gate counts. Reads the
@@ -759,27 +711,6 @@ class Journal:
         """The most recent attachment row for a role, or None."""
         rows = self._rows('SELECT * FROM attachments WHERE role = ? ORDER BY id DESC LIMIT 1', (role,))
         return rows[0] if rows else None
-
-    def snapshot_grant(self, grantee, privileges):
-        """Store the privileges of one grantee ({scope: [privileges]}) unless a row already exists for it.
-
-        A lockout rerun must never replace the original snapshot with the already-revoked state,
-        so an existing row is kept as it is. Returns True when a row was written.
-        """
-        value = {k: sorted(v) for k, v in privileges.items()} if isinstance(privileges, dict) else sorted(privileges)
-        with self.lock:
-            cur = self.conn.execute('INSERT INTO grants_snapshot (grantee, privileges_json, captured_utc) VALUES (?, ?, ?) '
-                                    'ON CONFLICT(grantee) DO NOTHING', (grantee, json.dumps(value, sort_keys=True), iso(utc_now())))
-            return cur.rowcount == 1
-
-    def mark_grant_restored(self, grantee):
-        """Stamp the time the grantee's privileges were restored."""
-        self._q('UPDATE grants_snapshot SET restored_utc = ? WHERE grantee = ?', (iso(utc_now()), grantee))
-
-    def grants_snapshot(self):
-        """Every snapshot row keyed by grantee, with privileges decoded to a list."""
-        return {r['grantee']: dict(r, privileges=json.loads(r['privileges_json']))
-                for r in self._rows('SELECT * FROM grants_snapshot ORDER BY grantee')}
 
     def upsert_pipeline(self, name, **fields):
         """Create the pipeline row when missing and set the given fields (PIPELINE_FIELDS only)."""

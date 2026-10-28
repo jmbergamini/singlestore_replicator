@@ -6,7 +6,7 @@ Port map (reference test, new test): predicate shapes, bucket rule, identifiers,
 reference inventory shape (now the neutral reference journal), dry run opens no connection, shape
 must match the capture, names must differ, write guard, no forbidden statements in the source,
 every write names the replacement, full copy with count proof and verify, resume after a kill,
-reconciliation after a server commit, retry before the statement, abort deadline and stop file,
+reconciliation after a server commit, retry before the statement, stop file,
 durability refusal, missing source, replacement durability, non-empty unjournaled target, rows
 not explained by the journal, AUTO_INCREMENT counter is not a difference, definition difference,
 journal from another plan, redaction, missing settings named without values, connection errors
@@ -14,7 +14,6 @@ redacted. New: bucket cap, lock wait requeue and serialization, lock probe, conc
 fresh-table fallback, retry of parked chunks, count proof mismatch.
 """
 import contextlib
-import datetime as dt
 import io
 import json
 import os
@@ -26,10 +25,10 @@ import threading
 import time
 import types
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from s2rebuild import copy as C
-from s2rebuild import estimate as E
 from s2rebuild import inventory as I
 from s2rebuild import steps
 from s2rebuild.common import EXIT_DONE, EXIT_GATE, EXIT_INCOMPLETE, EXIT_MISMATCH, EXIT_REFUSED, KitError, auto_table_limit
@@ -315,27 +314,18 @@ class CopyTests(unittest.TestCase):
         h = Harness(self)
         pred = "CRC32(CONCAT_WS('|', COALESCE(`x`, ''), COALESCE(`y`, ''), COALESCE(`z`, ''))) MOD 2 = 0"
         h.fake.fail_insert[('t_nokey', pred)] = 'after'
-        outcome = h.o5_o6()
-        self.assertEqual((outcome.status, outcome.exit_code), (steps.INCOMPLETE, EXIT_INCOMPLETE), h.text())
-        self.assertEqual(h.states()[('t_nokey', 0)][0], 'failed')
-        self.assertEqual(h.step('O6').status, steps.PASSED, h.text())
+        self.assertEqual(h.o5_o6().status, steps.PASSED, h.text())
+        self.assertEqual(len(h.journal.events('retry_round')), 1, 'the retry round of the pass reconciles and copies the chunk again')
         self.assertEqual(multiset(h.fake.rows(TGT, 't_nokey')), multiset(h.fake.rows(SRC, 't_nokey')))
         self.assertEqual(len(h.journal.events('reconcile_delete')), 1)
 
     def test_failed_chunk_before_statement_is_retried(self):
         h = Harness(self)
         h.fake.fail_insert[('t_single', 'CRC32(`id`) MOD 3 = 0')] = 'before'
-        self.assertEqual(h.o5_o6().exit_code, EXIT_INCOMPLETE)
-        self.assertEqual(h.step('O6').status, steps.PASSED)
+        self.assertEqual(h.o5_o6().status, steps.PASSED, h.text())
         self.assertEqual(multiset(h.fake.rows(TGT, 't_single')), multiset(h.fake.rows(SRC, 't_single')))
 
-    def test_abort_deadline_and_stop_file(self):
-        h = Harness(self, mutate=lambda d: d['window'].update(start='2000-01-01T00:00:00Z', end='2000-01-01T08:00:00Z'))
-        outcome = h.o5_o6()
-        self.assertEqual(outcome.exit_code, EXIT_INCOMPLETE, h.text())
-        self.assertIn('Abort deadline reached', h.text())
-        self.assertEqual({s for s, _ in h.states().values()}, {'pending'})
-        self.assertFalse(any(w.startswith('INSERT') for w in h.fake.writes))
+    def test_stop_file(self):
         h2 = Harness(self)
         self.assertEqual(h2.step('O5').status, steps.PASSED)
         stop = C.stop_file_for(h2.journal_path)
@@ -345,8 +335,6 @@ class CopyTests(unittest.TestCase):
         self.assertFalse(any(w.startswith('INSERT') for w in h2.fake.writes))
         stop.unlink()
         self.assertEqual(h2.step('O6').status, steps.PASSED)
-        h2.journal.set_meta('abort_deadline', '2000-01-01T00:00:00Z')
-        self.assertEqual(C.resolve_abort_at(h2.journal, h2.config), dt.datetime(2000, 1, 1, tzinfo=dt.timezone.utc), 'the O1 record wins')
 
 
 # ---------------------------------------------------------------------------
@@ -401,8 +389,9 @@ class RefusalTests(unittest.TestCase):
 
     def test_resume_without_redo_refuses_unexplained_rows_before_any_write(self):
         h = Harness(self)
-        h.fake.fail_insert[('t_single', 'CRC32(`id`) MOD 3 = 0')] = 'before'
-        self.assertEqual(h.o5_o6().exit_code, EXIT_INCOMPLETE)
+        self.assertEqual(h.step('O5').status, steps.PASSED)
+        C.stop_file_for(h.journal_path).write_text('stop')
+        self.assertEqual(h.step('O6').exit_code, EXIT_INCOMPLETE)
         h.fake.rows(TGT, 't_comp').append({'a': 'stray', 'b': '2026-02-02 00:00:00.000000', 'c': 1, 'note': None})
         writes = len(h.fake.writes)
         outcome = h.step('O6', redo=False)
@@ -436,8 +425,12 @@ class RefusalTests(unittest.TestCase):
         self.assertEqual(h.journal.events('definition_mismatch'), ['t_comp'])
 
     def test_refuses_journal_from_another_plan(self):
-        h = Harness(self, mutate=lambda d: d['window'].update(start='2000-01-01T00:00:00Z', end='2000-01-01T08:00:00Z'))
-        self.assertEqual(h.o5_o6().exit_code, EXIT_INCOMPLETE)
+        h = Harness(self)
+        self.assertEqual(h.step('O5').status, steps.PASSED)
+        stop = C.stop_file_for(h.journal_path)
+        stop.write_text('stop')
+        self.assertEqual(h.step('O6').exit_code, EXIT_INCOMPLETE)
+        stop.unlink()
         other = dict(FIXTURE_TABLES)
         cols, pk, est, create = other['t_single']
         other['t_single'] = (cols, pk, 60_000_000, create)
@@ -566,10 +559,9 @@ class ReferenceTableTests(unittest.TestCase):
     def test_a_failed_staging_insert_drops_the_staging_table_and_the_rerun_copies(self):
         h = ref_harness(self)
         h.fake.fail_insert[('t_ref__stage', self.ref_plan(h).predicate(0))] = 'before'
-        self.assertEqual(h.step('O6').exit_code, EXIT_INCOMPLETE, h.text())
-        self.assertNotIn('t_ref__stage', h.fake.databases[TGT]['tables'])
-        self.assertEqual(h.fake.rows(TGT, 't_ref'), [])
         self.assertEqual(h.step('O6').status, steps.PASSED, h.text())
+        self.assertNotIn('t_ref__stage', h.fake.databases[TGT]['tables'])
+        self.assertEqual(len(h.journal.events('retry_round')), 1, 'the retry round copies the chunk again')
         self.assertEqual(multiset(h.fake.rows(TGT, 't_ref')), multiset(h.fake.rows(SRC, 't_ref')))
 
     def test_detection_names_and_columns(self):
@@ -714,9 +706,9 @@ class SchedulerTests(unittest.TestCase):
 
     def test_parked_chunks_need_retry_failed(self):
         h = Harness(self, mutate=lambda d: d['copy'].update(max_attempts=1))
-        h.fake.fail_insert[('t_single', 'CRC32(`id`) MOD 3 = 0')] = 'before'
-        self.assertEqual(h.o5_o6().exit_code, EXIT_INCOMPLETE)
-        self.assertEqual(h.journal.chunks('t_single')[0]['attempts'], 1)
+        h.fake.fail_statement(r'^INSERT INTO `[^`]+`\.`t_single` .*CRC32\(`id`\) MOD 3 = 0$', 'before', times=2)
+        self.assertEqual(h.o5_o6().exit_code, EXIT_INCOMPLETE, 'the chunk fails in the pass and in its retry round')
+        self.assertEqual(h.journal.chunks('t_single')[0]['attempts'], 2)
         self.assertEqual(h.step('O6').exit_code, EXIT_INCOMPLETE, 'the parked chunk is left alone without --retry-failed')
         self.assertIn('pending=0 started=0 failed=1', h.text())
         self.assertEqual(h.step('O6', options={'retry_failed': True}).status, steps.PASSED)
@@ -785,22 +777,6 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual([w for w in new if w.startswith('DELETE')], ['DELETE FROM `%s`.`t_single` WHERE CRC32(`id`) MOD 3 = 1' % TGT])
         self.assertEqual(sum(1 for w in new if w.startswith('INSERT')), 1, 'only the marked bucket is copied again')
         self.assertEqual(multiset(h.fake.rows(TGT, 't_single')), multiset(h.fake.rows(SRC, 't_single')))
-
-    def test_abort_deadline_keeps_the_earlier_of_record_and_window(self):
-        h = Harness(self)
-        plans = h.plans()
-        longest = C.longest_chunk_seconds(plans, h.config)
-        self.assertGreater(longest, 0)
-        window_deadline = h.config.window.abort_deadline(longest)
-        self.assertEqual(C.resolve_abort_at(h.journal, h.config, longest), window_deadline)
-        h.journal.set_meta('abort_deadline', '2026-11-01T11:30:00Z')
-        self.assertEqual(C.resolve_abort_at(h.journal, h.config, longest), window_deadline, 'an O1 record without the allowance is tightened')
-        h.journal.set_meta('abort_deadline', '2026-11-01T10:00:00Z')
-        self.assertEqual(C.resolve_abort_at(h.journal, h.config, longest), dt.datetime(2026, 11, 1, 10, tzinfo=dt.timezone.utc), 'an earlier record wins')
-        h.journal.record_gate('P1', True, 'account in place')
-        h.journal.step_end('P2', 'passed', 'preflight passed')
-        self.assertEqual(h.step('O1', redo=True, options={'no_rehearsal': 'copy test'}).status, steps.PENDING)
-        self.assertIn('longest modeled chunk', h.text())
 
     def test_serialization_survives_a_resume_and_configured_limits_are_kept(self):
         h = Harness(self, mutate=lambda d: (d['copy'].update(lock_retry_seconds=1), d['databases'][0]['tables'].update(t_nokey={'concurrency': 2})))
@@ -908,38 +884,76 @@ FRESH = {'fresh_table': 't_single'}
 class WorkspaceGuardTests(unittest.TestCase):
     def test_w8_the_breaker_trips_after_six_failures_in_a_row(self):
         """Six chunk failures with no success between them (copy.max_consecutive_failures) stop new chunks: the seventh chunk
-        stays pending, the work order's message is logged, journaled and in the O6 note, and O6 ends INCOMPLETE (exit 2).
-        A plain rerun copies the lot once the workspace is steady."""
+        stays pending and the work order's message is logged and journaled. The retry round of the pass then copies the lot (B3)."""
         h = Harness(self, mutate=lambda d: d['copy'].update(workers=1))
         self.assertEqual(h.config.copy.max_consecutive_failures, 6)
         h.fake.fail_statement(r'^INSERT INTO', 'before', times=6)
         outcome = h.o5_o6()
-        self.assertEqual((outcome.status, outcome.exit_code), (steps.INCOMPLETE, EXIT_INCOMPLETE), h.text())
-        self.assertIn(C.BREAKER_MESSAGE, outcome.note)
+        self.assertEqual(outcome.status, steps.PASSED, h.text())
         self.assertIn('circuit breaker: 6 chunk failures in a row; ' + C.BREAKER_MESSAGE, h.text())
         self.assertEqual(h.journal.events('breaker'), ['6 chunk failures in a row; no new chunk starts'])
-        states = h.states()
-        self.assertEqual(sorted(s for s, _ in states.values()), ['failed'] * 6 + ['pending'])
-        self.assertEqual(states[('t_empty', 0)][0], 'pending', 'the chunk after the breaker never started')
+        self.assertIn('retry round: 6 chunk(s) failed in this pass', h.text())
         self.assertEqual(len(h.fake.faults_fired), 6)
-        self.assertEqual(h.step('O6').status, steps.PASSED, h.text())
         for name in FIXTURE_TABLES:
             self.assertEqual(multiset(h.fake.rows(TGT, name)), multiset(h.fake.rows(SRC, name)), name)
 
-    def test_w8_error_1997_is_reconciled_and_requeued_without_an_attempt(self):
-        """A chunk that fails with 1997 (a node replaced under it, Helios fact 40) is marked failed, so its rows are reconciled,
-        and goes to the back of its queue without consuming an attempt; the same run completes with every row once."""
+class FinalPassTests(unittest.TestCase):
+    def test_b3_failed_chunks_go_last_and_retry_no_sooner_than_the_delay(self):
+        """B3 and K1: a failed chunk queues after the pending ones of its table, and the retry round of the pass starts it no sooner
+        than the retry delay after its failure, on the runner's clock."""
         h = Harness(self, mutate=lambda d: d['copy'].update(workers=1))
-        h.fake.fail_insert[('t_single', 'CRC32(`id`) MOD 3 = 0')] = 'commit'
-        outcome = h.o5_o6()
-        self.assertEqual(outcome.status, steps.PASSED, h.text())
-        self.assertEqual(h.journal.events('transient'), ['t_single bucket 0: error 1997, requeued without an attempt'])
-        self.assertIn('TRANSIENT t_single bucket 0 (error 1997, a node may have been replaced); reconciled and requeued without an attempt', h.text())
-        attempts = {(t, b): a for t, b, _, _, a in h.journal.chunk_states()}
-        self.assertEqual(attempts[('t_single', 0)], 1, 'the transient consumed no attempt')
-        self.assertEqual(len(h.journal.events('reconcile_delete')), 1, 'the rows the server applied were removed before the re-insert')
-        self.assertEqual(multiset(h.fake.rows(TGT, 't_single')), multiset(h.fake.rows(SRC, 't_single')))
-        self.assertEqual({s for s, _ in h.states().values()}, {'done'})
+        self.assertEqual(h.step('O5').status, steps.PASSED)
+        h.journal.mark_started('t_single', 0)
+        h.journal.mark_failed('t_single', 0, 'an earlier run')
+        runner = C.Runner(h.plans(), C.statements_for(h.db), h.journal, h.fake.connect, h.log, h.config.copy, workers=1,
+                          sleep=lambda s: None)
+        runner.load_pending()
+        self.assertEqual([b for b, _ in runner.queues['t_single']], [1, 2, 0], 'the failed chunk is last in its table')
+        clock = {'t': 0.0}
+        lock = threading.Lock()
+
+        def sleep(s):
+            with lock:
+                clock['t'] += s
+        h2 = Harness(self, mutate=lambda d: d['copy'].update(workers=1))
+        self.assertEqual(h2.step('O5').status, steps.PASSED)
+        h2.fake.fail_insert[('t_single', 'CRC32(`id`) MOD 3 = 1')] = 'before'
+        runner = C.Runner(h2.plans(), C.statements_for(h2.db), h2.journal, h2.fake.connect, h2.log, h2.config.copy, workers=1,
+                          sleep=sleep, clock=lambda: clock['t'], retry_delay=1200)
+        started = []
+        run_chunk = runner.run_chunk
+
+        def recorded(session, table, bucket, prior):
+            started.append((table, bucket, clock['t']))
+            return run_chunk(session, table, bucket, prior)
+        runner.run_chunk = recorded
+        self.assertTrue(runner.copy(), h2.text())
+        tries = [t for table, bucket, t in started if (table, bucket) == ('t_single', 1)]
+        self.assertEqual(len(tries), 2, 'one failure, one retry')
+        self.assertGreaterEqual(tries[1] - tries[0], 1200, 'the retry waits the delay after the failure')
+        self.assertEqual(len(h2.journal.events('retry_round')), 1)
+
+    def test_k1_a_count_mismatch_names_the_reconciled_buckets_and_the_recovery(self):
+        h = Harness(self)
+        self.assertEqual(h.o5_o6().status, steps.PASSED, h.text())
+        h.journal.event('reconcile_delete', 't_single bucket 1 removed 220 rows before re-insert')
+        h.journal.record_table_counts('t_single', 700, 920)
+        with mock.patch.object(C, 'RETRY_DELAY_SECONDS', 20 * 60):
+            lines = C.mismatch_hint(h.journal, SRC, h.run_id)
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn('t_single: source 700 rows, replacement 920; reconciled buckets 1', lines[0])
+        self.assertIn('Wait until 20 minutes after the interruption', lines[0])
+        self.assertIn('s2rebuild mark-recopy t_single --bucket 1 --db %s --run %s' % (SRC, h.run_id), lines[0])
+        self.assertIn('s2rebuild run --from O6 --db %s --run %s' % (SRC, h.run_id), lines[0])
+
+    def test_k7_the_progress_line_names_a_slow_chunk(self):
+        h = Harness(self)
+        self.assertEqual(h.step('O5').status, steps.PASSED)
+        runner = C.Runner(h.plans(), C.statements_for(h.db), h.journal, h.fake.connect, h.log, h.config.copy, clock=lambda: 4000.0)
+        runner.started_at = 0.0
+        runner.running = {('t_single', 1): 4000.0 - 31 * 60, ('t_comp', 0): 4000.0 - 60}
+        line = runner.progress_line()
+        self.assertTrue(line.endswith(' slow=t_single/1 31m'), line)
 
 
 class StopSafetyTests(unittest.TestCase):
@@ -1005,18 +1019,6 @@ class StopSafetyTests(unittest.TestCase):
         self.assertEqual(h.step('O6').status, steps.PASSED, h.text())
         for name in FIXTURE_TABLES:
             self.assertEqual(multiset(h.fake.rows(TGT, name)), multiset(h.fake.rows(SRC, name)), name)
-
-    def test_f13_fresh_table_refused_past_the_deadline(self):
-        """Past the abort deadline the fresh-table load is refused before a connection opens: no statement, no journal write."""
-        h = Harness(self, mutate=lambda d: d['window'].update(start='2000-01-01T00:00:00Z', end='2000-01-01T08:00:00Z'))
-        self.assertEqual(h.step('O5').status, steps.PASSED)
-        connections, writes = len(h.fake.connections), len(h.fake.writes)
-        outcome = h.step('O6', options=FRESH)
-        self.assertEqual((outcome.status, outcome.exit_code), (steps.REFUSED, EXIT_REFUSED), h.text())
-        self.assertIn('Abort deadline', outcome.note)
-        self.assertEqual((len(h.fake.connections), len(h.fake.writes)), (connections, writes))
-        self.assertEqual(h.journal.events('evidence_reopened'), [])
-        self.assertIsNone(h.journal.get_meta(C.FRESH_META + 't_single'))
 
     def test_f13_fresh_table_refused_while_the_stop_file_exists(self):
         """The stop file refuses the fresh-table load with nothing written; once it is removed the load runs."""
@@ -1112,7 +1114,7 @@ class StopSafetyTests(unittest.TestCase):
                     self.assertEqual(multiset(h.fake.rows(TGT, 't_single')), multiset(h.fake.rows(SRC, 't_single')))
                     self.assertNotIn('t_single__fresh', h.fake.databases[TGT]['tables'])
                     chunks = h.journal.chunks('t_single')
-                    self.assertEqual({(c['state'], c['error']) for c in chunks}, {('done', E.FRESH_LOAD_ERROR)})
+                    self.assertEqual({(c['state'], c['error']) for c in chunks}, {('done', C.FRESH_LOAD_ERROR)})
                     self.assertEqual(sum(c['rows_inserted'] for c in chunks), len(h.fake.rows(SRC, 't_single')))
                     self.assertEqual(h.journal.get_meta(C.FRESH_META + 't_single'), 't_single__fresh done')
                     self.assertEqual(h.step('O6').status, steps.PASSED, h.text())
@@ -1167,22 +1169,9 @@ class StopSafetyTests(unittest.TestCase):
                     self.assertIn('t_single__fresh was recorded loaded, but t_single', h.text())
                 self.assertEqual(multiset(h.fake.rows(TGT, 't_single')), multiset(h.fake.rows(SRC, 't_single')))
                 self.assertNotIn('t_single__fresh', h.fake.databases[TGT]['tables'])
-                self.assertEqual({(c['state'], c['error']) for c in h.journal.chunks('t_single')}, {('done', E.FRESH_LOAD_ERROR)})
+                self.assertEqual({(c['state'], c['error']) for c in h.journal.chunks('t_single')}, {('done', C.FRESH_LOAD_ERROR)})
                 self.assertEqual(h.journal.get_meta(C.FRESH_META + 't_single'), 't_single__fresh done')
                 self.assertEqual(h.step('O6').status, steps.PASSED, h.text())
-
-    def test_f13_calibrate_skips_fresh_table_rows(self):
-        """The chunk rows of a fresh-table load (bucket 0 holds every row, zero duration) carry the fresh-table error, and the
-        chunk reader of calibrate skips them."""
-        h = Harness(self)
-        self.assertEqual(h.step('O5').status, steps.PASSED)
-        self.assertEqual(h.step('O6', options=FRESH).status, steps.INCOMPLETE)
-        self.assertEqual(h.step('O6').status, steps.PASSED, h.text())
-        self.assertEqual({c['error'] for c in h.journal.chunks('t_single')}, {E.FRESH_LOAD_ERROR})
-        for first_pass_only in (True, False):
-            points = E.read_chunks(h.journal_path, first_pass_only=first_pass_only)
-            self.assertEqual(sorted({p[-1] for p in points}), ['t_comp', 't_empty', 't_nokey'], first_pass_only)
-
 
 if __name__ == '__main__':
     unittest.main()

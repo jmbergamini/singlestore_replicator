@@ -16,15 +16,15 @@ from s2rebuild.connect import Log
 from s2rebuild.journal import MEMORY, Journal
 from tests.helpers import config_from, write_config
 
-EXPECTED_ORDER = ['P1', 'P2', 'P3', 'P4', 'P5', 'O1', 'O2', 'O3', 'O4', 'O5', 'O6', 'O7', 'O8', 'O9', 'O10', 'O11',
+EXPECTED_ORDER = ['P1', 'P2', 'P3', 'P4', 'O1', 'O2', 'O3', 'O4', 'O5', 'O6', 'O7', 'O8', 'O9', 'O10', 'O11',
                   'C1', 'C2', 'C3', 'C4']
 
 
 class RegistryTests(unittest.TestCase):
     def test_order_ids_and_metadata(self):
         self.assertEqual(steps.ORDER, EXPECTED_ORDER)
-        self.assertEqual(steps.OUTAGE, EXPECTED_ORDER[5:16])
-        self.assertEqual(steps.ADMIN_STEPS, ['P1', 'P5', 'O2', 'O3', 'O9', 'O10', 'O11', 'C3', 'C4'])
+        self.assertEqual(steps.OUTAGE, EXPECTED_ORDER[4:15])
+        self.assertEqual(steps.ADMIN_STEPS, ['P1', 'O2', 'O3', 'O9', 'O10', 'O11', 'C3', 'C4'])
         self.assertEqual(steps.OWNER_SQL_STEPS, ['O2', 'O3', 'O9', 'O10', 'O11', 'C3', 'C4'])
         for step_id, step in steps.REGISTRY.items():
             self.assertEqual(step.id, step_id)
@@ -36,7 +36,7 @@ class RegistryTests(unittest.TestCase):
         self.assertFalse(steps.REGISTRY['O6'].needs_person)
         self.assertEqual(steps.REGISTRY['O6'].kind_label, 'python')
         self.assertEqual(steps.REGISTRY['O11'].identity_label, 'owner + customer')
-        for step_id in ('P2', 'C2', 'P3', 'P5', 'O2', 'O3', 'O4', 'O5', 'O6', 'O7', 'O8', 'O9', 'O10', 'O11', 'C1', 'C3', 'C4'):
+        for step_id in ('P2', 'C2', 'P3', 'O2', 'O3', 'O4', 'O5', 'O6', 'O7', 'O8', 'O9', 'O10', 'O11', 'C1', 'C3', 'C4'):
             self.assertIn(step_id, steps.HANDLERS)
         for admin_step in steps.ADMIN_STEPS:
             if admin_step != 'P1':
@@ -89,11 +89,10 @@ class Harness:
             self.journals[db.source] = Journal(path) if on_disk else Journal(MEMORY)
 
     def ready_for_o1(self):
-        """Record P1 and P2 as the P1 gate and s2rebuild check do, and waive the rehearsal for run(), so O1 reaches its go gate."""
+        """Record P1 and P2 as the P1 gate and s2rebuild check do, so O1 reaches its go gate."""
         for journal in self.journals.values():
             journal.record_gate('P1', True, 'account, Keychain items and config in place')
             journal.step_end('P2', 'passed', 'preflight passed')
-        self.options = {'no_rehearsal': 'test run without a rehearsal'}
         return self
 
     def run(self, **kw):
@@ -133,8 +132,8 @@ class DryRunTests(unittest.TestCase):
         self.assertIn('python steps not run (no implementation or no input yet): O4 example_orders_db, O5 example_orders_db, O6 example_orders_db, '
                       'O7 example_orders_db, O8 example_orders_db', text)
         self.assertIn('No connection was opened and nothing was written.', text)
-        self.assertIn('abort deadline: 2026-11-01T11:30:00Z', text)
-        self.assertIn('freeze path: A read-only attachment', text)
+        self.assertIn('window: 2026-11-01T05:00:00Z to 2026-11-01T13:00:00Z (8 h 00 m); no step stops on it', text)
+        self.assertIn('freeze: read-only attachment', text)
         self.assertIn('-- O3: Freeze: read-only attachment (Path A)', text, 'admin steps print their block in a dry run')
         self.assertIn('DETACH DATABASE `example_orders_db`;', text)
         self.assertEqual(h.journal.steps_board(), {}, 'a dry run journals nothing')
@@ -145,19 +144,6 @@ class DryRunTests(unittest.TestCase):
         self.assertIn('earlier steps without a passed gate: O1, O2, O3, O4, O5', h.text())
         self.assertIn('gates pending: none', h.text())
 
-    def test_dry_run_reports_a_past_deadline_without_stopping(self):
-        h = Harness(self, lambda d: d['window'].update(start='2000-01-01T00:00:00Z', end='2000-01-01T08:00:00Z'))
-        self.assertEqual(h.run(dry_run=True, to_id='O2'), EXIT_DONE)
-        self.assertIn('abort deadline is in the past', h.text())
-        self.assertIn('[O2]', h.text())
-
-    def test_dry_run_with_lockout_mode(self):
-        h = Harness(self, lambda d: d.update(freeze={'mode': 'lockout'}))
-        self.assertEqual(h.run(dry_run=True, to_id='O3'), EXIT_DONE)
-        self.assertIn('freeze path: B lockout', h.text())
-        self.assertIn('Path B lockout needs the owner profile', h.text())
-
-
 class RealRunTests(unittest.TestCase):
     def test_run_stops_at_o1_gate_with_exit_4_and_records_window(self):
         h = Harness(self).ready_for_o1()
@@ -165,11 +151,9 @@ class RealRunTests(unittest.TestCase):
         self.assertEqual(h.journal.step_status('O1'), 'pending')
         meta = h.journal.meta()
         self.assertEqual(meta['window_start'], '2026-11-01T05:00:00Z')
-        self.assertEqual(meta['abort_deadline'], '2026-11-01T11:30:00Z')
         self.assertEqual(meta['run_id'], '20261101-0500')
         self.assertEqual(meta['replacement_db'], 'example_orders_db_rebuild_20261101')
         self.assertEqual(meta['config_hash'], h.config.config_hash())
-        self.assertEqual(meta['freeze_mode'], 'readonly')
         self.assertIn('Stopped at O1: a person must record the gate', h.text())
         self.assertIsNone(h.journal.step_status('O2'), 'nothing after the pending gate runs')
 
@@ -221,13 +205,6 @@ class RealRunTests(unittest.TestCase):
             steps.record_gate(h.journals, 'O3', True, '  ')
         with self.assertRaisesRegex(KitError, 'Unknown step'):
             steps.record_gate(h.journals, 'O99', True, 'x')
-
-    def test_failed_check_exits_4_and_stops(self):
-        h = Harness(self, lambda d: d['window'].update(start='2000-01-01T00:00:00Z', end='2000-01-01T08:00:00Z'))
-        self.assertEqual(h.run(), EXIT_GATE)
-        self.assertEqual(h.journal.step_status('O1'), 'failed')
-        self.assertIn('Stopped at O1: gate failed', h.text())
-        self.assertIsNone(h.journal.step_status('O2'))
 
     def test_failed_gate_blocks_the_next_step(self):
         h = Harness(self)
@@ -330,32 +307,15 @@ class RealRunTests(unittest.TestCase):
                          'python outage steps with only passed steps between them share one run --from')
 
     def test_o1_without_a_window_reaches_the_go_with_no_deadline(self):
-        """The window is optional: O1 records no deadline, waits for the go, and the copy deadline resolves to None."""
-        from s2rebuild import copy as copy_module
+        """The window is optional: O1 records none and waits for the go."""
         h = Harness(self, lambda d: d.pop('window')).ready_for_o1()
         self.assertEqual(h.run(), EXIT_GATE)
         self.assertEqual(h.journal.step_status('O1'), 'pending')
-        self.assertIn('window: none configured, so no abort deadline', h.text())
+        self.assertIn('window: none configured; the copy and the switch run without a time limit', h.text())
         self.assertIn('Stopped at O1', h.text())
-        self.assertEqual(h.journal.get_meta('abort_deadline'), '')
         self.assertEqual(h.journal.get_meta('window_start'), '')
         self.assertIsNotNone(h.journal.get_meta('config_hash'), 'O1 ran, so the gate warning stays quiet')
-        self.assertEqual(h.journal.events('window'), ['none configured; no abort deadline'])
-        self.assertIsNone(copy_module.resolve_abort_at(h.journal, h.config, 600))
-
-    def test_o1_without_a_window_clears_a_deadline_an_earlier_o1_recorded(self):
-        from s2rebuild import copy as copy_module
-        h = Harness(self, lambda d: d.pop('window')).ready_for_o1()
-        h.journal.set_meta('abort_deadline', '2000-01-01T00:00:00Z')
-        self.assertEqual(h.run(), EXIT_GATE)
-        self.assertEqual(h.journal.get_meta('abort_deadline'), '')
-        self.assertIsNone(copy_module.resolve_abort_at(h.journal, h.config))
-
-    def test_o1_fails_with_a_past_deadline(self):
-        h = Harness(self, lambda d: d['window'].update(start='2000-01-01T00:00:00Z', end='2000-01-01T08:00:00Z'))
-        self.assertEqual(h.run(), EXIT_GATE)
-        self.assertEqual(h.journal.step_status('O1'), 'failed')
-        self.assertIn('already past', h.text())
+        self.assertEqual(h.journal.events('window'), ['none configured'])
 
     def test_two_databases_run_database_major(self):
         h = Harness(self, lambda d: d['databases'].append({'source': 'second_db', 'layout': {'partitions': 8, 'sub_partitions': 64}}))
@@ -378,8 +338,6 @@ class RealRunTests(unittest.TestCase):
         self.assertEqual(steps.run_one(h.config, h.databases, h.journals, h.log, 'P4'), EXIT_GATE)
         self.assertEqual(h.journal.step_status('P4'), 'pending')
         self.assertIn('decision recorded by: people', h.text())
-        with self.assertRaisesRegex(KitError, 'Cannot run P5 for database example_orders_db: earlier steps are not passed: P4'):
-            steps.run_one(h.config, h.databases, h.journals, h.log, 'P5')
         self.assertEqual(steps.run_one(h.config, h.databases, h.journals, h.log, 'C4', dry_run=True), EXIT_DONE)
         self.assertIsNone(h.journal.step_status('C4'))
 
@@ -422,7 +380,6 @@ class RealRunTests(unittest.TestCase):
     def test_f5_o1_refused_without_p2_in_the_journal(self):
         """O1 refuses before any journal write when P2 is not passed in this run; a dry run reports it and walks on."""
         h = Harness(self)
-        h.options = {'no_rehearsal': 'not the point of this test'}
         self.assertEqual(h.run(dry_run=True, to_id='O2'), EXIT_DONE)
         self.assertIn('P2 preflight: not passed in this run (not run)', h.text())
         self.assertIn('a real run refuses here: P2 is not passed in this run (not run); run s2rebuild check --run 20261101-0500 for this run first', h.text())
@@ -444,71 +401,9 @@ class RealRunTests(unittest.TestCase):
         self.assertIn('P2 preflight: passed in this run at', h.text())
         self.assertEqual(h.journal.get_meta('config_hash'), h.config.config_hash())
 
-    def test_f5_o1_refused_without_rehearsal_evidence_unless_no_rehearsal(self):
-        """Rehearsal evidence is P5 passed in this run or a passed rehearsal of any run; without it only --no-rehearsal NOTE lets O1
-        go on, recorded as an event and in the O1 note."""
-        h = Harness(self, on_disk=True)
-        for journal in h.journals.values():
-            journal.record_gate('P1', True, 'in place')
-            journal.step_end('P2', 'passed', 'preflight passed')
-        self.assertEqual(h.run(), EXIT_REFUSED)
-        self.assertIn('O1 refused: no rehearsal evidence (P5 passed in this run, or a passed rehearsal under', h.journal.step('O1')['note'])
-        self.assertIn('run s2rebuild rehearse, or waive it with --no-rehearsal NOTE', h.journal.step('O1')['note'])
-        self.assertIsNone(h.journal.get_meta('config_hash'))
-        self.assertEqual(h.run(options={'no_rehearsal': '   '}), EXIT_REFUSED, 'an empty note waives nothing')
-        self.assertEqual(h.run(options={'no_rehearsal': 'owner accepted the risk'}), EXIT_GATE)
-        self.assertEqual(h.journal.events('no_rehearsal'), ['O1 without rehearsal evidence: owner accepted the risk'])
-        self.assertIn('rehearsal waived with --no-rehearsal: owner accepted the risk', h.journal.step('O1')['note'])
-        self.assertIn('rehearsal evidence: none found; waived with --no-rehearsal: owner accepted the risk', h.text())
-        h.journal.step_end('P5', 'passed', 'rehearsal passed')
-        self.assertEqual(h.run(redo=True, to_id='O1'), EXIT_GATE)
-        self.assertIn('rehearsal evidence: P5 passed in this run', h.text())
-        self.assertEqual(len(h.journal.events('no_rehearsal')), 1, 'no waiver is recorded while evidence exists')
-        h.journal.step_end('P5', 'pending', 'reopened for the test')
-        timings = h.config.runs_dir() / 'earlier-rehearsal' / 'rehearsal' / 'timings.json'
-        timings.parent.mkdir(parents=True)
-        timings.write_text('{"p5_status": "pending"}', encoding='utf8')
-        self.assertEqual(h.run(redo=True, to_id='O1'), EXIT_REFUSED, 'a rehearsal that did not pass is no evidence')
-        timings.write_text('{"p5_status": "passed"}', encoding='utf8')
-        self.assertEqual(h.run(redo=True, to_id='O1'), EXIT_GATE)
-        self.assertIn('rehearsal evidence: a passed rehearsal under %s' % h.config.runs_dir(), h.text())
-
-    def test_w8_o1_refuses_while_autoscale_is_on_unless_accepted_and_records_the_workspace_answer(self):
-        """O1 reads the workspace facts P2 recorded: autoscale on refuses before any journal write unless --accept-autoscale NOTE,
-        which is recorded as an event and in the O1 note; without an API read O1 prints the three questions and records the
-        operator's --workspace NOTE as evidence of the go."""
-        import json
-        h = Harness(self).ready_for_o1()
-        api = {'source': 'api', 'workspace_id': 'ws-123', 'state': 'ACTIVE', 'autoscale': True, 'auto_suspend': False,
-               'fields': {'state': 'ACTIVE', 'autoScale': {'enabled': True}, 'autoSuspend': {'suspendType': 'DISABLED'}}}
-        h.journal.set_meta('preflight', json.dumps({'workspace': api}))
-        self.assertEqual(h.run(), EXIT_REFUSED)
-        note = h.journal.step('O1')['note']
-        self.assertIn('autoscale is on (Management API at P2); every chunk in flight fails with error 1997', note)
-        self.assertIn('override with --accept-autoscale NOTE', note)
-        self.assertIsNone(h.journal.get_meta('config_hash'), 'the refusal records nothing of O1')
-        self.assertIn('workspace: state ACTIVE, autoscale on (enabled=True), auto-suspend off (suspendType=DISABLED)', h.text())
-        self.assertEqual(h.run(options=dict(h.options, accept_autoscale='owner turned it off by hand at 04:50')), EXIT_GATE)
-        self.assertEqual(h.journal.events('accept_autoscale'), ['O1 with autoscale on: owner turned it off by hand at 04:50'])
-        self.assertIn('O1 with autoscale on: owner turned it off by hand at 04:50', h.journal.step('O1')['note'])
-        self.assertEqual(h.journal.get_meta('config_hash'), h.config.config_hash())
-        api.update(autoscale=False, fields=dict(api['fields'], autoScale={'enabled': False}))
-        h.journal.set_meta('preflight', json.dumps({'workspace': api}))
-        self.assertEqual(h.run(redo=True, to_id='O1'), EXIT_GATE, 'autoscale off needs no override')
-        self.assertEqual(len(h.journal.events('accept_autoscale')), 1)
-        h.journal.set_meta('preflight', json.dumps({'workspace': {'source': 'questions'}}))
-        self.assertEqual(h.run(redo=True, to_id='O1'), EXIT_GATE)
-        self.assertIn('workspace: not read through the Management API; the three questions: is the workspace ACTIVE', h.text())
-        self.assertIn('workspace answer: none recorded; record the answers at O1 with --workspace NOTE', h.text())
-        self.assertEqual(h.journal.events('workspace'), [])
-        self.assertEqual(h.run(redo=True, to_id='O1', options=dict(h.options, workspace='ACTIVE, autoscale off, auto-suspend off')), EXIT_GATE)
-        self.assertEqual(h.journal.events('workspace'), ['O1 workspace answer: ACTIVE, autoscale off, auto-suspend off'])
-        self.assertIn('workspace answer: ACTIVE, autoscale off, auto-suspend off', h.text())
-        self.assertIn('O1 workspace answer: ACTIVE, autoscale off, auto-suspend off', h.journal.step('O1')['note'])
-
     def test_f5_o1_journal_fault_points_resume_on_rerun(self):
         """The O1 journal writes the readiness checks guard, at the three points: before its first write (run_id), after the
-        names, hash and window are written (at the no_rehearsal event), and after every meta write but before the step result
+        names, hash and window are written (at the window event), and after every meta write but before the step result
         (step_end, which leaves O1 running as a kill -9 does). Each rerun runs O1 again (it is not passed), records every key once
         more and waits for the go; the names and hash rules then hold on the journal (a changed replacement name or configuration
         is seen)."""
@@ -518,7 +413,7 @@ class RealRunTests(unittest.TestCase):
             with self.subTest(point=point):
                 h = Harness(self).ready_for_o1()
                 method, match = {'before': ('set_meta', lambda key, value: key == 'run_id'),
-                                 'after': ('event', lambda kind, detail: kind == 'no_rehearsal'),
+                                 'after': ('event', lambda kind, detail: kind == 'window'),
                                  'journal': ('step_end', lambda step_id, status, *a, **k: step_id == 'O1')}[point]
                 fired = crash_journal(self, h.journal, method, match=match)
                 with self.assertRaises(SimulatedCrash):
@@ -531,7 +426,6 @@ class RealRunTests(unittest.TestCase):
                 meta = h.journal.meta()
                 self.assertEqual(meta['config_hash'], h.config.config_hash())
                 self.assertEqual((meta['source_db'], meta['replacement_db'], meta['retained_db']), h.databases[0].names)
-                self.assertEqual(meta['abort_deadline'], '2026-11-01T11:30:00Z')
                 other = config_from(lambda d: d['databases'][0].update(replacement='example_orders_db_rebuild_20261102'))
                 with self.assertRaisesRegex(KitError, 'records replacement database example_orders_db_rebuild_20261101'):
                     steps.check_run_names(h.journal, other.databases[0])
@@ -542,7 +436,7 @@ class RealRunTests(unittest.TestCase):
         """With two databases a pending O1 stops run_steps (and run_one, step O1) only after O1 ran for the second one too, so both
         journals hold the names, the configuration hash and the window before the one go; a refused O1 still stops at once. The
         three failure points are the second database's O1 writes: before its first write (run_id), after its names, hash and
-        window (at the no_rehearsal event), and before its result (step_end, left running as a kill -9 does). The first database
+        window (at the window event), and before its result (step_end, left running as a kill -9 does). The first database
         is left pending; a rerun records both and waits for the go, and the names and hash rules then hold on the second journal."""
         import yaml
         from s2rebuild.config import build_config
@@ -568,7 +462,6 @@ class RealRunTests(unittest.TestCase):
                 meta = journal.meta()
                 self.assertEqual(meta['config_hash'], h.config.config_hash(), db.source)
                 self.assertEqual((meta['source_db'], meta['replacement_db'], meta['retained_db']), db.names)
-                self.assertEqual(meta['abort_deadline'], '2026-11-01T11:30:00Z')
         h = Harness(self, two).ready_for_o1()
         self.assertEqual(h.run(), EXIT_GATE)
         recorded(h)
@@ -586,7 +479,7 @@ class RealRunTests(unittest.TestCase):
                 h = Harness(self, two).ready_for_o1()
                 second = h.journals['second_db']
                 method, match = {'before': ('set_meta', lambda key, value: key == 'run_id'),
-                                 'after': ('event', lambda kind, detail: kind == 'no_rehearsal'),
+                                 'after': ('event', lambda kind, detail: kind == 'window'),
                                  'journal': ('step_end', lambda step_id, status, *a, **k: step_id == 'O1')}[point]
                 fired = crash_journal(self, second, method, match=match)
                 with self.assertRaises(SimulatedCrash):

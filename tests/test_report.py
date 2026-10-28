@@ -35,11 +35,10 @@ class WorkbookTests(unittest.TestCase):
         db = cfg.databases[0]
         inv = I.load(FIXTURE_INVENTORY)
         plans = I.plan_tables(inv, cfg, db)
-        est = E.estimate(plans, cfg, E.DEFAULT_BASELINE, pipeline_count=2)
-        fit = E.window_fit(est, cfg.window)
+        est = E.estimate(plans, cfg, pipeline_count=2)
         with tempfile.TemporaryDirectory() as tmp:
-            path = R.write_profile_workbook(Path(tmp) / 'reports' / 'profile.xlsx', inv, plans, est, fit, cfg, db, '20261101-0500',
-                                            E.DEFAULT_BASELINE, steps_board={'P3': {'status': 'passed', 'started_utc': 'a', 'ended_utc': 'b'}},
+            path = R.write_profile_workbook(Path(tmp) / 'reports' / 'profile.xlsx', inv, plans, est, cfg, db, '20261101-0500',
+                                            steps_board={'P3': {'status': 'passed', 'started_utc': 'a', 'ended_utc': 'b'}},
                                             env={'S2REBUILD_KAFKA_CREDENTIALS': 'x'})
             wb = load_workbook(str(path))
             self.assertEqual(wb.sheetnames[0], 'Summary')
@@ -49,8 +48,8 @@ class WorkbookTests(unittest.TestCase):
             self.assertEqual(summary['Database'], 'example_orders_db')
             self.assertEqual(summary['Tables'], 6)
             self.assertEqual(summary['Estimated rows'], 639003650)
-            self.assertEqual(summary['Buckets'], 40)
-            self.assertEqual(summary['Verdict'], 'FITS')
+            self.assertEqual(summary['Buckets'], 68)
+            self.assertEqual(summary['Rows per hour (estimate.rows_per_hour)'], 2_400_000_000)
             self.assertEqual(summary['P3'], 'passed a b')
             self.assertEqual(summary['Captured'], '2 (1 KAFKA, 1 S3)')
             self.assertEqual(summary['Tables with AUTO_INCREMENT counters'], 'customers')
@@ -60,10 +59,7 @@ class WorkbookTests(unittest.TestCase):
             self.assertEqual(summary['Pipelines the application recreates'], 'imports')
             self.assertEqual(summary['Pipelines with errors in 24 h'], 'imports')
             self.assertEqual(summary['Write-capable'], 'app_user, retention_job')
-            self.assertEqual(summary['Path B action'], 'none (Path A read-only attachment)')
-            self.assertAlmostEqual(summary['Modeled GiB per hour'], round(est.size_gib / est.copy_seconds * 3600, 1))
             self.assertIsInstance(summary['Estimated rows'], int, 'numbers stored as numbers')
-            self.assertEqual(summary['Abort deadline'], E.iso(fit.deadline))
             orders = wb['orders']
             labels = [orders.cell(row=r, column=1).value for r in range(1, orders.max_row + 1)]
             values = {orders.cell(row=r, column=1).value: orders.cell(row=r, column=2).value for r in range(1, orders.max_row + 1)}
@@ -75,7 +71,7 @@ class WorkbookTests(unittest.TestCase):
             self.assertEqual(values['Primary key'], 'id')
             self.assertEqual(values['Shard key'], 'id')
             self.assertEqual(values['Sort key'], 'created_at')
-            self.assertIsInstance(values['Minutes expected'], float)
+            self.assertIsInstance(values['Minutes at the run rate'], float)
             definition_row = labels.index('Definition')
             self.assertEqual(labels[definition_row - 1], None, 'one blank row before the definition block')
             self.assertEqual(orders.cell(row=definition_row + 2, column=1).value, 'CREATE TABLE `orders` (')
@@ -104,7 +100,7 @@ class WorkbookTests(unittest.TestCase):
             self.assertEqual(wb['System'].cell(row=2, column=1).value, 'db_a')
 
     def test_long_and_reserved_table_names_are_mapped(self):
-        cfg = config_from(lambda d: d.update(freeze={'mode': 'lockout'}))
+        cfg = config_from()
         db = cfg.databases[0]
         inv = I.load(FIXTURE_INVENTORY)
         long_name = 'a_very_long_table_name_that_goes_past_31:chars'
@@ -115,14 +111,13 @@ class WorkbookTests(unittest.TestCase):
         plans = I.plan_tables(inv, cfg, db)
         est = E.estimate(plans, cfg)
         with tempfile.TemporaryDirectory() as tmp:
-            path = R.write_profile_workbook(Path(tmp) / 'p.xlsx', inv, plans, est, None, cfg, db, 'r', E.DEFAULT_BASELINE)
+            path = R.write_profile_workbook(Path(tmp) / 'p.xlsx', inv, plans, est, cfg, db, 'r')
             wb = load_workbook(str(path))
             self.assertIn('a_very_long_table_name_that_goe', wb.sheetnames)
             self.assertIn('System~2', wb.sheetnames, 'System is reserved for the system sheet')
             summary = {str(r[0].value): r[1].value for r in wb['Summary'].iter_rows(min_col=1, max_col=2) if r[0].value}
             self.assertEqual(summary[long_name], 'a_very_long_table_name_that_goe')
             self.assertEqual(summary['System'], 'System~2')
-            self.assertIn('REVOKE the write privileges', summary['Path B action'])
             R.write_system_sheet(path, [{'database': 'd', 'partitions': 1, 'sub_partitions': 0, 'tables': 0, 'estimated_rows': 0, 'size_gib': None,
                                          'pipelines': 0, 'copy_minutes_expected': 0.0}])
             wb = load_workbook(str(path))
@@ -137,10 +132,9 @@ class WorkbookTests(unittest.TestCase):
         plans = I.plan_tables(inv, cfg, db)
         est = E.estimate(plans, cfg)
         with tempfile.TemporaryDirectory() as tmp:
-            path = R.write_profile_workbook(Path(tmp) / 'p.xlsx', inv, plans, est, None, cfg, db, 'r', E.DEFAULT_BASELINE)
+            path = R.write_profile_workbook(Path(tmp) / 'p.xlsx', inv, plans, est, cfg, db, 'r')
             wb = load_workbook(str(path))
             summary = {str(r[0].value): r[1].value for r in wb['Summary'].iter_rows(min_col=1, max_col=2) if r[0].value}
-            self.assertNotIn('Verdict', summary)
             self.assertIn('no owner profile', summary['Captured'])
             self.assertEqual(wb['Pipelines'].cell(row=2, column=1).value, 'pipelines not captured: no owner profile')
             self.assertEqual(wb['Pipeline offsets'].cell(row=2, column=1).value, 'none captured')
@@ -159,15 +153,14 @@ class WorkbookTests(unittest.TestCase):
             'storage_type': 'columnstore', 'reference': True, 'auto_increment': None, 'est_rows': 6_000_000, 'exact_rows': 6_000_000,
             'size_gib': 0.4, 'computed_columns': []})
         plans = I.plan_tables(inv, cfg, db)
-        est = E.estimate(plans, cfg, E.DEFAULT_BASELINE)
-        self.assertGreater(est.schedule.per_table['regions'][2], 0.0)
+        est = E.estimate(plans, cfg)
         with tempfile.TemporaryDirectory() as tmp:
-            path = R.write_profile_workbook(Path(tmp) / 'p.xlsx', inv, plans, est, None, cfg, db, 'r', E.DEFAULT_BASELINE)
+            path = R.write_profile_workbook(Path(tmp) / 'p.xlsx', inv, plans, est, cfg, db, 'r')
             wb = load_workbook(str(path))
             regions = {r[0].value: r[1].value for r in wb['regions'].iter_rows(min_col=1, max_col=2) if r[0].value}
             self.assertEqual(regions['Copy path'], 'reference table, copied through a staging table')
             self.assertEqual((regions['Buckets'], regions['Rows exact']), (1, 6_000_000), 'one bucket although 6 M rows would chunk')
-            self.assertGreater(regions['Minutes expected'], 0.0)
+            self.assertGreater(regions['Minutes at the run rate'], 0.0)
             callouts = ' '.join(str(c.value) for c in wb['regions']['B'] if c.value)
             self.assertIn('reference table, copied through a staging table: the row count is an exact COUNT(*)', callouts)
             orders = {r[0].value: r[1].value for r in wb['orders'].iter_rows(min_col=1, max_col=2) if r[0].value}
@@ -177,7 +170,7 @@ class WorkbookTests(unittest.TestCase):
             self.assertEqual(summary['Tables'], 7)
 
     def test_final_summary_without_a_window(self):
-        """A run whose O1 recorded no window shows 'none configured' and no deadline in the final workbook."""
+        """A run whose O1 recorded no window shows 'none configured' in the final workbook."""
         from s2rebuild.journal import MEMORY, Journal
         cfg = config_from(lambda d: d.pop('window'))
         db = cfg.databases[0]
@@ -187,10 +180,8 @@ class WorkbookTests(unittest.TestCase):
         self.addCleanup(journal.close)
         journal.set_meta('window_start', '')
         journal.set_meta('window_end', '')
-        journal.set_meta('abort_deadline', '')
         summary = {label: value for label, value in R.final_summary_rows(inv, plans, journal, cfg, db, 'r') if label}
         self.assertEqual(summary['Window'], 'none configured')
-        self.assertEqual(summary['Abort deadline'], 'none')
         journal.set_meta('window_start', '2026-10-27T00:00:00Z')
         journal.set_meta('window_end', '2026-10-27T05:00:00Z')
         summary = {label: value for label, value in R.final_summary_rows(inv, plans, journal, cfg, db, 'r') if label}
@@ -252,10 +243,7 @@ class FinalReportTests(unittest.TestCase):
         j.event('switch_listing', 'after: name live; name retained')
         j.event('endstate_listing', 'before: name live; name retained')
         j.event('endstate_listing', 'after: name live; name retained (C3)')
-        j.set_meta('preflight', json.dumps({'leaf_cores': 16, 'workspace': {'source': 'api', 'state': 'ACTIVE', 'autoscale': True, 'auto_suspend': False,
-                                                                           'fields': {'state': 'ACTIVE', 'autoScale': {'enabled': True}, 'autoSuspend': 'OFF'}}}))
         j.event('workspace', 'O1 workspace answer: autoscale off for the window')
-        j.event('accept_autoscale', 'O1 with autoscale on: accepted for the lab')
         j.event('view', json.dumps({'view': 'order_totals', 'original_definer': '`app_user`@`%`', 'definer': 'owner', 'reason': 'the original definer no longer exists; the owner account is the definer'}))
         j.event('routine', json.dumps({'routine': 'tax_rate', 'kind': 'function', 'original_definer': '`app`@`%`', 'definer': 'kept', 'reason': 'original definer kept'}))
         j.set_meta('pipelines_skipped', json.dumps(['KAFKA']))
@@ -274,9 +262,7 @@ class FinalReportTests(unittest.TestCase):
             self.assertEqual(summary['Retain until'], '2027-01-25T03:00:00Z')
             self.assertEqual(summary['Switched'], '2026-10-27T03:00:00Z')
             self.assertTrue(summary['Delete later with'].startswith('s2rebuild cleanup --delete %s --run r' % self.db.retained))
-            self.assertEqual(summary['Observed at P2'], 'state ACTIVE; autoscale on (enabled=True); auto-suspend off (Management API at P2)')
             self.assertEqual(summary['Answered at O1'], 'O1 workspace answer: autoscale off for the window')
-            self.assertEqual(summary['Autoscale accepted at O1'], 'O1 with autoscale on: accepted for the lab')
             self.assertEqual(summary['Reference tables (copied through a staging table)'], 'events')
             self.assertTrue(summary['Not recreated (no credentials given)'].startswith('orders_stream (KAFKA)'))
             views = {r[0].value: (r[2].value, r[3].value) for r in wb['Views'].iter_rows(min_row=2)}
@@ -298,12 +284,11 @@ class FinalReportTests(unittest.TestCase):
         from s2rebuild import report_md
         summary = self.summary()
         for label in ('Live entry', 'Retained entry', 'Entries before O10', 'Entries after O10', 'Entries before C3', 'Entries after C3',
-                      'Observed at P2', 'Answered at O1', 'Switched'):
+                      'Answered at O1', 'Switched'):
             self.assertEqual(summary[label], 'not recorded', label)
         self.assertEqual(summary['Retain until'], 'not recorded (C2 records it)')
-        self.assertEqual(summary['Autoscale accepted at O1'], 'none')
         self.assertEqual(summary['Sampled fingerprints (latest, with the predicate)'], 'none')
-        self.assertNotIn('Entries before repair C3', summary, 'the repair moments print only when C3 ran a repair')
+        self.assertNotIn('Entries at the refusal C3', summary, 'the refusal moment prints only when C3 refused')
         self.assertEqual([r[0] for r in R.routine_rows(self.inv, self.journal, self.cfg, self.db)], ['nightly_rollup', 'tax_rate'])
         self.assertEqual(R.routine_rows({'routines': [], 'routines_captured': False}, self.journal, self.cfg, self.db)[0][0],
                          'none captured (the owner profile reads routines)')

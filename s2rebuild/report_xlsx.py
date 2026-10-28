@@ -17,7 +17,7 @@ from openpyxl.styles import Alignment, Font
 from openpyxl.utils import get_column_letter
 
 from . import estimate, routines, steps, transform, verify
-from .common import KitError, format_duration, iso
+from .common import format_duration, iso
 
 SHEET_NAME_LIMIT = 31
 _INVALID = re.compile(r'[\[\]:*?/\\]')
@@ -92,7 +92,7 @@ def _key_lists(table):
     return primary, unique, shard, sort, other
 
 
-def summary_rows(inventory, plans, est, fit, config, db, run_id, baseline, steps_board=None, name_map=None):
+def summary_rows(inventory, plans, est, config, db, run_id, steps_board=None, name_map=None):
     """The (label, value) rows of the Summary tab for the profile workbook."""
     window = config.window
     rows = [('SingleStore Database Rebuild Kit profile', None), (None, None),
@@ -108,7 +108,7 @@ def summary_rows(inventory, plans, est, fit, config, db, run_id, baseline, steps
         rows.append(('Source attachment', '%s, STORAGE_ID %s' % (attachment.get('ATTACH_TYPE'), attachment.get('STORAGE_ID'))))
     if window is not None:
         rows.append(('Window', '%s to %s (%s)' % (iso(window.start), iso(window.end), format_duration(window.duration.total_seconds()))))
-    rows.append(('Freeze path', 'A read-only attachment' if config.freeze.mode == 'readonly' else 'B lockout'))
+    rows.append(('Freeze', 'read-only attachment'))
     rows.append((None, None))
     rows.append(('Steps', None))
     for step_id, row in (steps_board or {}).items():
@@ -118,30 +118,10 @@ def summary_rows(inventory, plans, est, fit, config, db, run_id, baseline, steps
     rows.extend([('Tables', est.tables), ('Views', len(inventory.get('views') or [])),
                  ('Routines', len(inventory.get('routines') or [])), ('Estimated rows', est.rows),
                  ('Primary files GiB', round(est.size_gib, 3)), ('Buckets', sum(p.n_buckets for p in plans)),
-                 ('Workers', est.workers)])
-    low, expected, high = est.copy_band
-    tl, te, th = est.total_band
+                 ('Workers', config.copy.workers)])
     rows.append((None, None))
     rows.append(('Estimate', None))
-    rows.extend([('Baseline', '%s (scan %.3e s/row, insert %.3e s/row, overhead %.1f s, %d workers, %s, leaf cores %s)' % (
-                  baseline.source, baseline.scan_s_per_row, baseline.insert_s_per_row, baseline.chunk_overhead_s, baseline.workers,
-                  baseline.compute_size, baseline.leaf_cores if baseline.leaf_cores is not None else 'not recorded')),
-                 ('Planning estimate', '%s; %s' % (est.scale_note, estimate.PLANNING_NOTE)),
-                 ('Copy wall expected', format_duration(expected)), ('Copy wall low', format_duration(low)), ('Copy wall high', format_duration(high)),
-                 ('Copy worker seconds', round(est.schedule.worker_seconds)), ('Longest chunk', format_duration(est.schedule.longest_chunk_seconds)),
-                 ('Modeled rows per hour', round(est.rows_per_hour)),
-                 ('Modeled GiB per hour', round(est.size_gib / est.copy_seconds * 3600, 1) if est.copy_seconds else 0),
-                 ('Total O2 to O11 expected', format_duration(te)),
-                 ('Total O2 to O11 low', format_duration(tl)), ('Total O2 to O11 high', format_duration(th))])
-    for label, seconds in est.allowances:
-        rows.append(('Allowance ' + label, format_duration(seconds)))
-    if fit is not None:
-        rows.append((None, None))
-        rows.append(('Window fit', None))
-        rows.extend([('Abort deadline', iso(fit.deadline)), ('Copy end expected', iso(fit.copy_end[1])), ('Copy end high', iso(fit.copy_end[2])),
-                     ('O11 end expected', iso(fit.total_end[1])), ('O11 end high', iso(fit.total_end[2])),
-                     ('Verdict', 'FITS' if fit.fits else 'DOES NOT FIT'),
-                     ('Spare at high', ('%s %s' % (format_duration(abs(fit.spare_seconds)), 'spare' if fit.spare_seconds >= 0 else 'short')))])
+    rows.extend([('Rows per hour (estimate.rows_per_hour)', est.rows_per_hour), ('Copy expected', format_duration(est.copy_seconds))])
     pipelines = inventory.get('pipelines') or {}
     rows.append((None, None))
     rows.append(('Pipelines', None))
@@ -165,8 +145,6 @@ def summary_rows(inventory, plans, est, fit, config, db, run_id, baseline, steps
     rows.append(('Write-capable', ', '.join(a['user'] for a in accounts) or 'none found'))
     for a in accounts:
         rows.append((a['user'], '%s on %s' % (', '.join(a['privileges']), ', '.join(a['scopes']))))
-    rows.append(('Path B action', ('REVOKE the write privileges above from every listed account on every database, restore at O11'
-                                   if config.freeze.mode == 'lockout' else 'none (Path A read-only attachment)')))
     rows.append((None, None))
     rows.append(('Findings', None))
     counters = [p.name for p in plans if _auto(inventory, p.name)]
@@ -219,7 +197,7 @@ def copy_path_text(plan):
 
 def table_rows(table, plan, est):
     """The (label, value) rows of one table tab's top block."""
-    low, expected, high = est.table_minutes(plan.name) if est is not None else (None, None, None)
+    minutes = round(plan.est_rows / float(est.rows_per_hour) * 60.0, 1) if est is not None and est.rows_per_hour else None
     primary, unique, shard, sort, other = _key_lists(table)
     auto = table.get('auto_increment') or {}
     rows = [('Table', plan.name), ('Storage type', table.get('storage_type') or 'unknown'), ('Copy path', copy_path_text(plan)),
@@ -227,9 +205,8 @@ def table_rows(table, plan, est):
             ('Key columns', ','.join(plan.key_columns) or '(all columns, COALESCE)'), ('Column count', len(plan.columns)),
             ('Rows estimated', plan.est_rows), ('Rows exact', table.get('exact_rows')), ('Size GiB', None if plan.size_gib is None else round(plan.size_gib, 3)),
             (None, None), ('Estimate', None),
-            ('Minutes low', low), ('Minutes expected', expected), ('Minutes high', high),
+            ('Minutes at the run rate', minutes),
             ('Buckets', plan.n_buckets), ('Chunk rows', plan.chunk_rows), ('Rows per chunk', round(plan.est_rows / plan.n_buckets)),
-            ('Worker seconds', round(est.schedule.per_table.get(plan.name, (0, 0, 0))[2]) if est is not None else None),
             ('Concurrency limit', plan.concurrency if plan.concurrency else 'auto'), ('Time column', plan.time_column or 'none'),
             (None, None), ('Attributes', None),
             ('Primary key', ', '.join(primary) or 'none'), ('Unique keys', '; '.join(unique) or 'none'),
@@ -252,7 +229,7 @@ def table_rows(table, plan, est):
     return rows
 
 
-def write_profile_workbook(path, inventory, plans, est, fit, config, db, run_id, baseline, steps_board=None, env=None):
+def write_profile_workbook(path, inventory, plans, est, config, db, run_id, steps_board=None, env=None):
     """Write the profile workbook: Summary, one tab per table, Pipelines, Pipeline offsets. Returns the path.
 
     env is the operator's environment, read only to say whether a credential variable is set.
@@ -267,7 +244,7 @@ def write_profile_workbook(path, inventory, plans, est, fit, config, db, run_id,
     name_map = {}
     for p in plans:
         name_map[p.name] = sheet_name(p.name, used)
-    _rows(summary, summary_rows(inventory, plans, est, fit, config, db, run_id, baseline, steps_board, name_map))
+    _rows(summary, summary_rows(inventory, plans, est, config, db, run_id, steps_board, name_map))
     summary.cell(row=1, column=1).font = _TITLE
     _widths(summary, [46, 90])
     by_name = {t['name']: t for t in inventory['tables']}
@@ -399,7 +376,7 @@ def entry_text(att):
         att.get('compute_id') or NOT_RECORDED, state, att.get('attach_syntax') or NOT_RECORDED)
 
 
-LISTING_EVENTS = (('switch_listing', 'O10', ('before', 'after')), ('endstate_listing', 'C3', ('before', 'after', 'before repair', 'after repair')))
+LISTING_EVENTS = (('switch_listing', 'O10', ('before', 'after')), ('endstate_listing', 'C3', ('before', 'after', 'at the refusal')))
 
 
 def listing_rows(journal):
@@ -411,27 +388,14 @@ def listing_rows(journal):
             when, _, text = detail.partition(': ')
             found[when] = text
         for when in moments:
-            if when in found or ' ' not in when:  # before and after always print; the repair moments only when C3 ran a repair
+            if when in found or ' ' not in when:  # before and after always print; the refusal moment only when C3 refused
                 rows.append(('Entries %s %s' % (when, step_id), found.get(when) or NOT_RECORDED))
     return rows
 
 
 def workspace_rows(journal):
-    """The Workspace rows of the final Summary: the settings P2 observed and what O1 recorded (the answer, an accepted autoscale)."""
-    from . import workspace
-    facts = workspace.recorded(journal)
-    if facts and facts.get('source') == 'api':
-        fields = facts.get('fields') or {}
-        observed = 'state %s; autoscale %s; auto-suspend %s (Management API at P2)' % (
-            facts.get('state') or 'not reported', workspace.describe(fields.get(workspace.AUTOSCALE_FIELD)),
-            workspace.describe(fields.get(workspace.AUTO_SUSPEND_FIELD)))
-    elif facts:
-        observed = 'not read at P2 (no Management API key); the three questions were printed for O1'
-    else:
-        observed = NOT_RECORDED
-    return [('Workspace', None), ('Observed at P2', observed),
-            ('Answered at O1', '; '.join(journal.events('workspace')) or NOT_RECORDED),
-            ('Autoscale accepted at O1', '; '.join(journal.events('accept_autoscale')) or 'none')]
+    """The Workspace rows of the final Summary: the answers O1 recorded (--workspace NOTE)."""
+    return [('Workspace', None), ('Answered at O1', '; '.join(journal.events('workspace')) or NOT_RECORDED)]
 
 
 def definer_text(event):
@@ -486,18 +450,16 @@ def routine_rows(inventory, journal, config, db):
     return rows
 
 
-def final_summary_rows(inventory, plans, journal, config, db, run_id, name_map=None, baseline=None, calibration=None):
-    """The (label, value) rows of the final workbook's Summary tab; calibration, when given, is the C2 Calibration line."""
-    from . import inventory as inventory_module
+def final_summary_rows(inventory, plans, journal, config, db, run_id, name_map=None):
+    """The (label, value) rows of the final workbook's Summary tab."""
     board = journal.steps_board()
     per_table, total = copy_stats(journal)
     meta = journal.meta()
     window = '%s to %s' % (meta['window_start'], meta.get('window_end', '?')) if meta.get('window_start') else 'none configured'
     rows = [('SingleStore Database Rebuild Kit final report', None), (None, None),
             ('Run', run_id), ('Customer', config.customer), ('Database', db.source), ('Replacement', db.replacement), ('Retained', db.retained),
-            ('Freeze path', 'A read-only attachment' if config.freeze.mode == 'readonly' else 'B lockout'),
-            ('Freeze time', meta.get('freeze_time') or 'not recorded'), ('Window', window),
-            ('Abort deadline', meta.get('abort_deadline') or 'none'), (None, None), ('Steps', None)]
+            ('Freeze', 'read-only attachment'),
+            ('Freeze time', meta.get('freeze_time') or 'not recorded'), ('Window', window), (None, None), ('Steps', None)]
     for step_id in steps.ORDER:
         row = board.get(step_id)
         if row:
@@ -513,24 +475,18 @@ def final_summary_rows(inventory, plans, journal, config, db, run_id, name_map=N
                  ('Copy wall time', format_duration(total['wall_seconds'])), ('Copy worker seconds', round(total['worker_seconds'])),
                  ('Rows per hour', round(total['rows'] / hours) if hours else 0), ('GiB per hour', round(size_gib / hours, 1) if hours else 0),
                  ('Lock waits', sum(e['lock_waits'] for e in per_table.values())), ('Re-copies', sum(e['recopies'] for e in per_table.values()))])
-    est = estimate.estimate(plans, config, baseline or estimate.DEFAULT_BASELINE, leaf_cores=inventory_module.recorded_leaf_cores(journal))
+    est = estimate.estimate(plans, config)
     rows.append((None, None))
     rows.append(('Estimate against actual', None))
     rows.extend([('Copy wall expected', format_duration(est.copy_seconds)), ('Copy wall actual', format_duration(total['wall_seconds'])),
-                 ('Rows per hour expected', round(est.rows_per_hour)), ('Rows per hour actual', round(total['rows'] / hours) if hours else 0),
-                 ('GiB per hour expected', round(size_gib / est.copy_seconds * 3600, 1) if est.copy_seconds else 0),
-                 ('GiB per hour actual', round(size_gib / hours, 1) if hours else 0),
-                 ('Worker seconds expected', round(est.schedule.worker_seconds)), ('Worker seconds actual', round(total['worker_seconds']))])
-    if calibration:
-        rows.append(('Calibration', calibration))
+                 ('Rows per hour expected (estimate.rows_per_hour)', est.rows_per_hour),
+                 ('Rows per hour actual', round(total['rows'] / hours) if hours else 0)])
     rows.append((None, None))
     rows.append(('Accounts', None))
     accounts = inventory.get('accounts') or []
     rows.append(('Write-capable', ', '.join(a['user'] for a in accounts) or 'none found'))
     for a in accounts:
         rows.append((a['user'], '%s on %s' % (', '.join(a['privileges']), ', '.join(a['scopes']))))
-    rows.append(('Path B action', ('REVOKE the write privileges above from every listed account on every database, restore at O11'
-                                   if config.freeze.mode == 'lockout' else 'none (Path A read-only attachment)')))
     rows.append((None, None))
     rows.append(('Verification', None))
     # the latest row per tier and table: a match after a mismatch counts as a match; the table tab keeps every row
@@ -691,7 +647,7 @@ def final_table_rows(table, plan, journal, per_table):
     return rows
 
 
-def write_final_workbook(path, inventory, plans, journal, config, db, run_id, baseline=None, env=None, calibration=None):
+def write_final_workbook(path, inventory, plans, journal, config, db, run_id, env=None):
     """Write the final workbook: Summary, one tab per table with copy and verification results, Pipelines tabs."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -700,7 +656,7 @@ def write_final_workbook(path, inventory, plans, journal, config, db, run_id, ba
     summary.title = 'Summary'
     used = {'Summary', 'Pipelines', 'Pipeline offsets', 'System', 'Views', 'Routines', 'History'}
     name_map = {p.name: sheet_name(p.name, used) for p in plans}
-    _rows(summary, final_summary_rows(inventory, plans, journal, config, db, run_id, name_map, baseline, calibration))
+    _rows(summary, final_summary_rows(inventory, plans, journal, config, db, run_id, name_map))
     summary.cell(row=1, column=1).font = _TITLE
     _widths(summary, [46, 90])
     per_table, _ = copy_stats(journal)
@@ -777,41 +733,17 @@ def record_retain_until(ctx):
 
 
 def handle_c2(step, ctx):
-    """C2 handler: the baseline fitted from the run journal, the final workbook and the Markdown run report, then the fitted baseline written.
-
-    Calibration is advisory. When the journal cannot be fitted (too few first-pass chunks, or any
-    other calibrate refusal), the baseline in use stays, the Summary of both reports carries a
-    Calibration line that says so, and the step passes with that note. calibrate only reads the
-    journal, so it runs before the reports; the baseline file is the last write.
-    """
-    from . import copy as copy_module, estimate, inventory as inventory_module, report_md
+    """C2 handler: retain_until_utc, then the final workbook and the Markdown run report."""
+    from . import copy as copy_module, report_md
     data, plans, _ = copy_module.load_plans(ctx)
     reports = ctx.config.runs_dir() / ctx.run_id / ctx.db.source / 'reports'
     if ctx.dry_run:
-        return steps.Outcome(steps.PASSED, 'dry run: final.xlsx and run-report.md would be written to %s and the baseline recalibrated' % reports)
-    baseline = copy_module.baseline_for(ctx.config)
+        return steps.Outcome(steps.PASSED, 'dry run: final.xlsx and run-report.md would be written to %s' % reports)
     record_retain_until(ctx)
-    try:
-        cal, kept = estimate.calibrate(ctx.journal_path, first_pass_only=True, workers=ctx.config.copy.workers,
-                                       compute_size=ctx.config.workspace.compute_size, run_id=ctx.run_id,
-                                       leaf_cores=inventory_module.recorded_leaf_cores(ctx.journal)), None
-    except KitError as exc:
-        cal, kept = None, 'baseline not recalibrated (%s); the baseline in use stays: %s' % (
-            exc, 'the shipped default' if baseline.source == 'default' else baseline.source)
-    xlsx = write_final_workbook(reports / 'final.xlsx', data, plans, ctx.journal, ctx.config, ctx.db, ctx.run_id, baseline, ctx.options.get('env') or {},
-                                calibration=kept)
-    md = report_md.write_run_report(reports / 'run-report.md', data, plans, ctx.journal, ctx.config, ctx.db, ctx.run_id, calibration=kept)
+    xlsx = write_final_workbook(reports / 'final.xlsx', data, plans, ctx.journal, ctx.config, ctx.db, ctx.run_id, ctx.options.get('env') or {})
+    md = report_md.write_run_report(reports / 'run-report.md', data, plans, ctx.journal, ctx.config, ctx.db, ctx.run_id)
     ctx.log('final workbook %s and run report %s written' % (xlsx, md))
-    if cal is None:
-        ctx.log('    ' + kept)
-        return steps.Outcome(steps.PASSED, 'reports written; ' + kept)
-    size = sum(float(t.get('size_gib') or 0) for t in ctx.journal.tables()) or None
-    for line in estimate.calibration_lines(cal, size):
-        ctx.log('    ' + line)
-    if not ctx.config.estimate.baseline:
-        return steps.Outcome(steps.PASSED, 'reports written; estimate.baseline is null, so the fitted baseline was printed, not written')
-    path = estimate.write_baseline(ctx.config.resolve(ctx.config.estimate.baseline), cal.baseline)
-    return steps.Outcome(steps.PASSED, 'reports written; baseline recalibrated and written to %s' % path)
+    return steps.Outcome(steps.PASSED, 'reports written')
 
 
 steps.register('C2', handle_c2)

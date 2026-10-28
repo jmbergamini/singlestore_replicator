@@ -1,4 +1,4 @@
-"""s2rebuild tests test_pipelines: O2, O9, O11 and C1 blocks and handlers, credentials, the freeze, grants per scope and the lockout loop.
+"""s2rebuild tests test_pipelines: O2, O9, O11 and C1 blocks and handlers, credentials, and the freeze.
 
 Author: John Bergamini
 """
@@ -6,13 +6,12 @@ import contextlib
 import io
 import json
 import os
-import re
 import stat
 import threading
 import unittest
 from unittest import mock
 
-from s2rebuild import freeze, grants, inventory, lockout, notebook, ownersql, pipelines as P, steps, switch
+from s2rebuild import freeze, grants, inventory, notebook, ownersql, pipelines as P, steps, switch
 from s2rebuild.common import KitError
 from s2rebuild.connect import Redactor
 from s2rebuild.sqlutil import probe_guard, read_guard, secret_forms, sql_literal
@@ -103,14 +102,14 @@ def live_state(h):
 def block_now(h, step_id, rollback=False):
     """The notebook form of a block built from the journal as it is now (the O10 handler writes the rollback files at O10).
 
-    For the rollback, the variant the journal calls for: through the retained copy (R1, R2b, R2c)
+    For the rollback, the variant the journal calls for: through the retained copy (R1, R2b)
     once S2b dropped the original record, else R1 and R2a.
     """
     ctx = h.ctx()
     names, inputs = ownersql.names_for(ctx), ownersql.block_inputs(ctx)
     if rollback and names['source_dropped']:
         return dict(ownersql.companion_blocks(step_id, names, h.config, rollback=True, released=inputs['released'],
-                                              app_writes_seen=inputs['app_writes_seen'], grants=inputs['grants']))['retained'].to_dict()
+                                              app_writes_seen=inputs['app_writes_seen']))['retained'].to_dict()
     return ownersql.block_for(step_id, names, h.config, rollback=rollback, **inputs).to_dict()
 
 
@@ -167,28 +166,11 @@ class BlockTests(unittest.TestCase):
         self.assertIn('Route customer: the customer runs customer/runs/x/pipelines/recreate-with-placeholders.sql', b.render())
         self.assertIn('pipeline count equals the capture', b.render())
 
-    def test_release_block_restores_grants_before_starting_pipelines(self):
-        names = {'source': SRC, 'replacement': TGT, 'flexible_parallelism': 0.5}
-        snap = {"'app'@'%'": {'*.*': ['INSERT', 'UPDATE'], '`%s`.*' % SRC: ['DELETE']}}
-        b = P.release_block(names, [ITEM, APP], snap, config=object())
-        text = b.render()
-        self.assertLess(text.index("GRANT INSERT, UPDATE ON *.* TO 'app'@'%';"), text.index('START PIPELINE'))
-        self.assertIn("GRANT DELETE ON `%s`.* TO 'app'@'%%';" % SRC, text)
-        self.assertIn("holds every restored privilege on `%s`.*; expect n = 1" % SRC, text)
-        self.assertNotIn('START PIPELINE `%s`.`app_owned`' % SRC, text)
-        start = [i for i in b.statements if i.sql.startswith('START')][0]
-        self.assertEqual(start.skip_if, (P.IS_RUNNING_SQL, (SRC, 'p1')))
-        self.assertIn('no retention gap on p1', text)
-        self.assertIn("SOURCE_PARTITION_ID = '0' AND EARLIEST_OFFSET > '5'", text)
-        self.assertIn('every captured partition of p1 present on the live name', text)
-        self.assertLess(text.index('current query_parallelism_per_leaf_core'), text.index('SET GLOBAL'))
-
-
     def test_release_block_leaves_pipelines_stopped_when_start_at_release_is_none(self):
         import types
         names = {'source': SRC, 'replacement': TGT}
         none = types.SimpleNamespace(pipelines=types.SimpleNamespace(start_at_release='none'))
-        b = P.release_block(names, [ITEM, APP], {}, config=none)
+        b = P.release_block(names, [ITEM, APP], config=none)
         text = b.render()
         self.assertNotIn('START PIPELINE', [i.sql[:14] for i in b.statements])
         self.assertEqual([i for i in b.statements if i.sql.startswith('START')], [])
@@ -196,7 +178,7 @@ class BlockTests(unittest.TestCase):
         self.assertIn('every captured partition of p1 present on the live name', text)
         self.assertNotIn('no retention gap', text, 'the retention check belongs to the start')
         self.assertIn('1 pipeline(s) left stopped by pipelines.start_at_release: none. Start one when you choose: START PIPELINE `%s`.`<name>`;' % SRC, text)
-        self.assertIn('START PIPELINE `%s`.`p1`' % SRC, P.release_block(names, [ITEM], {}, config=None).render(), 'all stays the default')
+        self.assertIn('START PIPELINE `%s`.`p1`' % SRC, P.release_block(names, [ITEM], config=None).render(), 'all stays the default')
         with self.assertRaises(KitError):
             config_from(mutate=lambda d: d.setdefault('pipelines', {}).update(start_at_release='some'))
         self.assertEqual(config_from().pipelines.start_at_release, 'all')
@@ -483,17 +465,6 @@ class HandlerTests(unittest.TestCase):
         out = h.step('O11', redo=True)
         self.assertIn('p1 partition 0 (recorded 5, earliest missing)', out.note)
 
-    def test_o11_restores_an_unrestored_snapshot_whatever_the_freeze_mode(self):
-        h = owner_harness(self)
-        write_o2(h, [])
-        grants.record_snapshot(h.journal, {"'app'@'%'": {'*.*': ['INSERT']}})
-        pass_steps(h, 'O5', 'O6', 'O7', 'O8', 'O9', 'O10')
-        out = h.step('O11', redo=True)
-        self.assertEqual(out.status, steps.PASSED, h.text())
-        self.assertIn({'GRANTEE': "'app'@'%'", 'PRIVILEGE_TYPE': 'INSERT'}, h.fake.privileges)
-        self.assertIsNotNone(h.journal.grants_snapshot()["'app'@'%'"]['restored_utc'])
-        self.assertEqual(grants.unrestored_snapshot(h.journal), {})
-
     def test_c1_needs_the_release_and_the_owner_for_pipelines_and_grants(self):
         h = Harness(self)
         pass_steps(h, 'O5', 'O6', 'O7', 'O8', 'O9', 'O10', 'O11')
@@ -735,7 +706,7 @@ class CommittedOffsetTests(unittest.TestCase):
         self.assertIn('offset of p1 partition 0 equals the O2 capture (LATEST_SUCCESSFUL_OFFSET); expect successful = 5',
                       P.replay_block(names, [ahead]).render())
         self.assertIn('(LATEST_LOADED_OFFSET: the capture holds no successful offset); expect loaded = 9', P.verify_block(names, [null]).render())
-        self.assertIn("SOURCE_PARTITION_ID = '0' AND EARLIEST_OFFSET > '5'", P.release_block(names, [ahead], {}).render())
+        self.assertIn("SOURCE_PARTITION_ID = '0' AND EARLIEST_OFFSET > '5'", P.release_block(names, [ahead]).render())
         h = owner_harness(self)
         h.fake.pipeline_offsets = [offset_row(SRC, '0', loaded=9, successful=9, earliest=7), offset_row(TGT, '0', loaded=9, successful=5)]
         owner = h.sessions.owner(read_guard())
@@ -1014,48 +985,6 @@ class ReleaseBoundaryTests(unittest.TestCase):
                 self.assertEqual(run_dict(h, stale)['status'], PIPELINE_PROOF)
                 self.assertEqual(h.fake.writes, before)
 
-    def test_f1_rollback_refused_once_a_lockout_privilege_is_back_on_the_live_name(self):
-        """Each failure point of the first GRANT of O11 (Path B): a privilege the lockout took and O11 gave back refuses both routes on the live state.
-
-        The kit records release_started_utc just before that GRANT; the test removes it so that
-        only the live privilege check refuses. After the refusal the rerun of O11 passes: the
-        privilege matches the snapshot once, the grantee is marked restored and released_utc is set.
-        """
-        scope = grants.database_scope(SRC)
-        label = "R1 before (zero-change proof): 'app'@'%%' holds none of the write privileges the lockout took on %s" % scope
-        for point in FAULT_POINTS:
-            with self.subTest(point=point):
-                h = switched_for_release(self)
-                grants.record_snapshot(h.journal, {"'app'@'%'": {scope: ['INSERT']}})
-                stale = block_now(h, 'O10', rollback=True)
-                self.assertIn(label, [i['label'] for i in stale['items']])
-                if point == 'journal':
-                    crash_journal(self, h.journal, 'event', match=lambda kind, detail: kind == 'owner_statement' and 'restore the grants' in detail)
-                    with self.assertRaises(SimulatedCrash):
-                        h.step('O11', redo=True)
-                else:
-                    h.fake.fail_statement(r'^GRANT ', point)
-                    self.assertEqual(h.step('O11', redo=True).status, steps.REFUSED)
-                self.assertEqual(starts(h), [], 'O11 stopped before any START')
-                self.assertIsNotNone(h.journal.get_meta('release_started_utc'), 'recorded just before the first GRANT')
-                h.journal.conn.execute("DELETE FROM meta WHERE key = 'release_started_utc'")
-                if point == 'before':
-                    self.assertEqual(machine_for(h)[0].rollback(), switch.ROLLED_BACK, 'the privilege is still withheld')
-                    continue
-                before = list(h.fake.writes)
-                with self.assertRaisesRegex(KitError, "reconcile first.*'app'@'%' holds 1 of the write privileges the lockout took on " + re.escape(scope)):
-                    machine_for(h)[0].rollback()
-                result = run_dict(h, stale)
-                self.assertEqual((result['status'], result['statements']), ('FAILED at check ' + label, 0))
-                self.assertEqual(h.fake.writes, before)
-                self.assertEqual(h.step('O11', redo=True).status, steps.PASSED, h.text())
-                held = [r for r in h.fake.schema_privileges if r['GRANTEE'] == "'app'@'%'" and r['TABLE_SCHEMA'] == SRC]
-                self.assertEqual([r['PRIVILEGE_TYPE'] for r in held], ['INSERT'], 'the privilege matches the snapshot, once')
-                self.assertEqual(grants.unrestored_snapshot(h.journal), {}, 'the grantee is marked restored')
-                self.assertIsNotNone(h.journal.grants_snapshot()["'app'@'%'"]['restored_utc'])
-                self.assertEqual(len(starts(h)), 1, 'START PIPELINE is issued exactly once')
-                self.assertIsNotNone(h.journal.get_meta('released_utc'))
-
     def test_f1_a_killed_o11_left_running_refuses_the_rollback_on_both_routes(self):
         """A real kill -9 leaves O11 running with no step_end: the kit and the notebook routes refuse; the rerun of O11 starts p1 once.
 
@@ -1154,13 +1083,13 @@ def assert_frozen_once(test, h):
 def run_o3_cell(h):
     """Generate the owner notebook from the journal as it is now, run cell 1 and the O3 cell on the fake; returns the O3 result."""
     names, blocks, inputs = notebook.blocks_for_run(h.ctx())
-    path = notebook.generate(h.tmp / 'owner-steps.ipynb', names, h.config, blocks, inputs['grants'], items=inputs['pipelines'],
+    path = notebook.generate(h.tmp / 'owner-steps.ipynb', names, h.config, blocks, items=inputs['pipelines'],
                              capture_step=inputs['capture_step'])
     cells = [''.join(c['source']) for c in json.loads(path.read_text())['cells'] if c['cell_type'] == 'code']
     namespace = {'cur': h.fake.connect('ops_owner').cursor(), 'connect': lambda: h.fake.connect('ops_owner')}
     with contextlib.redirect_stdout(io.StringIO()):
         exec(compile(cells[0], 'cell1', 'exec'), namespace)
-        exec(compile(next(c for c in cells if c.startswith('# O3 Path A')), 'cell-O3', 'exec'), namespace)
+        exec(compile(next(c for c in cells if c.startswith('# O3 freeze')), 'cell-O3', 'exec'), namespace)
     return namespace['result']
 
 
@@ -1560,285 +1489,6 @@ class FreezeTests(unittest.TestCase):
         self.assertIn('-- O3: Freeze: read-only attachment (Path A)', h.text())
         self.assertEqual(h.fake.writes, writes)
         assert_between_detach_and_attach(self, h)
-
-
-class GrantsTests(unittest.TestCase):
-    def test_snapshot_per_scope_revoke_restore_and_compare(self):
-        h = owner_harness(self)
-        h.fake.privileges += [{'GRANTEE': "'app'@'%'", 'PRIVILEGE_TYPE': p} for p in ('SELECT', 'INSERT', 'UPDATE')]
-        h.fake.privileges += [{'GRANTEE': "'admin_like'@'%'", 'PRIVILEGE_TYPE': 'ALL PRIVILEGES'}]
-        h.fake.schema_privileges += [{'GRANTEE': "'dbwriter'@'%'", 'TABLE_SCHEMA': SRC, 'PRIVILEGE_TYPE': 'DELETE'}]
-        h.fake.table_privileges += [{'GRANTEE': "'app'@'%'", 'TABLE_SCHEMA': SRC, 'TABLE_NAME': 't_single', 'PRIVILEGE_TYPE': 'UPDATE'}]
-        owner = h.sessions.owner(steps.guard_for('lockout', h.db, steps.OWNER))
-        snap = grants.snapshot(owner, SRC, {'s2rebuild_runner', 'ops_owner'})
-        self.assertEqual(snap["'app'@'%'"], {'*.*': ['INSERT', 'UPDATE'], '`%s`.`t_single`' % SRC: ['UPDATE']})
-        self.assertEqual(snap["'dbwriter'@'%'"], {'`%s`.*' % SRC: ['DELETE']}, 'a database-only writer is in the snapshot')
-        self.assertEqual(len(snap["'admin_like'@'%'"]['*.*']), len(grants.REVOKE_PRIVILEGES), 'ALL PRIVILEGES expands to the write list')
-        statements = grants.revoke_statements(snap)
-        self.assertIn("REVOKE DELETE ON `%s`.* FROM 'dbwriter'@'%%'" % SRC, statements)
-        self.assertIn("REVOKE UPDATE ON `%s`.`t_single` FROM 'app'@'%%'" % SRC, statements)
-        for sql in statements:
-            if 'admin_like' not in sql:
-                owner.execute(sql)
-        self.assertEqual(grants.restored_by_another(owner, SRC, {g: v for g, v in snap.items() if g != "'admin_like'@'%'"}), {})
-        h.fake.schema_privileges.append({'GRANTEE': "'dbwriter'@'%'", 'TABLE_SCHEMA': SRC, 'PRIVILEGE_TYPE': 'DELETE'})
-        self.assertEqual(grants.restored_by_another(owner, SRC, snap)["'dbwriter'@'%'"], {'`%s`.*' % SRC: ['DELETE']})
-        part = {g: v for g, v in snap.items() if g != "'admin_like'@'%'"}
-        grants.record_snapshot(h.journal, part)
-        self.assertEqual(grants.snapshot_from_journal(h.journal), part)
-        self.assertTrue(grants.restore(owner, h.journal, SRC, part, h.log))
-        self.assertEqual(grants.compare(owner, SRC, part), {})
-        path = h.tmp / 'grants-snapshot.json'
-        grants.write_snapshot(path, part)
-        self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
-        grants.write_snapshot(path, {})
-        self.assertEqual(grants.read_snapshot_file(path), part, 'an existing snapshot file is never overwritten')
-        self.assertEqual(grants.normalize({"'old'@'%'": ['INSERT']}), {"'old'@'%'": {'*.*': ['INSERT']}}, 'an old list row reads as global')
-
-
-class LockoutTests(unittest.TestCase):
-    def harness(self):
-        """A lockout-mode harness with two held connections and two quiet passes required."""
-        return owner_harness(self, mutate=lambda d: d.update(freeze={'mode': 'lockout', 'lockout': {'connections': 2, 'quiet_passes_required': 2}}))
-
-    def test_a_pass_kills_idle_and_busy_sessions_and_revokes_restored_grants(self):
-        h = self.harness()
-        h.fake.privileges += [{'GRANTEE': "'app'@'%'", 'PRIVILEGE_TYPE': p} for p in ('INSERT', 'UPDATE')]
-        h.fake.schema_privileges += [{'GRANTEE': "'dbwriter'@'%'", 'TABLE_SCHEMA': SRC, 'PRIVILEGE_TYPE': 'INSERT'}]
-        h.fake.processlist = [{'ID': 11, 'USER': 'app', 'HOST': 'h:1', 'DB': SRC, 'COMMAND': 'Query', 'TIME': 1, 'INFO': 'INSERT INTO t VALUES (1)'},
-                              {'ID': 12, 'USER': 'app', 'HOST': 'h:2', 'DB': SRC, 'COMMAND': 'Sleep', 'TIME': 30, 'INFO': None},
-                              {'ID': 13, 'USER': 'dbwriter', 'HOST': 'h:3', 'DB': SRC, 'COMMAND': 'Sleep', 'TIME': 5, 'INFO': None},
-                              {'ID': 14, 'USER': 'other', 'HOST': 'h:4', 'DB': SRC, 'COMMAND': 'Query', 'TIME': 1, 'INFO': 'SELECT 1'}]
-        admin, held, snap = lockout.prepare(h.sessions, h.db, h.config, h.journal, h.log, h.tmp / 'snap.json')
-        self.assertEqual(set(snap), {"'app'@'%'", "'dbwriter'@'%'"})
-        self.assertNotIn({'GRANTEE': "'dbwriter'@'%'", 'TABLE_SCHEMA': SRC, 'PRIVILEGE_TYPE': 'INSERT'}, h.fake.schema_privileges)
-        h.fake.privileges.append({'GRANTEE': "'app'@'%'", 'PRIVILEGE_TYPE': 'UPDATE'})
-        seen, killed, gone, restored = lockout.one_pass(held, SRC, snap, h.journal, h.log)
-        self.assertEqual((seen, killed, gone), (3, 3, 0))
-        self.assertEqual(sorted(h.fake.killed), [11, 12, 13], 'idle sessions of locked accounts are killed too')
-        self.assertEqual(restored, {"'app'@'%'": {'*.*': ['UPDATE']}})
-        self.assertIn('GRANT RESTORED BY ANOTHER SESSION', h.text())
-        self.assertEqual([r['ID'] for r in h.fake.processlist], [14])
-
-    def test_a_rerun_reuses_the_first_snapshot(self):
-        h = self.harness()
-        h.fake.privileges += [{'GRANTEE': "'app'@'%'", 'PRIVILEGE_TYPE': p} for p in ('INSERT', 'UPDATE')]
-        path = h.tmp / 'snap.json'
-        _, held, first = lockout.prepare(h.sessions, h.db, h.config, h.journal, h.log, path)
-        h.fake.privileges.append({'GRANTEE': "'app'@'%'", 'PRIVILEGE_TYPE': 'INSERT'})
-        _, _, second = lockout.prepare(h.sessions, h.db, h.config, h.journal, h.log, path)
-        self.assertEqual(second, first)
-        self.assertEqual(grants.snapshot_from_journal(h.journal)["'app'@'%'"], {'*.*': ['INSERT', 'UPDATE']})
-        self.assertEqual(grants.read_snapshot_file(path)["'app'@'%'"], {'*.*': ['INSERT', 'UPDATE']})
-        self.assertNotIn({'GRANTEE': "'app'@'%'", 'PRIVILEGE_TYPE': 'INSERT'}, h.fake.privileges, 'the reappeared grant was revoked again')
-        self.assertIn('reusing the first grants snapshot', h.text())
-
-    def test_the_quiet_proof_runs_again_after_a_failure_and_the_stop_file_is_seen(self):
-        h = self.harness()
-        h.fake.privileges += [{'GRANTEE': "'app'@'%'", 'PRIVILEGE_TYPE': 'INSERT'}]
-        _, held, snap = lockout.prepare(h.sessions, h.db, h.config, h.journal, h.log)
-        answers = iter([False, True])
-        calls = []
-
-        def quiet():
-            calls.append(1)
-            return next(answers)
-        summary = lockout.run_lockout(held, SRC, snap, h.journal, h.log, h.config, sleep=lambda s: None, max_passes=20, quiet_hook=quiet)
-        self.assertTrue(summary['quiet_proof'])
-        self.assertEqual((len(calls), summary['passes']), (2, 4), 'proof after 2 quiet passes, failed, 2 more, passed')
-        stop = h.tmp / 'stop'
-        config = h.config
-
-        def slow(seconds):
-            stop.write_text('x')
-        import dataclasses
-        from s2rebuild.config import Section
-        cfg = dataclasses.replace(config, freeze=Section(dict(config.freeze.as_dict(), lockout=dict(config.freeze.lockout.as_dict(), interval_seconds=60))))
-        summary = lockout.run_lockout(held, SRC, snap, h.journal, h.log, cfg, stop_file=stop, sleep=slow, max_passes=50)
-        self.assertEqual((summary['passes'], summary['stopped']), (1, 'the stop file is present'), 'the wait is cut short by the stop file')
-
-    def test_f12_hold_loop_revokes_a_grant_restored_after_the_quiet_proof(self):
-        """--hold passes on after the quiet proof: a grant another job restores is revoked again, every pass lands in journal meta,
-        and the hold ends once the journal records S1."""
-        h = self.harness()
-        grant = {'GRANTEE': "'app'@'%'", 'PRIVILEGE_TYPE': 'INSERT'}
-        h.fake.privileges.append(dict(grant))
-        _, held, snap = lockout.prepare(h.sessions, h.db, h.config, h.journal, h.log)
-
-        def proof():
-            h.fake.privileges.append(dict(grant))  # another job gives the grant back right after the proof
-            return True
-        calls = []
-
-        def s1_signal():
-            calls.append(1)
-            if len(calls) == 6:
-                h.journal.event('switch_statement', 'S1 DETACH source')
-            return switch.s1_ran(held[0], h.journal, SRC)
-        summary = lockout.run_lockout(held, SRC, snap, h.journal, h.log, h.config, sleep=lambda s: None, max_passes=50, quiet_hook=proof,
-                                      hold_hook=s1_signal)
-        self.assertEqual((summary['passes'], summary['quiet_proof']), (5, True), h.text())
-        self.assertEqual(summary['stopped'], 'S1 of O10 has run: the journal records S1 DETACH source')
-        self.assertNotIn(grant, h.fake.privileges, 'the hold loop revoked the grant restored after the proof')
-        self.assertEqual(h.journal.events('grant_restored'), ["'app'@'%' INSERT on *.*"])
-        self.assertIn('--hold keeps the loop running until S1 of O10 has run', h.text())
-        self.assertIn('pass 3 threads=0 killed=0 gone=0 restored_grants=1', h.text())
-        self.assertEqual(h.journal.get_meta(lockout.LAST_PASS_QUIET), '1')
-        self.assertIsNone(lockout.last_pass_problem(h.journal, 60))
-
-    def test_f12_the_same_thread_id_on_two_connections_is_killed_from_each(self):
-        """Thread ids are per aggregator: id 7 on each of two aggregators is two sessions, and each held connection kills its own."""
-        h = self.harness()
-        h.fake.aggregators = 2
-        h.fake.privileges.append({'GRANTEE': "'app'@'%'", 'PRIVILEGE_TYPE': 'INSERT'})
-        _, held, snap = lockout.prepare(h.sessions, h.db, h.config, h.journal, h.log)
-        aggregators = [s.conn.aggregator for s in held]
-        self.assertEqual(sorted(aggregators), [0, 1])
-        h.fake.processlist = [{'ID': 7, 'USER': 'app', 'HOST': 'h:%d' % a, 'DB': SRC, 'COMMAND': 'Sleep', 'TIME': 9, 'INFO': None, 'AGGREGATOR': a}
-                              for a in aggregators]
-        seen, killed, gone, _ = lockout.one_pass(held, SRC, snap, h.journal, h.log)
-        self.assertEqual((seen, killed, gone), (2, 2, 0))
-        self.assertEqual((h.fake.killed, h.fake.processlist), ([7, 7], []))
-        self.assertEqual(h.journal.get_meta(lockout.LAST_PASS_QUIET), '0', 'a pass that kills is not quiet')
-
-    def test_f12_lockout_hold_runs_on_after_the_proof_and_stops_once_s1_ran(self):
-        """s2rebuild lockout --hold: the quiet proof passes, the loop passes on, and a hand S1 (the source off its STORAGE_ID, no
-        journal event) ends it with exit 0."""
-        import datetime as dt
-        from s2rebuild import cli, watch
-        from s2rebuild.common import EXIT_DONE, iso, utc_now
-        from s2rebuild.connect import SessionFactory
-        from tests.helpers import run_cli
-        h = owner_harness(self, mutate=lambda d: d.update(freeze={'mode': 'lockout', 'lockout': {'connections': 2, 'quiet_passes_required': 2,
-                                                                                                    'interval_seconds': 0}}))
-        h.journal.record_attachment('source', SRC, '1028600672070281646:7367158985892520834', 'cid-1', 'READWRITE')
-        grant = {'GRANTEE': "'app'@'%'", 'PRIVILEGE_TYPE': 'INSERT'}
-        h.fake.privileges.append(dict(grant))
-        proofs = []
-
-        def proof(*args, **kwargs):
-            proofs.append(1)
-            h.fake.change_before(r'^SELECT ID, USER, HOST', lambda d: d.attachments.remove(d.attachment(SRC)))  # the owner runs S1 by hand
-            return True, ['quiet proof passed']
-
-        def factory(config, env, log, dry_run):
-            return SessionFactory(config, env, log, dry_run, connector=lambda **kw: h.fake.connect(user=kw.get('user')))
-        argv = ['lockout', '--hold', '--until', iso(utc_now() + dt.timedelta(minutes=2)), '--config', str(h.config_path), '--run', h.run_id]
-        with mock.patch.object(cli, 'SessionFactory', factory), mock.patch.object(watch, 'quiet_proof', proof):
-            code, text = run_cli(argv, env=h.env)
-        self.assertEqual((code, len(proofs)), (EXIT_DONE, 1), text)
-        self.assertIn('pass 3 threads=0', text, 'the loop passed on after the proof')
-        self.assertNotIn('pass 4 ', text)
-        self.assertIn('lockout --hold: S1 of O10 has run: no database is attached under the name %s' % SRC, text)
-        self.assertNotIn(grant, h.fake.privileges)
-        self.assertEqual(h.journal.get_meta(lockout.LAST_PASS_QUIET), '1')
-
-    def test_f12_lockout_command_refuses_path_b_with_two_databases_before_any_revoke(self):
-        """s2rebuild lockout, with and without --hold, took the snapshot and issued a global REVOKE with two databases configured on
-        Path B, while step O11, gate O11 --pass and owner-sql O11 refuse that configuration, so nothing in the kit gave the grant back.
-        Now it refuses first, as owner-notebook does: no connection, no REVOKE, no snapshot file and nothing journaled. A refusal before
-        the guarded REVOKE is reached, so it has no failure points of its own."""
-        import datetime as dt
-        from s2rebuild import cli
-        from s2rebuild.common import EXIT_REFUSED, iso, utc_now
-        from s2rebuild.connect import SessionFactory
-        from tests.helpers import run_cli
-
-        def two_on_path_b(d):
-            d['databases'].append({'source': 'second_db', 'layout': {'partitions': 8, 'sub_partitions': 64}})
-            d['freeze'] = {'mode': 'lockout', 'lockout': {'connections': 2, 'quiet_passes_required': 2, 'interval_seconds': 0}}
-        h = owner_harness(self, mutate=two_on_path_b)
-        grant = {'GRANTEE': "'app'@'%'", 'PRIVILEGE_TYPE': 'INSERT'}
-        h.fake.privileges.append(dict(grant))
-        connects = []
-
-        def factory(config, env, log, dry_run):
-            def connect(**kw):
-                connects.append(kw.get('user'))
-                return h.fake.connect(user=kw.get('user'))
-            return SessionFactory(config, env, log, dry_run, connector=connect)
-        board = h.journal.steps_board()
-        until = iso(utc_now() + dt.timedelta(minutes=2))
-        for extra in ([], ['--hold'], ['--kill-only']):
-            argv = ['lockout', '--db', SRC, '--until', until] + extra + ['--config', str(h.config_path), '--run', h.run_id]
-            with mock.patch.object(cli, 'SessionFactory', factory):
-                code, text = run_cli(argv, env=h.env)
-            self.assertEqual(code, EXIT_REFUSED, (extra, text))
-            self.assertIn('freeze.mode lockout (Path B) is single database in this pass, and the configuration has 2 databases '
-                          '(example_orders_db, second_db)', text)
-        self.assertEqual((connects, h.fake.writes, h.fake.killed), ([], [], []), 'no connection, no REVOKE, no KILL')
-        self.assertIn(grant, h.fake.privileges)
-        self.assertEqual(list((h.tmp / 'runs').rglob('grants-snapshot.json')), [])
-        self.assertEqual((grants.snapshot_from_journal(h.journal), h.journal.get_meta(lockout.LAST_PASS_UTC), h.journal.steps_board()),
-                         ({}, None, board), 'nothing journaled')
-
-    def test_f12_fault_points_in_the_hold_loop_refuse_s1_until_a_rerun_pass_is_quiet(self):
-        """REVOKE and KILL CONNECTION of a hold pass at the three failure points: immediately before, immediately after, and after the
-        statement but before the journal write of the last pass (crash_journal on set_meta).
-
-        The pass marks itself not quiet before its first statement, so a rerun of O10 refuses S1 with nothing issued, even with the
-        killed session idle (the S1 session check counts non-idle sessions only); a grant the failed pass did not revoke again is
-        also refused by the live S1 check that the accounts hold none of the privileges the lockout took. Rerunning s2rebuild lockout --hold (prepare, then the
-        loop) revokes or kills what is left and records a quiet pass; O10 then switches with one DETACH.
-        """
-        from tests.test_switch import detaches, path_b_harness
-        grant = {'GRANTEE': "'app'@'%'", 'PRIVILEGE_TYPE': 'INSERT'}
-        idle = {'ID': 21, 'USER': 'app', 'HOST': 'h:21', 'DB': SRC, 'COMMAND': 'Sleep', 'TIME': 3, 'INFO': None}
-        for statement in ('REVOKE', 'KILL CONNECTION'):
-            for point in FAULT_POINTS:
-                with self.subTest(statement=statement, point=point):
-                    h = path_b_harness(self)
-                    h.fake.privileges.append(dict(grant))
-                    _, held, snap = lockout.prepare(h.sessions, h.db, h.config, h.journal, h.log)
-                    armed = []
-
-                    def proof():
-                        # right after the proof another job gives the grant back, or the application reconnects and stays idle
-                        if statement == 'REVOKE':
-                            h.fake.privileges.append(dict(grant))
-                        else:
-                            h.fake.processlist.append(dict(idle))
-                        armed.append(len(h.fake.writes))
-                        if point == 'journal':
-                            crash_journal(self, h.journal, 'set_meta', match=lambda key, value: key == lockout.LAST_PASS_QUIET and any(
-                                w.startswith(statement) for w in h.fake.writes[armed[0]:]))
-                        else:
-                            h.fake.fail_statement('^' + statement, point)
-                        return True
-                    with self.assertRaises((FakeDisconnect, SimulatedCrash)):
-                        lockout.run_lockout(held, SRC, snap, h.journal, h.log, h.config, sleep=lambda s: None, max_passes=20, quiet_hook=proof,
-                                            hold_hook=lambda: switch.s1_ran(held[0], h.journal, SRC))
-                    self.assertEqual(h.journal.get_meta(lockout.LAST_PASS_QUIET), '0', 'marked not quiet before the statement')
-                    machine, _ = machine_for(h)
-                    # REVOKE 'before' leaves the restored grant in place, so the live privilege check refuses first; otherwise the pass
-                    # marked not quiet refuses
-                    held_again = statement == 'REVOKE' and point == 'before'
-                    with self.assertRaisesRegex(KitError, r'S1 before \(Path B\): ' + (
-                            r"'app'@'%' holds none of the write privileges the lockout took on \*\.\*\": expected n = 0, observed n = 1"
-                            if held_again else 'the last lockout pass was quiet within 60 s.*was not quiet')):
-                        machine.forward()
-                    self.assertEqual(detaches(h), [])
-                    _, held, snap = lockout.prepare(h.sessions, h.db, h.config, h.journal, h.log)
-                    summary = lockout.run_lockout(held, SRC, snap, h.journal, h.log, h.config, sleep=lambda s: None, max_passes=4,
-                                                  quiet_hook=lambda: True, hold_hook=lambda: switch.s1_ran(held[0], h.journal, SRC))
-                    self.assertEqual((summary['stopped'], summary['quiet_proof']), ('max passes reached', True))
-                    self.assertNotIn(grant, h.fake.privileges)
-                    self.assertEqual(h.fake.processlist, [])
-                    self.assertEqual(h.fake.killed.count(21), 0 if statement == 'REVOKE' else 1)
-                    machine, _ = machine_for(h)
-                    self.assertEqual(machine.forward(), switch.COMPLETE, h.text())
-                    self.assertEqual(len(detaches(h)), 1)
-
-    def test_o3_lockout_needs_the_owner_and_owner_sql_prints_the_plan(self):
-        h = Harness(self, mutate=lambda d: d.update(freeze={'mode': 'lockout'}))
-        out = h.step('O3', redo=True)
-        self.assertEqual(out.status, steps.PENDING)
-        self.assertIn('Path B lockout needs the owner profile', h.text())
-        block = lockout.plan_block(names_of(h), {"'app'@'%'": {'*.*': ['INSERT']}})
-        text = block.render()
-        self.assertIn("REVOKE INSERT ON *.* FROM 'app'@'%';", text)
-        self.assertLess(text.index("holds write privileges on *.*"), text.index('REVOKE'))
-        self.assertIn('holds none of them on *.*; expect n = 0', text)
 
 
 if __name__ == '__main__':

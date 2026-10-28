@@ -1,4 +1,4 @@
-"""s2rebuild enginecapture: the engine-capture command, a read-only record of the engine that the test fake is built from.
+"""s2rebuild tools/enginecapture: a read-only record of the engine that the test fake is built from (a development tool).
 
 Author: John Bergamini
 
@@ -13,12 +13,19 @@ file: the fixture database name is replaced by a placeholder. Statements issued,
 read guard: SELECT on information_schema.COLUMNS, GLOBAL_VARIABLES, ROUTINES and PIPELINES,
 SELECT @@memsql_version, SELECT ... LIMIT 1 on a view that COLUMNS does not list, USE and SHOW
 AGGREGATES in the fixture database.
+
+Usage from the kit root: .venv/bin/python tools/enginecapture.py [--config PATH] [--fixture-database NAME] [--out FILE] [--dry-run]
 """
+import argparse
 import json
 import re
+import sys
+from pathlib import Path
 
-from .common import KitError, iso, utc_now
-from .sqlutil import ident
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from s2rebuild.common import KitError, iso, utc_now  # noqa: E402 - the kit root goes on the path first
+from s2rebuild.sqlutil import ident  # noqa: E402
 
 # the views the kit reads (work order section 4, W1)
 VIEWS = ('TABLES', 'COLUMNS', 'STATISTICS', 'TABLE_STATISTICS', 'MV_COLUMNSTORE_FILES', 'ROUTINES', 'PROJECTIONS', 'VIEWS', 'USER_PRIVILEGES',
@@ -190,3 +197,51 @@ def summary_lines(data, path):
     for warning in data.get('warnings', []):
         lines.append('warning: ' + warning)
     return lines
+
+
+def main(argv=None):
+    """Read the engine with the owner profile and write tests/engine/helios-<version>.json (reads only; no run is opened).
+
+    The owner session reads the version, the view columns, the PASSWORD_ variables and, with
+    --fixture-database, SHOW AGGREGATES and the ROUTINES and PIPELINES counts; the runner session
+    counts the same two views, so the file records what the runner sees against the owner. A dry
+    run prints the statements and writes nothing.
+    """
+    from s2rebuild.config import load_config
+    from s2rebuild.connect import Log, Redactor, SessionFactory
+    from s2rebuild.sqlutil import read_guard
+    parser = argparse.ArgumentParser(prog='enginecapture')
+    parser.add_argument('--config', metavar='PATH', help='configuration file (default: $S2REBUILD_CONFIG or customer/config.yaml)')
+    parser.add_argument('--fixture-database', metavar='NAME',
+                        help='a database to read SHOW AGGREGATES in and to count ROUTINES and PIPELINES rows as the owner and as the runner')
+    parser.add_argument('--out', metavar='FILE', help='write the capture here instead of tests/engine/helios-<version>.json')
+    parser.add_argument('--dry-run', action='store_true', help='print the reads, open no connection, write nothing')
+    args = parser.parse_args(argv)
+    import os
+    config = load_config(args.config, env=os.environ)
+    if config.owner is None and not args.dry_run:
+        raise KitError('enginecapture needs connections.owner in the configuration: the view columns and SHOW AGGREGATES are read with the owner profile')
+    fixture = args.fixture_database
+    if fixture is not None:
+        ident(fixture)  # the shape check before any connection opens; the name itself never reaches the file
+    redactor = Redactor([config.workspace.host], soft=[config.runner.user] + ([config.owner.user] if config.owner else []))
+    log = Log(redactor, stream=sys.stdout)
+    sessions = SessionFactory(config, os.environ, log, args.dry_run)
+    try:
+        owner = sessions.owner(read_guard('owner engine-capture'))
+        runner = sessions.runner(read_guard('runner engine-capture')) if fixture else None
+        data = capture(owner, fixture, runner)
+    finally:
+        sessions.close()
+    if args.dry_run:
+        print('DRY RUN: enginecapture issued the reads above and writes nothing')
+        return 0
+    path = Path(args.out) if args.out else default_path(Path(__file__).resolve().parent.parent, data['engine_version'])
+    written = write_capture(data, path)
+    for line in summary_lines(data, written):
+        print(redactor(line))
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

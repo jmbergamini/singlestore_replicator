@@ -10,11 +10,11 @@ from pathlib import Path
 from . import report_xlsx, steps
 
 
-def write_run_report(path, inventory, plans, journal, config, db, run_id, calibration=None):
-    """Write run-report.md next to the final workbook; returns the path. calibration is the C2 Calibration line, when given."""
+def write_run_report(path, inventory, plans, journal, config, db, run_id):
+    """Write run-report.md next to the final workbook; returns the path."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    rows = report_xlsx.final_summary_rows(inventory, plans, journal, config, db, run_id, calibration=calibration)
+    rows = report_xlsx.final_summary_rows(inventory, plans, journal, config, db, run_id)
     lines = ['# SingleStore Database Rebuild Kit: run report', '', 'Run %s, database %s, customer %s.' % (run_id, db.source, config.customer), '',
              '## Summary', '']
     for label, value in rows:

@@ -23,7 +23,7 @@ import threading
 from pathlib import Path
 
 from . import steps
-from .common import EXIT_GATE, EXIT_REFUSED, KitError, iso, parse_utc, utc_now
+from .common import EXIT_REFUSED, KitError, iso, parse_utc, utc_now
 from .sqlutil import ident, owner_guard, qualified
 
 RUNNER_PRIVILEGES = ('SELECT', 'INSERT', 'DELETE', 'CREATE', 'DROP', 'ALTER', 'CREATE DATABASE', 'DROP DATABASE', 'PROCESS',
@@ -261,12 +261,19 @@ def _run_statement(session, sql, block, item, secret, journal):
         raise KitError('%s failed at "%s": %s: %s' % (block.step_id, label, type(exc).__name__, exc))
 
 
+# COUNT of attached databases under a name (parameter: the name): the late-DETACH read before the KILL form.
+ATTACHED_NAME_COUNT_SQL = 'SELECT COUNT(*) AS n FROM information_schema.MV_CLOUD_ATTACHED_DATABASES WHERE DATABASE_NAME = %s'
+
+
 def detach_with_escalation(open_session, guard, database, wait_seconds, kill, log, journal=None):
     """DETACH DATABASE on a second owner connection; after wait_seconds cancel it and issue it again WITH KILL.
 
     Section 10.7 step 2 and 10.13 S1. The waiting DETACH is cancelled with KILL QUERY on the
     kit's own connection id only (a guard built for that one id). Without detach_kill the waiting
-    DETACH is cancelled and the step refuses with the bridge guidance. Returns 'plain' or 'kill'.
+    DETACH is cancelled and the step refuses. A first DETACH that lands late, after the cancel,
+    leaves no database under the name: the kit reads that before the KILL form and returns
+    'plain' without issuing it. Every caller re-reads the branch record after either outcome.
+    Returns 'plain' or 'kill'.
     """
     sql = 'DETACH DATABASE %s' % ident(database)
     worker = open_session(guard)
@@ -306,11 +313,16 @@ def detach_with_escalation(open_session, guard, database, wait_seconds, kill, lo
             journal.event('detach_wait', '%s waited %d s; cancelled with KILL QUERY on connection %d' % (database, wait_seconds, cid))
         if not kill:
             raise KitError('DETACH DATABASE %s waited more than %d s and freeze.detach_kill is off; the waiting DETACH was cancelled. '
-                           'Stop the writers (s2rebuild lockout works as a bridge), then rerun the step' % (database, wait_seconds))
+                           'Stop the writers, then rerun the step' % (database, wait_seconds))
     finally:
         worker.close()
     killer = open_session(guard)
     try:
+        if not int(_first_value(killer.query(ATTACHED_NAME_COUNT_SQL, (database,))) or 0):
+            if journal is not None:
+                journal.event('detach_late', 'DETACH DATABASE %s finished after the cancel; no KILL issued' % database)
+            log('    DETACH DATABASE %s finished after the cancel: no database is attached under the name, so no KILL is issued' % database)
+            return 'plain'
         killer.execute(sql + ' KILL')
     finally:
         killer.close()
@@ -403,12 +415,12 @@ def names_for(ctx):
         'source': ctx.db.source, 'replacement': ctx.db.replacement, 'retained': ctx.db.retained,
         'partitions': ctx.db.layout.partitions, 'sub_partitions': ctx.db.layout.sub_partitions,
         'runner_user': ctx.config.runner.user, 'owner_user': ctx.config.owner.user if ctx.config.owner else None,
-        'freeze_mode': ctx.config.freeze.mode, 'detach_wait_seconds': ctx.config.freeze.detach_wait_seconds,
-        'detach_kill': ctx.config.freeze.detach_kill, 'quiet_max_age_seconds': ctx.config.freeze.quiet_max_age_seconds,
+        'detach_wait_seconds': ctx.config.freeze.detach_wait_seconds,
+        'detach_kill': ctx.config.freeze.detach_kill,
         'flexible_parallelism': ctx.config.closeout.flexible_parallelism,
         'retain_days': ctx.config.closeout.retain_days, 'run_id': ctx.run_id, 'freeze_time': journal.get_meta('freeze_time'),
         'workspace_id': ctx.config.workspace.get('id'), 'table_counts': table_counts(journal), 'source_counts': source_counts(journal),
-        'source_dropped': any(d.startswith('S2b DROP') or d.startswith('repair DROP original') for d in journal.events('switch_statement')),
+        'source_dropped': any(d.startswith('S2b DROP') for d in journal.events('switch_statement')),
         'retain_until_utc': journal.get_meta('retain_until_utc'),
     }
     for role in ('source', 'replacement', 'retained', 'live'):
@@ -442,31 +454,10 @@ def table_counts(journal):
 
 
 def source_counts(journal):
-    """[(table, source_count)] of the planned tables with a source count above zero, smallest first: the S2b zero-change proof and the repair."""
+    """[(table, source_count)] of the planned tables with a source count above zero, smallest first: the S2b zero-change proof."""
     rows = [t for t in journal.tables() if t.get('source_count')]
     rows.sort(key=lambda t: (int(t['source_count']), t['table_name']))
     return [(t['table_name'], int(t['source_count'])) for t in rows]
-
-
-def withheld_privileges(journal):
-    """The lockout snapshot rows O11 has not given back yet, as {grantee: {scope: [privileges]}} (grants.unrestored_snapshot)."""
-    from . import grants
-    return grants.unrestored_snapshot(journal)
-
-
-def withheld_checks(snapshot, db_name):
-    """[(grantee, scope, sql, params)]: COUNT of the snapshot's write privileges a grantee holds now, per scope (the rollback proof).
-
-    Every count must be 0 until O11 gives the privileges back; a privilege back on the live
-    name means the release began, so the rollback is refused. Issues nothing (reads only).
-    """
-    from . import grants
-    checks = []
-    for user, scopes in sorted(grants.normalize(snapshot).items()):
-        for scope, privs in sorted(scopes.items()):
-            sql, params = grants.privilege_count_check(user, scope, privs, db_name)
-            checks.append((user, scope, sql, params))
-    return checks
 
 
 def placeholders(text):
@@ -493,17 +484,15 @@ def expected_counts(ctx):
 
 
 def block_inputs(ctx):
-    """The journal and capture state every block builder needs: pipelines, grants, counts, capture step, route, release.
+    """The journal and capture state every block builder needs: pipelines, counts, capture step, route, release.
 
     released is True once O11 started releasing writers (switch.writers_released): the
-    rollback block then carries a STOP. grants (the lockout snapshot not given back yet) also
-    feeds the rollback proof's privilege checks and, on Path B, the forward block's S1 privilege
-    checks. s0_problems (switch.s0_journal_problems) puts
+    rollback block then carries a STOP. s0_problems (switch.s0_journal_problems) puts
     a STOP at the head of the O10 forward block while S0 would refuse on the journal.
     """
-    from . import grants, pipelines, switch
+    from . import pipelines, switch
     cap = pipelines.capture_for(ctx)
-    return {'pipelines': cap['items'], 'capture_step': cap['step'], 'grants': grants.unrestored_snapshot(ctx.journal),
+    return {'pipelines': cap['items'], 'capture_step': cap['step'],
             'counts': expected_counts(ctx), 'route': ctx.config.pipelines.route,
             'released': switch.writers_released(ctx.journal),
             'app_writes_seen': ctx.journal.get_meta('app_writes_seen'),
@@ -648,10 +637,6 @@ def record_identity_checks(block, names, role, label, again=False):
         block.check('recorded %s record not detached' % role, record_detached_sql(), (name, sid), Expect('column_equals', 'n', 0))
 
 
-REPAIR_OUTAGE_NOTE = ('The repair detaches the live name for about 30 seconds on a 3 TB database (Helios fact 34): the application cannot '
-                      'reach it meanwhile. Stop the application or accept the outage before you proceed.')
-
-
 def endstate_block(names):
     """C3 End state: reads only. The live name resolves to the live record, the retained name to the retained record READONLY, and the
     entries with IS_DROPPED = 0 across both storages are exactly those two (switch.gate_block with the recorded ids).
@@ -676,67 +661,7 @@ def endstate_block(names):
     switch.gate_block(block, names, 'end state', recorded=True)
     block.note('The kit then runs the write probe on the retained name as the runner: a DELETE of a value that cannot exist must be refused as '
                'read only. By hand: run the O3 write probe statement against %s and expect the read-only refusal.' % names['retained'])
-    block.note('When a check fails on a third entry (the detached original under the live name, or the replacement name) and the journal shows '
-               'no S2b or S4, the switch was made by an older kit: s2rebuild step C3 prints and, with the owner profile, runs the repair block '
-               '(owner-sql/C3-repair.sql).')
     return block
-
-
-def repair_block(names):
-    """C3 repair for a switch made without S2b and S4: the post-switch sequence proven on October 27, 2026, each statement behind a record check.
-
-    The original record detached (checked before anything else, so an original already
-    dropped stops the block before the live name is detached); detach the live name; the
-    original record's own ATTACH_SYNTAX; record and row check; DROP
-    the original record; the live record's own ATTACH_SYNTAX (a milestone placeholder, since
-    the AT MILESTONE form exists only after the DETACH; the note says where to copy it from);
-    DROP the replacement record by its record; the gate. The kit route runs the same sequence
-    through switch.SwitchMachine.repair_end_state, reading each syntax live.
-    """
-    from . import switch
-    block = Block('C3', 'End state repair (a switch made without S2b and S4)')
-    block.refuse('run this block only when the end state gate failed and the journal shows no S2b or S4; remove this line by hand once decided')
-    block.note(REPAIR_OUTAGE_NOTE)
-    block.note('repair: the first check reads the original record before the live name is detached. When it finds no row, the original is '
-               'attached or already dropped, so this block stops with nothing issued: s2rebuild step C3 with the owner profile resumes a '
-               'repair that stopped part way from the live state, and refuses when nothing is left to repair.')
-    block.check('repair: the original record is detached with its ATTACH_SYNTAX', switch.DETACHED_RECORD_SQL, (names['source'], names['source_sid']),
-                Expect('columns_equal', value=record_expect(names, 'source')))
-    block.check('repair: the live name holds the recorded live record', switch.ATTACHED_RECORD_SQL, (names['source'], names['live_sid']),
-                Expect('columns_equal', value=record_expect(names, 'live')))
-    block.statement('DETACH DATABASE %s' % ident(names['source']), 'repair: detach the live name',
-                    detach={'wait': names['detach_wait_seconds'], 'kill': bool(names['detach_kill'])})
-    block.check('repair: no attached database named source', inventory_attachment_sql(), (names['source'],), Expect('no_rows'))
-    block.statement(switch.original_syntax(names), 'repair: attach the original record read write by its own ATTACH_SYNTAX')
-    block.check('repair: the original record is attached READWRITE under the live name', inventory_attachment_sql(), (names['source'],),
-                Expect('columns_equal', value={'STORAGE_ID': names['source_sid'], 'ATTACH_TYPE': 'READWRITE'}))
-    for table, count in (names.get('source_counts') or [])[:3]:
-        block.check('repair proof: %s holds the source row count' % table, switch.count_sql(names['source'], table), (), Expect('column_equals', 'n', count))
-    block.statement('DROP DATABASE %s' % ident(names['source']), 'repair: drop the original record (its data stays in the retained copy)')
-    block.check('repair: the original record is dropped', switch.RECORD_STATE_SQL, (names['source'], names['source_sid']),
-                Expect('column_equals', 'IS_DROPPED', 1))
-    block.check('repair: the live record is detached with its ATTACH_SYNTAX', switch.DETACHED_RECORD_SQL, (names['source'], names['live_sid']),
-                Expect('columns_equal', value=record_expect(names, 'live')))
-    block.statement("ATTACH DATABASE %s AT MILESTONE '<live_milestone>' STORAGEID %s COMPUTEID %s" % (ident(names['source']), names['live_sid'], names['live_cid']),
-                    'repair: re-attach the live record read write by its own ATTACH_SYNTAX')
-    block.note('repair: the AT MILESTONE value is the ATTACH_SYNTAX of the detached live record; copy it from the row of the check above.')
-    block.check('repair: the live name holds the live record READWRITE again', inventory_attachment_sql(), (names['source'],),
-                Expect('columns_equal', value={'STORAGE_ID': names['live_sid'], 'ATTACH_TYPE': 'READWRITE'}))
-    record_identity_checks(block, names, 'replacement', 'replacement')
-    block.statement('DROP DATABASE %s' % ident(names['replacement']), 'repair: drop the replacement record (the live branch is independent of it)',
-                    skip_if=(record_absent_sql(), (names['replacement'], names['replacement_sid'])))
-    block.check('repair: the replacement record is dropped', switch.RECORD_STATE_SQL, (names['replacement'], names['replacement_sid']),
-                Expect('column_equals', 'IS_DROPPED', 1))
-    switch.gate_block(block, names, 'end state', recorded=True)
-    return block
-
-
-def ask(prompt):
-    """Read one line from the operator at a terminal; None without a terminal. Tests replace this function."""
-    import sys
-    if sys.stdin is None or not sys.stdin.isatty():
-        return None
-    return input(prompt).strip()
 
 
 def inventory_attachment_sql():
@@ -745,15 +670,14 @@ def inventory_attachment_sql():
             'WHERE DATABASE_NAME = %s')
 
 
-def block_for(step_id, names, config=None, rollback=False, pipelines=None, grants=None, counts=None, capture_step=None, route='kit',
+def block_for(step_id, names, config=None, rollback=False, pipelines=None, counts=None, capture_step=None, route='kit',
               released=False, app_writes_seen=None, s0_problems=None):
     """The Block for an admin step id (O2, O3, O9, O10, O11, C3, C4, P1); O10 with rollback=True gives R1 and R2a (the retained variant is a companion).
 
-    The keyword inputs come from block_inputs(ctx); O3 gives the Path B lockout plan when
-    freeze.mode is lockout; the O10 forward block starts with a STOP while s0_problems is not empty,
-    and on Path B checks before S1 that no account holds again the write privileges the lockout took (the snapshot not given back).
+    The keyword inputs come from block_inputs(ctx); the O10 forward block starts with a STOP while
+    s0_problems is not empty.
     """
-    from . import freeze, lockout, pipelines as pipeline_module, switch
+    from . import freeze, pipelines as pipeline_module, switch
     key = str(step_id).upper()
     if key == 'P1':
         return account_block(names)
@@ -764,8 +688,6 @@ def block_for(step_id, names, config=None, rollback=False, pipelines=None, grant
     if key == 'O2':
         return pipeline_module.stop_block(names, pipelines or [])
     if key == 'O3':
-        if config is not None and config.freeze.mode == 'lockout':
-            return lockout.plan_block(names, grants or {})
         return freeze.block(names)
     if key == 'O9':
         if route == 'customer':
@@ -773,31 +695,29 @@ def block_for(step_id, names, config=None, rollback=False, pipelines=None, grant
         return pipeline_module.replay_block(names, pipelines or [], capture_step)
     if key == 'O10':
         if rollback:
-            return switch.rollback_block(names, released=released, app_writes_seen=app_writes_seen, withheld=grants)
-        return switch.forward_block(names, counts, s0_problems, withheld=grants)
+            return switch.rollback_block(names, released=released, app_writes_seen=app_writes_seen)
+        return switch.forward_block(names, counts, s0_problems)
     if key == 'O11':
-        return pipeline_module.release_block(names, pipelines or [], grants or {}, config)
+        return pipeline_module.release_block(names, pipelines or [], config)
     raise KitError('%s is not an admin step with an owner SQL block (owner-sql covers %s)' % (step_id, ', '.join(steps.OWNER_SQL_STEPS)))
 
 
 def companion_blocks(step_id, names, config=None, rollback=False, **inputs):
-    """The blocks printed beside a step's block, as (variant, Block): O3 Path A has the re-entry block (O3-reentry), the O10 rollback the
-    variant through the retained copy (O10-rollback-retained, for after S2b ran), and C3 the repair block (C3-repair).
+    """The blocks printed beside a step's block, as (variant, Block): O3 has the re-entry block (O3-reentry) and the O10 rollback the
+    variant through the retained copy (O10-rollback-retained, for after S2b ran).
 
     inputs are the keyword inputs of block_for (block_inputs): the rollback companion takes
-    released, app_writes_seen and grants from them. owner-sql opens no session, so it cannot
+    released and app_writes_seen from them. owner-sql opens no session, so it cannot
     see whether an earlier run stopped between DETACH and ATTACH, or whether S2b ran; it writes
     both blocks, and the checks of each refuse the wrong state.
     """
     from . import freeze, switch
     key = str(step_id).upper()
-    if key == 'O3' and not rollback and (config is None or config.freeze.mode != 'lockout'):
+    if key == 'O3' and not rollback:
         return [('reentry', freeze.reentry_block(names))]
     if key == 'O10' and rollback:
         return [('retained', switch.rollback_block(names, released=inputs.get('released', False), app_writes_seen=inputs.get('app_writes_seen'),
-                                                   withheld=inputs.get('grants'), after_s2b=True))]
-    if key == 'C3':
-        return [('repair', repair_block(names))]
+                                                   after_s2b=True))]
     return []
 
 
@@ -956,65 +876,23 @@ def record_endstate_listing(ctx, when):
 def handle_c3(step, ctx):
     """C3 handler: the End state block (two entries, reads only), the write probe on the retained name, the listing recorded.
 
-    With the owner profile, when the gate fails and the journal holds no S2b or S4 (a switch by
-    an older kit), the repair block is printed with its outage note and runs after the operator
-    types proceed (ownersql.ask), or at once with --yes; the gate then runs again. A failed gate
-    with S2b and S4 in the journal refuses with the listing and no repair. The repair's own
-    statements do not count as S2b or S4, so a repair that stopped part way is offered again and
-    resumes from the live state (switch.SwitchMachine.repair_end_state), which refuses before any
-    statement when nothing is left to repair. Without the owner profile the block is printed and
-    the gate waits for a person.
+    With the owner profile a failed gate refuses with the listing: C3 never detaches, attaches or
+    drops a database. Without the owner profile the block is printed and the gate waits for a person.
     """
     from . import switch
-    names = names_for(ctx)
-    block = endstate_block(names)
+    block = endstate_block(names_for(ctx))
     if ctx.dry_run or not ctx.owner_configured:
-        out = handle_admin(step, ctx, block)
-        for variant, companion in companion_blocks('C3', names):
-            print_block(companion, ctx, owner_sql_path(ctx, 'C3', variant=variant))
-        return out
+        return handle_admin(step, ctx, block)
     record_endstate_listing(ctx, 'before')
     try:
         out = handle_admin(step, ctx, block, after=lambda results: retained_write_probe(ctx))
     except KitError as exc:
         out = steps.Outcome(steps.REFUSED, str(exc), EXIT_REFUSED)
-    if out.status != steps.REFUSED or 'stopped at check' not in out.note:
-        if out.status == steps.PASSED:
-            record_endstate_listing(ctx, 'after')
-        return out
-    entries = record_endstate_listing(ctx, 'before repair')
-    # S2b and S4 of the kit's switch only: the repair's own DROP of the original marks a repair to resume from the live state, not a switch made with S2b
-    switched_here = any(d.startswith('S2b DROP') or d.startswith('S4 DROP') for d in ctx.journal.events('switch_statement'))
-    if switched_here:
-        return steps.Outcome(steps.REFUSED, '%s. The journal shows S2b and S4, so no repair applies; entries: %s' % (out.note, switch.listing_text(entries)),
+    entries = record_endstate_listing(ctx, 'after' if out.status == steps.PASSED else 'at the refusal')
+    if out.status == steps.REFUSED and 'stopped at check' in out.note:
+        return steps.Outcome(steps.REFUSED, '%s; find out who attached or moved the extra entry. Entries: %s' % (out.note, switch.listing_text(entries)),
                              EXIT_REFUSED)
-    repair = repair_block(names)
-    repair.items = [i for i in repair.items if i.kind != 'refuse']
-    guard_check_block(repair, ctx)
-    print_block(repair, ctx, owner_sql_path(ctx, 'C3', variant='repair'))
-    ctx.log('    ' + REPAIR_OUTAGE_NOTE)
-    if not ctx.yes:
-        answer = ask('The journal shows no S2b or S4 (a switch by an older kit). Run the repair now? Type proceed: ')
-        if answer is None:
-            return steps.Outcome(steps.PENDING, 'C3: the end state gate failed (%s); rerun step C3 --yes%s, or at a terminal type proceed, to run the '
-                                 'repair block above' % (out.note, steps.run_flag(ctx.run_id)), EXIT_GATE)
-        if answer.strip().lower() != 'proceed':
-            ctx.journal.event('endstate_repair_declined', answer.strip()[:80] or 'no answer')
-            return steps.Outcome(steps.REFUSED, 'C3: the repair was not confirmed; nothing was issued. Entries: %s' % switch.listing_text(entries),
-                                 EXIT_REFUSED)
-    guard = steps.guard_for('C3', ctx.db, steps.OWNER)
-    owner = ctx.owner_session(guard)
-    runner = ctx.runner_session(steps.guard_for('O8', ctx.db))
-    try:
-        machine = switch.SwitchMachine(owner, names, ctx.journal, ctx.log, runner, open_session=ctx.owner_session, guard=guard)
-        ctx.journal.event('endstate_repair', 'started: the live name is detached for the repair')
-        machine.repair_end_state()
-    finally:
-        owner.close()
-        runner.close()
-    retained_write_probe(ctx)
-    record_endstate_listing(ctx, 'after repair')
-    return steps.Outcome(steps.PASSED, 'C3 repaired the end state with the owner profile: two entries, the live record and the retained record')
+    return out
 
 
 def definer_routines_sql():
@@ -1159,7 +1037,7 @@ def _detach(cursor, connect, sql, wait, kill):
     if outcome.get("done"):
         return "plain"
     if not kill:
-        raise RuntimeError("DETACH waited more than %d s and detach_kill is off; stop the writers (lockout cell) and rerun" % wait)
+        raise RuntimeError("DETACH waited more than %d s and detach_kill is off; stop the writers and rerun" % wait)
     cursor.execute(sql + " KILL")
     return "kill"
 

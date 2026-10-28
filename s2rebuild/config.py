@@ -109,7 +109,6 @@ SCHEMA = {
         'ca_file': Field('str', 'certs/singlestore_bundle.pem'),
         'compute_size': Field('str', None, nullable=True),
         'id': Field('str', None, nullable=True),
-        'management_api_key_keychain': Field('str', None, nullable=True),
         'keepalive_minutes': Field('int', 15, minimum=0, maximum=60),
     },
     'connections': {
@@ -120,27 +119,17 @@ SCHEMA = {
     'window': Opt({
         'start': Field('datetime'),
         'end': Field('datetime'),
-        'restart_allowance_minutes': Field('int', 60, minimum=0),
-        'buffer_minutes': Field('int', 30, minimum=0),
     }),
     'freeze': {
-        'mode': Field('str', 'readonly', choices=('readonly', 'lockout')),
         'detach_wait_seconds': Field('int', 120, minimum=0),
         'detach_kill': Field('bool', True),
         'write_probe': Field('bool', True),
-        'quiet_max_age_seconds': Field('int', 60, minimum=1),
-        'lockout': {
-            'connections': Field('int', 6, minimum=1),
-            'interval_seconds': Field('int', 5, minimum=0),
-            'protected_accounts': Field('list', []),
-            'quiet_passes_required': Field('int', 3, minimum=1),
-        },
     },
     'copy': {
         'workers': Field('int', 4, minimum=1, maximum=32),
         'chunk_rows': Field('int', 10_000_000, minimum=1),
         'min_rows_for_chunking': Field('int', 5_000_000, minimum=0),
-        'max_buckets_per_table': Field('int', 32, minimum=1),
+        'max_buckets_per_table': Field('int', 64, minimum=1),
         'table_concurrency': Field('any', 'auto'),
         'lock_probe_timeout_seconds': Field('int', 5, minimum=1),
         'lock_retry_seconds': Field('int', 120, minimum=1),
@@ -148,6 +137,8 @@ SCHEMA = {
         'max_lock_waits': Field('int', 10, minimum=1),
         'max_consecutive_failures': Field('int', 6, minimum=1, maximum=100),
         'progress_seconds': Field('int', 60, minimum=1),
+        # the progress line names a chunk running longer than this (K7); the read timeout stays as it is
+        'slow_chunk_minutes': Field('int', 30, minimum=1),
     },
     'verify': {
         'tiers': Field('list', list(TIERS)),
@@ -169,10 +160,8 @@ SCHEMA = {
         'start_at_release': Field('str', 'all', choices=('all', 'none')),
     },
     'estimate': {
-        'baseline': Field('str', 'customer/baseline.json', nullable=True),
-        'band_percent': Field('int', 15, minimum=0, maximum=100),
-        # the most credit a workspace with more leaf cores than the baseline's gets on the rates; 1.0 is none (section 10.6)
-        'scale_up_cap': Field('number', 1.0, minimum=1.0, maximum=4.0),
+        # rows copied per hour over a whole O6 on the workspace of the run; the estimate is rows divided by this (section 10.6)
+        'rows_per_hour': Field('int', 2_400_000_000, minimum=1),
     },
     'closeout': {
         'retain_days': Field('int', 90, minimum=1),
@@ -297,7 +286,7 @@ class Section:
                                            for k, v in data.items()})
 
     def __getattr__(self, name):
-        if name == '_data':  # unpickling (the rehearsal's spawned copy process) asks before _data exists
+        if name == '_data':  # unpickling (a spawned copy process) asks before _data exists
             raise AttributeError(name)
         try:
             return self._data[name]
@@ -374,22 +363,15 @@ class DatabaseSpec:
 
 @dataclasses.dataclass(frozen=True)
 class Window:
-    """The outage window and the allowances that produce the abort deadline."""
+    """The outage window, recorded at O1 and printed on the plan sheet; no step stops on it."""
 
     start: dt.datetime
     end: dt.datetime
-    restart_allowance_minutes: int
-    buffer_minutes: int
 
     @property
     def duration(self):
         """Length of the window as a timedelta."""
         return self.end - self.start
-
-    def abort_deadline(self, longest_chunk_seconds=0):
-        """end minus restart allowance minus buffer minus the longest chunk (section 10.6)."""
-        return self.end - dt.timedelta(minutes=self.restart_allowance_minutes + self.buffer_minutes,
-                                       seconds=longest_chunk_seconds)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -549,7 +531,7 @@ def build_config(data, path=None, run_date=None, root=None):
         end = parse_utc(raw['window']['end'], 'window.end')
         if end <= start:
             raise KitError('window.end must be after window.start')
-        window = Window(start, end, raw['window']['restart_allowance_minutes'], raw['window']['buffer_minutes'])
+        window = Window(start, end)
     copy = raw['copy']
     concurrency = copy['table_concurrency']
     if isinstance(concurrency, bool) or not (concurrency == 'auto' or (isinstance(concurrency, int) and 1 <= concurrency <= copy['workers'])):
@@ -558,9 +540,6 @@ def build_config(data, path=None, run_date=None, root=None):
     if not tiers or len(set(tiers)) != len(tiers) or any(t not in TIERS for t in tiers) \
             or [t for t in TIERS if t in tiers] != tiers:
         raise KitError('verify.tiers must list some of count, newest, fingerprint in that order')
-    for account in raw['freeze']['lockout']['protected_accounts']:
-        if not isinstance(account, str) or not account:
-            raise KitError('freeze.lockout.protected_accounts must hold account names')
     _check_env_map(raw['pipelines']['credentials_env'], 'pipelines.credentials_env')
     _check_env_map(raw['pipelines']['per_pipeline_env'], 'pipelines.per_pipeline_env')
     _check_item_map(raw['pipelines']['credentials_keychain'], 'pipelines.credentials_keychain')

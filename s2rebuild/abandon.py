@@ -13,8 +13,7 @@ account-sql --drop --execute, which a later run would otherwise refuse at P1.
 
 abandon refuses once the switch may have begun (Journal.switch_began): from then on the way back
 is owner-sql O10 --rollback. It takes the copy lock, so it refuses while a copy runs; pause the
-copy first and let the running chunks finish. Path B gives the revoked privileges back at O11
-only, so abandon refuses on Path B. The position is read first, as O3 does: the source READONLY
+copy first and let the running chunks finish. The position is read first, as O3 does: the source READONLY
 on the recorded storage gets the DETACH and the ATTACH; a stop between them resumes at the
 ATTACH; a source already READWRITE on the recorded storage gets checks only. A rerun after a
 partial abandon finishes it. Statements issued: DETACH DATABASE and ATTACH DATABASE on the
@@ -116,13 +115,11 @@ def block(names, position='frozen'):
 
 
 def refusal(ctx):
-    """Why abandon cannot run for this database, or None: the switch may have begun, Path B, or no source STORAGE_ID recorded."""
+    """Why abandon cannot run for this database, or None: the switch may have begun, or no source STORAGE_ID recorded."""
     began = ctx.journal.switch_began()
     if began:
         return ('abandon refused for %s: the switch may have begun (%s); the way back is s2rebuild owner-sql O10 --rollback'
                 % (ctx.db.source, began))
-    if ctx.config.freeze.mode == 'lockout':
-        return 'abandon refused for %s: Path B gives the revoked privileges back at O11 only; abandon covers Path A' % ctx.db.source
     if ownersql.placeholders(ownersql.names_for(ctx)['source_sid']):
         return 'abandon refused for %s: no source STORAGE_ID is recorded (P2 records it); nothing of this run has changed the workspace' % ctx.db.source
     return None

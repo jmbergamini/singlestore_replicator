@@ -6,18 +6,17 @@ Helios 10.8.0, October 27, 2026: a branch keeps its parent's STORAGE_ID and ever
 leaves the old record behind, so the switch, the rollback, C3 and abandon identify a database by
 its record. The fake's branch records are on (its defaults).
 """
-import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
 
 from s2rebuild import abandon, ownersql, switch
 from s2rebuild.common import KitError
-from s2rebuild.journal import COLUMNS, SCHEMA_VERSION, Journal, create_table_sql
+from s2rebuild.journal import SCHEMA_VERSION, Journal
 from s2rebuild.sqlutil import read_guard
 from tests.test_abandon import frozen_with_replacement
 from tests.test_copy import SRC, TGT
-from tests.test_switch import RET, SID, machine_for, old_kit_switch, switched_harness
+from tests.test_switch import RET, SID, machine_for, switch_without_s2b, switched_harness
 
 
 def attach_writes(h):
@@ -38,10 +37,10 @@ class RecordIdentityTests(unittest.TestCase):
     def test_rollback_detaches_the_live_branch_not_the_parent_and_re_attaches_the_original_by_its_syntax(self):
         """R1 detaches the live pitr record and leaves its parent, the replacement, attached; R2a runs the detached original's own ATTACH_SYNTAX.
 
-        A switch made without S2b (old_kit_switch) still has the detached original record, so the rollback takes R2a.
+        A switch made without S2b (switch_without_s2b) still has the detached original record, so the rollback takes R2a.
         """
         h = switched_harness(self)
-        machine, names = old_kit_switch(h)
+        machine, names = switch_without_s2b(h)
         self.assertEqual(machine.position(), switch.SWITCHED, h.text())
         detached_original = h.journal.attachment('source')
         self.assertEqual((detached_original['record_type'], detached_original['is_detached'], detached_original['compute_id']), ('create', 1, 'cid-1'))
@@ -65,7 +64,7 @@ class RecordIdentityTests(unittest.TestCase):
         a source record that differs from the journal refuses S1 before the DETACH. A new pitr branch of the same storage cannot be told
         from the live record re-attached, since every attach changes the COMPUTE_ID (fact 44)."""
         h = switched_harness(self)
-        machine, names = old_kit_switch(h)
+        machine, names = switch_without_s2b(h)
         recorded = h.journal.attachment('live')
         cur = h.fake.connect('admin').cursor()
         cur.execute('CREATE DATABASE `other_db` PARTITIONS 16 SUB_PARTITIONS 0')
@@ -103,7 +102,7 @@ class RecordIdentityTests(unittest.TestCase):
         """After a switch without S2b the live name carries two records, the detached original (create) and the live branch (pitr); identify
         returns the attached one, even when the original is expected, and the two never match."""
         h = switched_harness(self)
-        machine, names = old_kit_switch(h)
+        machine, names = switch_without_s2b(h)
         session = h.sessions.runner(read_guard())
         try:
             found = switch.records(session, SRC)
@@ -143,29 +142,18 @@ class RecordIdentityTests(unittest.TestCase):
         self.assertEqual((retained[0]['ATTACH_TYPE'], retained[0]['ACCESS'], retained[0]['PREV_DATABASE_NAME']), ('resume', 'READONLY', SRC))
         self.assertTrue(switch.records_match(first, second))
 
-    def test_the_journal_round_trips_a_record_and_upgrades_a_version_2_journal(self):
-        """A version 2 journal keeps its attachment rows readable (record fields unknown); a record stored whole comes back whole, and a row of
+    def test_the_journal_round_trips_a_record(self):
+        """A row without record fields stays readable (record fields unknown); a record stored whole comes back whole, and a row of
         either view completes the latest row of the same record."""
         with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / 'v2.sqlite'
-            conn = sqlite3.connect(str(path))
-            for name in COLUMNS:
-                if name != 'attachments':
-                    conn.execute(create_table_sql(name))
-            conn.execute('CREATE TABLE attachments (id INTEGER PRIMARY KEY AUTOINCREMENT, role TEXT NOT NULL, database_name TEXT NOT NULL, '
-                         'storage_id TEXT, compute_id TEXT, attach_type TEXT, observed_utc TEXT NOT NULL)')
-            conn.execute("INSERT INTO meta VALUES ('schema_version', '2')")
-            conn.execute("INSERT INTO attachments (role, database_name, storage_id, compute_id, attach_type, observed_utc) "
-                         "VALUES ('source', 'src_db', 'sid-1', 'cid-1', 'READWRITE', '2026-10-27T00:00:00Z')")
-            conn.commit()
-            conn.close()
-            j = Journal(path)
+            j = Journal(Path(tmp) / 'journal.sqlite')
             self.addCleanup(j.close)
             self.assertEqual(j.schema_version(), SCHEMA_VERSION)
+            j.record_attachment('source', 'src_db', storage_id='sid-1', compute_id='cid-1', attach_type='READWRITE')
             old = j.attachment('source')
             self.assertEqual((old['storage_id'], old['compute_id'], old['attach_type']), ('sid-1', 'cid-1', 'READWRITE'))
-            self.assertEqual((old['record_type'], old['attach_syntax'], old['is_detached']), (None, None, None), 'a version 2 row has no record')
-            self.assertEqual(switch.record_key(old), ('src_db', 'sid-1', None), 'a version 2 row is matched by name and STORAGE_ID')
+            self.assertEqual((old['record_type'], old['attach_syntax'], old['is_detached']), (None, None, None), 'a row without a record')
+            self.assertEqual(switch.record_key(old), ('src_db', 'sid-1', None), 'a row without a record is matched by name and STORAGE_ID')
             record = {'DATABASE_NAME': 'src_db', 'STORAGE_ID': 'sid-1', 'ATTACH_TYPE': 'create', 'COMPUTE_ID': 'cid-1', 'ACCESS': 'READONLY',
                       'PREV_DATABASE_NAME': None, 'IS_DETACHED': 0, 'IS_DROPPED': 0, 'END_VERSION': None,
                       'ATTACH_SYNTAX': 'ATTACH DATABASE `src_db` STORAGEID sid-1 COMPUTEID cid-1'}

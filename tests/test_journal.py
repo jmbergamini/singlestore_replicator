@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 
 from s2rebuild.common import KitError
-from s2rebuild.journal import ADDED_COLUMNS, COLUMNS, MEMORY, SCHEMA_VERSION, TABLE_CONSTRAINTS, Journal
+from s2rebuild.journal import COLUMNS, MEMORY, SCHEMA_VERSION, Journal
 from tests.fakedb import SimulatedCrash
 from tests.helpers import Plan, crash_journal, plans
 
@@ -42,25 +42,6 @@ def legacy_journal(path):
     conn.close()
 
 
-def version_1_journal(path):
-    """A journal as schema version 1 of the kit wrote it: every table, without the columns version 2 added, O8 passed on one verified table."""
-    conn = sqlite3.connect(str(path))
-    for name, cols in COLUMNS.items():
-        later = {c for c, _ in ADDED_COLUMNS[2].get(name, [])}
-        parts = ['%s %s' % col for col in cols if col[0] not in later]
-        if name in TABLE_CONSTRAINTS:
-            parts.append(TABLE_CONSTRAINTS[name])
-        conn.execute('CREATE TABLE %s (%s)' % (name, ', '.join(parts)))
-    conn.execute("INSERT INTO meta VALUES ('schema_version', '1'), ('source_db', 'src_db'), ('replacement_db', 'tgt_db')")
-    conn.execute("INSERT INTO tables (table_name, est_rows, n_buckets, key_kind, key_expr, columns_json, target_count, verified_at_utc) "
-                 "VALUES ('t1', 10, 1, 'key', '`id`', '[\"id\", \"v\"]', 10, '2026-11-01T06:00:00Z')")
-    conn.execute("INSERT INTO chunks (table_name, bucket, state, rows_inserted, ended_utc, attempts) VALUES ('t1', 0, 'done', 10, '2026-11-01T05:30:00Z', 1)")
-    conn.execute("INSERT INTO verification (table_name, tier, result, checked_utc) VALUES ('t1', 'count', 'match', '2026-11-01T06:00:00Z')")
-    conn.execute("INSERT INTO steps (step_id, status, note) VALUES ('O8', 'passed', 'every tier passed')")
-    conn.commit()
-    conn.close()
-
-
 class SchemaTests(unittest.TestCase):
     def test_schema_created_in_memory_and_on_disk(self):
         j = Journal(MEMORY)
@@ -79,31 +60,6 @@ class SchemaTests(unittest.TestCase):
                 self.assertEqual(have, [c for c, _ in cols], table)
             j.close()
             self.assertTrue(path.exists())
-
-    def test_migration_from_reference_runner_journal(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / 'legacy.sqlite'
-            legacy_journal(path)
-            j = Journal(path)
-            self.assertEqual(j.schema_version(), SCHEMA_VERSION)
-            self.assertEqual(j.get_meta('source_db'), 'src_db')
-            cols = [r[1] for r in j.conn.execute('PRAGMA table_info(tables)')]
-            for added in ('size_gib', 'time_column', 'unique_key_lock_risk', 'concurrency', 'verified_at_utc'):
-                self.assertIn(added, cols)
-            names = {r[0] for r in j.conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
-            self.assertTrue(set(COLUMNS) <= names)
-            self.assertEqual([(b, s) for _, b, s, _, _ in j.chunk_states('t001')], [(0, 'done'), (1, 'done'), (2, 'started')])
-            totals, tables_done = j.totals()
-            self.assertEqual(totals['done'], (2, 2000))
-            self.assertEqual(tables_done, 0)
-            self.assertEqual(j.events('create_database'), ['tgt_db'])
-            j.check_plan([Plan('t001', 25_000_000, 3)], 'src_db', 'tgt_db')
-            j.step_start('O6')
-            self.assertEqual(j.step_status('O6'), 'running')
-            j.close()
-            again = Journal(path)
-            self.assertEqual(again.schema_version(), SCHEMA_VERSION)
-            again.close()
 
     def test_refuses_a_newer_schema(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -146,69 +102,17 @@ class SchemaTests(unittest.TestCase):
                 ro.set_meta('x', 'y')
             ro.close()
 
-    def test_f4_version_1_journal_upgrades_in_place_to_version_2(self):
-        """A version 1 journal gains tables.recopy_epoch (0) and verification.epoch (unknown for the rows it holds), then the version 3
-        attachment record columns and the version 4 sampling columns of verification, and keeps its data."""
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / 'v1.sqlite'
-            version_1_journal(path)
-            j = Journal(path)
-            self.assertEqual((j.schema_version(), SCHEMA_VERSION), (4, 4))
-            for table, cols in COLUMNS.items():
-                self.assertEqual(set(j._existing_columns(table)), {c for c, _ in cols}, table)
-            self.assertEqual(j.recopy_epoch('t1'), 0)
-            self.assertIsNone(j.verifications('t1')[0]['epoch'], 'a version 1 row has no epoch: S0 asks for a new O8')
-            self.assertEqual((j.verifications('t1')[0]['predicate'], j.verifications('t1')[0]['sample_rows']), (None, None), 'a full fingerprint')
-            self.assertEqual(j.step_status('O8'), 'passed')
-            state = j.verification_state()[0]
-            self.assertEqual((state['table_name'], state['verified_at_utc'], state['epoch_verified']), ('t1', '2026-11-01T06:00:00Z', 0))
-            j.record_verification('t1', 'count', 'match', 10, 10)
-            self.assertEqual(j.verifications('t1')[-1]['epoch'], 0)
-            self.assertEqual(j.verification_state()[0]['epoch_verified'], 1)
-            j.close()
-            again = Journal(path)
-            self.assertEqual(again.schema_version(), 4)
-            again.close()
-
-    def test_f4_read_only_open_reads_a_version_1_journal_without_changing_it(self):
-        """status opens a version 1 journal read-only as it is: the steps read, the version stays 1, the file is not written."""
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / 'v1.sqlite'
-            version_1_journal(path)
-            before = path.read_bytes()
-            ro = Journal(path, read_only=True)
-            self.assertEqual(ro.schema_version(), 1)
-            self.assertEqual(ro.steps_board()['O8']['status'], 'passed')
-            with self.assertRaises(sqlite3.OperationalError):
-                ro.set_meta('x', 'y')
-            ro.close()
-            self.assertEqual(path.read_bytes(), before)
-
-    def test_f4_read_only_version_1_journal_gives_the_s0_state_without_changing_it(self):
-        """owner-sql opens a version 1 journal read only: its S0 state reads as after the upgrade (epoch 0, no row at that epoch),
-        so the O10 forward block carries a STOP naming the table, and the file is not written. Read only, so nothing to inject."""
-        from s2rebuild import switch
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / 'v1.sqlite'
-            version_1_journal(path)
-            before = path.read_bytes()
-            ro = Journal(path, read_only=True)
-            state = ro.verification_state()
-            self.assertEqual([(t['table_name'], t['recopy_epoch'], t['epoch_verified'], t['chunks_open']) for t in state], [('t1', 0, 0, 0)])
-            self.assertEqual(switch.unverified_tables(ro), ['t1 (no matching verification at re-copy epoch 0)'])
-            self.assertIn('not verified on the rows now copied: t1 (no matching verification at re-copy epoch 0); rerun O6 to O8',
-                          '; '.join(switch.s0_journal_problems(ro)))
-            ro.close()
-            self.assertEqual(path.read_bytes(), before)
-
-    def test_read_only_refuses_an_older_schema_with_a_remedy(self):
+    def test_an_older_journal_is_refused_never_upgraded(self):
+        """R7: one schema. A journal of an older kit is refused, writable or read only, and the file is left as it was."""
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'legacy.sqlite'
             legacy_journal(path)
-            with self.assertRaisesRegex(KitError, 'older schema .* writable command'):
-                Journal(path, read_only=True)
-            Journal(path).close()
-            Journal(path, read_only=True).close()
+            before = path.read_bytes()
+            for read_only in (False, True):
+                with self.assertRaisesRegex(KitError, 'This journal was written by an older kit; finish or abandon that run with the kit '
+                                                      'version that started it'):
+                    Journal(path, read_only=read_only)
+            self.assertEqual(path.read_bytes(), before)
 
     def test_corrupt_and_odd_paths_become_kit_errors(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -607,21 +511,6 @@ class OtherRowsTests(unittest.TestCase):
         self.assertEqual(j.attachment('source')['attach_type'], 'READONLY')
         with self.assertRaises(KitError):
             j.record_attachment('other', 'x')
-
-    def test_grants_snapshot(self):
-        j = self.j
-        j.snapshot_grant("'app'@'%'", ['UPDATE', 'INSERT'])
-        snap = j.grants_snapshot()
-        self.assertEqual(snap["'app'@'%'"]['privileges'], ['INSERT', 'UPDATE'])
-        self.assertIsNone(snap["'app'@'%'"]['restored_utc'])
-        j.mark_grant_restored("'app'@'%'")
-        self.assertIsNotNone(j.grants_snapshot()["'app'@'%'"]['restored_utc'])
-        self.assertFalse(j.snapshot_grant("'app'@'%'", ['DELETE']), 'a rerun never overwrites the first snapshot')
-        row = j.grants_snapshot()["'app'@'%'"]
-        self.assertEqual(row['privileges'], ['INSERT', 'UPDATE'])
-        self.assertIsNotNone(row['restored_utc'])
-        self.assertTrue(j.snapshot_grant("'other'@'%'", {'*.*': ['INSERT'], '`db1`.*': ['UPDATE', 'DELETE']}))
-        self.assertEqual(j.grants_snapshot()["'other'@'%'"]['privileges'], {'*.*': ['INSERT'], '`db1`.*': ['DELETE', 'UPDATE']})
 
     def test_pipelines_and_offsets(self):
         j = self.j

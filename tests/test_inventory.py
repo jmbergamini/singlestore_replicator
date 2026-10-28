@@ -274,9 +274,9 @@ class PlanTests(unittest.TestCase):
         plans = I.plan_tables(self.inv, self.cfg, self.db)
         by = {p.name: p for p in plans}
         self.assertEqual([p.name for p in plans], ['order_items', 'orders', 'events', 'customers', 'totals', 'empty_table'], 'largest first')
-        self.assertEqual(by['order_items'].n_buckets, 32, 'capped at max_buckets_per_table')
+        self.assertEqual(by['order_items'].n_buckets, 60, 'rows over chunk_rows, under max_buckets_per_table')
         self.assertEqual(by['order_items'].key_columns, ['order_id', 'line_no'])
-        self.assertEqual(by['order_items'].predicate(31), "CRC32(CONCAT_WS('|', `order_id`, `line_no`)) MOD 32 = 31")
+        self.assertEqual(by['order_items'].predicate(59), "CRC32(CONCAT_WS('|', `order_id`, `line_no`)) MOD 60 = 59")
         self.assertEqual(by['orders'].n_buckets, 3)
         self.assertEqual(by['orders'].time_column, 'updated_at')
         self.assertEqual(by['events'].key_kind, 'row')
@@ -289,8 +289,8 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(by['empty_table'].key_kind, 'row')
         self.assertIsNone(by['orders'].concurrency)
         summary = I.plan_summary(plans)
-        self.assertEqual((summary['tables'], summary['buckets']), (6, 40))
-        self.assertEqual(summary['statements']['insert_select'], 40)
+        self.assertEqual((summary['tables'], summary['buckets']), (6, 68))
+        self.assertEqual(summary['statements']['insert_select'], 68)
         with self.assertRaises(KitError):
             by['orders'].predicate(3)
 
@@ -526,7 +526,6 @@ class DriftTests(unittest.TestCase):
 
 class SystemProfileTests(unittest.TestCase):
     def test_rows_per_database(self):
-        from s2rebuild import estimate
         answers = {
             'SELECT DATABASE_NAME, NUM_PARTITIONS': [{'DATABASE_NAME': 'db_a', 'NUM_PARTITIONS': 32, 'NUM_SUB_PARTITIONS': 0},
                                                       {'DATABASE_NAME': 'db_b', 'NUM_PARTITIONS': 8, 'NUM_SUB_PARTITIONS': 64}],
@@ -536,7 +535,7 @@ class SystemProfileTests(unittest.TestCase):
             'SELECT f.DATABASE_NAME': [{'DATABASE_NAME': 'db_a', 'primary_files_gib': 40.0}],
             'SELECT DATABASE_NAME, COUNT(*) AS pipelines': [{'DATABASE_NAME': 'db_b', 'pipelines': 3}],
         }
-        rows = I.system_profile(FakeSession(answers), config_from(), estimate.DEFAULT_BASELINE, estimate)
+        rows = I.system_profile(FakeSession(answers), config_from())
         self.assertEqual([r['database'] for r in rows], ['db_a', 'db_b'])
         self.assertEqual(rows[0]['tables'], 2)
         self.assertEqual(rows[0]['size_gib'], 40.0)

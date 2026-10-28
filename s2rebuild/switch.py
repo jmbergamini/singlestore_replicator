@@ -1,4 +1,4 @@
-"""s2rebuild switch: the O10 state machine over the attachment views, forward S0 to S4 and rollback R1 to R2c.
+"""s2rebuild switch: the O10 state machine over the attachment views, forward S0 to S4 and rollback R1 to R2b.
 
 Author: John Bergamini
 
@@ -18,17 +18,12 @@ already written with a STOP first). Every S3 precondition
 (replacement attached READWRITE on its recorded STORAGE_ID, retained name free) is checked
 before S1, so the source is never detached for a switch that cannot finish; so is the two-entry
 end state: each storage holds its recorded record only, since a branch of the source or of the
-replacement shares its STORAGE_ID and would stop S2b or the gate after the DROP. On Path B, S1
-refuses unless no account holds again a write privilege the lockout took and the last lockout
-pass recorded in the journal was quiet within freeze.quiet_max_age_seconds (lockout --hold keeps
-it fresh and ends once s1_ran sees S1 done); S0 and the go decision check that pass as well, and
-the S1 before-checks run once before the go, so a refusal that issues nothing leaves the
-re-copy open. The printed forward block checks the privileges live, one check per account and
-scope, where the kit reads the journal pass.
+replacement shares its STORAGE_ID and would stop S2b or the gate after the DROP. The S1
+before-checks run once before the go, so a refusal that issues nothing leaves the re-copy open.
 S3 attaches the live name READWRITE, so the application can write from that moment: a rollback
 from the switched position first runs the zero-change proof (every planned table on the live
-name holds its journal target_count; no pipeline runs on it, no write privilege the lockout
-took is back and no foreign non-idle session is on it) and refuses with what differs. Rollback
+name holds its journal target_count; no pipeline runs on it and no foreign non-idle session is
+on it) and refuses with what differs. Rollback
 is refused once O11 started releasing writers or C1 saw application writes, and resumes from
 any position behind S1.
 Identity is the branch record, never a STORAGE_ID alone (Helios 10.8.0, October 27, 2026: a
@@ -51,10 +46,7 @@ the journal. A failed proof at S2b stops with the original attached read write u
 name, the rollback state. Rollback before S2b ran: R1, then R2a (the original's own syntax).
 After S2b the original record is gone, so the rollback goes through the retained copy: R2b,
 ATTACH <retained> AS <source> STORAGEID <original>, a read-write pitr branch under the live
-name; when the server refuses a branch of a READ ONLY attachment, R2c detaches the retained
-name and re-attaches its record by syntax under the live name (a resume record; the retained
-name then leaves the Portal, and the report says where the data is). No rollback step drops
-the retained copy. Statements issued through the O10 owner guard: DETACH DATABASE (with the
+name (fact 35). No rollback step drops the retained copy. Statements issued through the O10 owner guard: DETACH DATABASE (with the
 KILL escalation), ATTACH DATABASE, DROP DATABASE on the source record at S2b and on the
 replacement at S4.
 """
@@ -81,17 +73,15 @@ PROJECTION_COUNT_SQL = 'SELECT COUNT(*) AS n FROM information_schema.PROJECTIONS
 COUNT_CHECKS = (('tables', TABLE_COUNT_SQL, 'tables'), ('views', VIEW_COUNT_SQL, 'views'), ('pipelines', PIPELINE_COUNT_SQL, 'pipelines'),
                 ('routines', ROUTINE_COUNT_SQL, 'routines'), ('projections', PROJECTION_COUNT_SQL, 'projections'))
 RUNNING_PIPELINES_SQL = "SELECT COUNT(*) AS n FROM information_schema.PIPELINES WHERE DATABASE_NAME = %s AND STATE = 'Running'"
-SWITCH_ALLOWANCE_SECONDS = 10 * 60
 
 NOT_STARTED, DETACHED, RETAINED, SWITCHED, LIVE_DETACHED, UNKNOWN = (
     'not started', 'source detached', 'retained attached', 'switched', 'live branch detached', 'unknown')
 # the positions of the two-entry switch: S2b attached the original read write under the live name (also the state after a
-# rollback by R2a), S2b dropped it, S4 dropped the replacement, and a rollback through the retained copy (R2b or R2c)
+# rollback by R2a), S2b dropped it, S4 dropped the replacement, and a rollback through the retained copy (R2b)
 ORIGINAL_ATTACHED, SOURCE_DROPPED, COMPLETE, ROLLED_BACK = (
     'original attached read write', 'original record dropped', 'switch complete', 'rolled back through the retained copy')
 FORWARD = ('S1', 'S2', 'S2b', 'S3', 'S4')
-ROLLBACK = ('R1', 'R2a', 'R2b', 'R2c')
-READ_ONLY_REFUSAL = 2720
+ROLLBACK = ('R1', 'R2a', 'R2b')
 
 
 def _rows(session, sql, params):
@@ -123,8 +113,6 @@ STORAGE_ENTRY_COUNT_SQL = 'SELECT COUNT(*) AS n FROM information_schema.MV_CLOUD
 # the S1 before-checks that each storage holds its recorded record only (SwitchMachine._storage_holds_only and the printed block)
 STORAGE_ONLY_LABELS = {'source': 'S1 before (for S2b): the original storage holds one entry, the original record',
                        'replacement': 'S1 before (for S4): the replacement storage holds one entry, the replacement record'}
-# COUNT of attached databases under a name (parameter: the name): the skip_if of the printed R2c statements
-NAME_ATTACHED_COUNT_SQL = 'SELECT COUNT(*) AS n FROM information_schema.MV_CLOUD_ATTACHED_DATABASES WHERE DATABASE_NAME = %s'
 # the state of one record (parameters: name, STORAGE_ID, COMPUTE_ID): IS_DROPPED = 1 after a DROP
 # the records of a name on a STORAGE_ID (parameters: name, STORAGE_ID), one not dropped first and an attached one before a detached one, so
 # the state checks read the record that matters; never by COMPUTE_ID, which every attach changes (fact 44)
@@ -313,15 +301,6 @@ def listing_text(entries):
     return '; '.join(record_text(r) for r in entries) or 'no entry'
 
 
-def read_only_refusal(exc):
-    """True when the server refused a statement because the attachment is read only: error 2720, or a message that says so."""
-    args = getattr(exc, 'args', ())
-    if args and args[0] == READ_ONLY_REFUSAL:
-        return True
-    text = str(exc).lower()
-    return 'read only' in text or 'read-only' in text or 'readonly' in text
-
-
 def live_is_branch_of_replacement(session, names, live_att, replacement_att):
     """True when the live name sits on the replacement's STORAGE_ID as its own branch of it; issues the MV_CLOUD_BRANCHES COUNT.
 
@@ -365,7 +344,7 @@ class Position:
         COMPLETE is SWITCHED with the replacement name gone (S4). The live name READWRITE on the
         original storage beside the retained copy is ORIGINAL_ATTACHED while it holds the original
         record (S2b attached it, or R2a put it back) and ROLLED_BACK when it holds a branch of the
-        retained copy (R2b or R2c). SOURCE_DROPPED is the retained copy alone with the original
+        retained copy (R2b). SOURCE_DROPPED is the retained copy alone with the original
         record dropped (S2b done, S3 ahead).
         """
         src_sid = str(names['source_sid'])
@@ -409,6 +388,7 @@ class Position:
 
 def read_position(session, names):
     """Query the attachment views for the three names, the records of the source name (the original record among them) and (once recorded) the live branch."""
+
     def _first(sql, params):
         rows = _rows(session, sql, params)
         return rows[0] if rows else None
@@ -428,12 +408,7 @@ def _sessions_params(names):
     return (names['source'], '%' + names['source'] + '%', names['runner_user'], names.get('owner_user') or names['runner_user'])
 
 
-def withheld_label(account, scope):
-    """The S1 before check on Path B that an account holds none of the write privileges the lockout took on a scope."""
-    return 'S1 before (Path B): %s holds none of the write privileges the lockout took on %s' % (account, scope)
-
-
-def forward_block(names, counts=None, s0_problems=None, withheld=None):
+def forward_block(names, counts=None, s0_problems=None):
     """The printed forward block S1 to S3 with every check and expected result (S0 is a decision).
 
     counts is {'tables', 'views', 'pipelines'} from the capture; each known count becomes a
@@ -441,40 +416,20 @@ def forward_block(names, counts=None, s0_problems=None, withheld=None):
     storage (a branch of either database would stop the block after the DROP of S2b). s0_problems is
     s0_journal_problems of the run (block_inputs): when any is left the block starts with a STOP
     naming them, so the hand route and the notebook refuse what the kit route refuses at S0.
-    withheld is the lockout snapshot not given back yet (ownersql.withheld_privileges): on Path B each
-    account and scope of it gets a check before the DETACH that it holds none of those write
-    privileges (expect n = 0), the live check that stands in for the kit's journal check of the
-    last lockout pass, so a privilege another job gave back after the quiet proof stops the hand and notebook
-    routes before S1 as the machine (s1_before) stops the kit route.
     """
-    path_a = names.get('freeze_mode', 'readonly') == 'readonly'
     block = ownersql.Block('O10', 'Switch forward')
     if s0_problems:
         block.refuse('S0 refused: %s; no statement of this block may run; generate the block again (s2rebuild owner-sql O10 or '
                      'owner-notebook) once S0 passes' % '; '.join(s0_problems))
     block.note('S0: O8 passed; every planned table verified after freeze_time and after its last chunk, at its current re-copy epoch; '
-               'O9 passed; time remaining covers the switch allowance; operator typed the live name.')
+               'O9 passed; operator typed the live name.')
     block.check('S1 before: source attached with the recorded STORAGE_ID', ATTACHED_SQL, (names['source'],),
                 ownersql.Expect('column_equals', 'STORAGE_ID', names['source_sid']))
     block.check('S1 before: the source is the recorded record', ATTACHED_RECORD_SQL, (names['source'], names['source_sid']),
                 ownersql.Expect('columns_equal', value=ownersql.record_expect(names, 'source')))
-    block.check('S1 before: source attached %s' % ('READONLY (Path A)' if path_a else 'READWRITE with a passed quiet proof (Path B)'),
-                ATTACHED_SQL, (names['source'],), ownersql.Expect('column_equals', 'ATTACH_TYPE', 'READONLY' if path_a else 'READWRITE'))
+    block.check('S1 before: source attached READONLY', ATTACHED_SQL, (names['source'],), ownersql.Expect('column_equals', 'ATTACH_TYPE', 'READONLY'))
     block.check('S1 before: no non-idle session on the source other than ours', SESSIONS_SQL, _sessions_params(names),
                 ownersql.Expect('column_equals', 'n', 0))
-    if not path_a:
-        checks = ownersql.withheld_checks(withheld or {}, names['source'])
-        block.note('S1 before (Path B): the last lockout pass was quiet within %s s (freeze.quiet_max_age_seconds). The kit checks this '
-                   'in the journal. This block checks the live state instead: the session check above, and one check per account and scope '
-                   'that the account holds none of the write privileges the lockout took. When one fails, nothing of this block has run: take the '
-                   'privilege away again with the statement of the O3 lockout plan (s2rebuild owner-sql O3), kill the sessions of that '
-                   'account, then run this block again from the top.' % names.get('quiet_max_age_seconds', 60))
-        if not checks:
-            block.note('S1 before (Path B): the journal holds no lockout snapshot, so this block has no privilege check. When the lockout '
-                       'took any privilege, record its snapshot (s2rebuild gate O3 --pass --note TEXT --evidence FILE with the output of '
-                       'the lockout cell) and generate this block again.')
-        for account, scope, sql, params in checks:
-            block.check(withheld_label(account, scope), sql, params, ownersql.Expect('column_equals', 'n', 0))
     block.check('S1 before (for S3): replacement attached READWRITE with the recorded STORAGE_ID', ATTACHED_SQL, (names['replacement'],),
                 ownersql.Expect('columns_equal', value={'STORAGE_ID': names['replacement_sid'], 'ATTACH_TYPE': 'READWRITE'}))
     block.check('S1 before (for S3): the replacement is the recorded record', ATTACHED_RECORD_SQL, (names['replacement'], names['replacement_sid']),
@@ -581,8 +536,7 @@ def s4_block(block, names):
 def gate_block(block, names, label, recorded=False):
     """The two-entry gate as checks: one entry on the original storage (the retained record), one on the replacement storage (the live record).
 
-    The records are checked by STORAGE_ID, type and parent, never by COMPUTE_ID (fact 44: a C3 repair
-    re-attaches the live record); recorded is kept for the callers.
+    The records are checked by STORAGE_ID, type and parent, never by COMPUTE_ID (fact 44); recorded is kept for the callers.
     """
     retained = {'ATTACH_TYPE': 'resume', 'PREV_DATABASE_NAME': names['source'], 'STORAGE_ID': names['source_sid']}
     live = {'ATTACH_TYPE': 'pitr', 'PREV_DATABASE_NAME': names['replacement'], 'STORAGE_ID': names['replacement_sid']}
@@ -604,28 +558,24 @@ def unproven_tables(table_counts):
     return [table for table, count in table_counts if count is None]
 
 
-def rollback_block(names, released=False, app_writes_seen=None, withheld=None, after_s2b=False):
+def rollback_block(names, released=False, app_writes_seen=None, after_s2b=False):
     """The rollback block, valid only before O11 released writers; a STOP item when it is no longer valid.
 
     R1 detaches the live name only while it holds the recorded live record. Before S2b ran
     (after_s2b=False) R2a runs the detached original record's own ATTACH_SYNTAX
     (original_syntax). After S2b (after_s2b=True) the original record is dropped, so R2b
-    attaches a read-write branch of the retained copy under the live name, and R2c, only when
-    the server refused R2b on the READ ONLY attachment, detaches the retained name and
-    re-attaches its record by syntax under the live name (a milestone placeholder with a note,
-    since the syntax exists only after the DETACH); its statements are skipped while the live
-    name is attached. No step drops the retained copy.
+    attaches a read-write branch of the retained copy under the live name. No step drops the
+    retained copy.
 
     Before R1 the zero-change proof: one COUNT(*) check per planned table of the live name
     against its journal target_count (names['table_counts'] from names_for), no pipeline Running
-    on the live name, none of the write privileges the lockout took (withheld, the snapshot not
-    given back yet) held again, then the S1 session query on the live name. The pipeline and
-    privilege checks read the live state, so a block written before O11 still refuses once a
-    hand or notebook O11 started a pipeline or gave a privilege back. A planned table without a
+    on the live name, then the S1 session query on the live name. The pipeline check reads the
+    live state, so a block written before O11 still refuses once a hand or notebook O11 started
+    a pipeline. A planned table without a
     target_count, or no planned table at all, is a STOP, since the live branch cannot be proven
     unchanged.
     """
-    block = ownersql.Block('O10', 'Rollback R1 and R2b, R2c (after S2b ran; before O11 only)' if after_s2b else
+    block = ownersql.Block('O10', 'Rollback R1 and R2b (after S2b ran; before O11 only)' if after_s2b else
                            'Rollback R1 and R2a (before S2b ran; before O11 only)')
     if released or app_writes_seen:
         block.refuse('rollback refused: %s; a rollback is now a new freeze and a reconciliation' % (
@@ -640,20 +590,16 @@ def rollback_block(names, released=False, app_writes_seen=None, withheld=None, a
                'zero-change proof and R1 and start at the R2 check. The notebook runs every item in order, so there the first proof check '
                'stops the block before any statement; finish from the R2 check of this block by hand.')
     block.note('Two blocks exist: O10-rollback (R2a) while the original record is still detached, that is before S2b ran, and '
-               'O10-rollback-retained (R2b, then R2c when R2b is refused) once S2b dropped it. Use the one the S2b state calls for; the '
+               'O10-rollback-retained (R2b) once S2b dropped it. Use the one the S2b state calls for; the '
                'R2 before check of the wrong one stops it with nothing issued.')
     block.note('Zero-change proof: S3 attached the live name READWRITE, so the application could write from then on. Every planned table must '
-               'hold the row count of the copy, no pipeline may run on the live name, no write privilege the lockout took may be back, and '
-               'no foreign session may be active; a failed check means reconcile first, never R1.')
+               'hold the row count of the copy, no pipeline may run on the live name, and no foreign session may be active; a failed check means reconcile first, never R1.')
     for table, count in table_counts:
         if count is not None:
             block.check('R1 before (zero-change proof): %s holds the copied row count' % table, count_sql(names['source'], table), (),
                         ownersql.Expect('column_equals', 'n', count))
     block.check('R1 before (zero-change proof): no pipeline Running on the live name', RUNNING_PIPELINES_SQL, (names['source'],),
                 ownersql.Expect('column_equals', 'n', 0))
-    for account, scope, sql, params in ownersql.withheld_checks(withheld or {}, names['source']):
-        block.check('R1 before (zero-change proof): %s holds none of the write privileges the lockout took on %s' % (account, scope), sql, params,
-                    ownersql.Expect('column_equals', 'n', 0))
     block.check('R1 before (zero-change proof): no non-idle session on the live name other than ours', SESSIONS_SQL, _sessions_params(names),
                 ownersql.Expect('column_equals', 'n', 0))
     block.check('R1 before: the attached database named source is the recorded live record', ATTACHED_SQL, (names['source'],),
@@ -693,37 +639,14 @@ def retained_branch_sql(names):
     return 'ATTACH DATABASE %s AS %s STORAGEID %s' % (ident(names['retained']), ident(names['source']), names['source_sid'])
 
 
-def retained_resume_sql(names, syntax=None):
-    """R2c: the detached retained record's own ATTACH_SYNTAX with AS <source>, so its record comes back read write under the live name.
-
-    syntax is the ATTACH_SYNTAX read after the DETACH; without it the AT MILESTONE form carries a
-    placeholder for the printed block.
-    """
-    text = str(syntax or '').strip().rstrip(';')
-    m = re.match(r'ATTACH DATABASE `[A-Za-z0-9_]+`( .*)$', text)
-    if m and ' AT MILESTONE ' in text:
-        return 'ATTACH DATABASE %s AS %s%s' % (ident(names['retained']), ident(names['source']), m.group(1))
-    return "ATTACH DATABASE %s AS %s AT MILESTONE '<retained_milestone>' STORAGEID %s COMPUTEID %s" % (
-        ident(names['retained']), ident(names['source']), names['source_sid'], names['retained_cid'])
-
-
 def _r2b_items(block, names):
-    """R2b, then R2c as the fallback: the live name takes a branch of the retained copy, or the retained record itself when a branch is refused."""
+    """R2b: the live name takes a read-write branch of the retained copy."""
     block.check('R2b before: the original record is dropped', RECORD_STATE_SQL, (names['source'], names['source_sid']),
                 ownersql.Expect('column_equals', 'IS_DROPPED', 1))
     block.check('R2b before: the retained name holds the recorded record READONLY', ATTACHED_SQL, (names['retained'],),
                 ownersql.Expect('columns_equal', value={'STORAGE_ID': names['retained_sid'], 'COMPUTE_ID': names['retained_cid'], 'ATTACH_TYPE': 'READONLY'}))
     block.check('R2b before: no attached database named source', ATTACHED_SQL, (names['source'],), ownersql.Expect('no_rows'))
     block.statement(retained_branch_sql(names), 'R2b: attach a read-write branch of the retained copy under the live name')
-    block.note('R2c, only when R2b was refused on the READ ONLY attachment (error %d): the two statements below are skipped while the live '
-               'name is attached. The AT MILESTONE value is the ATTACH_SYNTAX of the retained record after its DETACH; copy it from the '
-               'R2c check row and add AS %s after the name. The retained name then leaves the Portal; its data is under the live name as a '
-               'resume record of it.' % (READ_ONLY_REFUSAL, names['source']))
-    attached_source = (NAME_ATTACHED_COUNT_SQL, (names['source'],))
-    block.statement('DETACH DATABASE %s' % ident(names['retained']), 'R2c: detach the retained name (only after a refused R2b)', skip_if=attached_source)
-    block.check('R2c: the retained record is detached with its ATTACH_SYNTAX, or attached (R2b done)', ALL_RECORDS_SQL, (names['retained'],),
-                ownersql.Expect('some_rows'))
-    block.statement(retained_resume_sql(names), 'R2c: re-attach the retained record read write under the live name', skip_if=attached_source)
     block.check('R2 after: source attached READWRITE on the original storage', ATTACHED_SQL, (names['source'],),
                 ownersql.Expect('columns_equal', value={'STORAGE_ID': names['source_sid'], 'ATTACH_TYPE': 'READWRITE'}))
     block.check('R2 after: the live name holds a record made from the retained copy', NAME_RECORD_SQL, (names['source'],),
@@ -740,7 +663,7 @@ def original_syntax(names):
 
 
 def s1_ran(session, journal, source):
-    """Why S1 of O10 has run, or None; s2rebuild lockout --hold calls it before every pass and ends the hold on it.
+    """Why S1 of O10 has run, or None.
 
     The journal records the S1 DETACH as a switch_statement event (O10 may run in another
     process on the same journal file), and the attachment views show the source name off the
@@ -782,13 +705,10 @@ class SwitchMachine:
     """Executes the switch one statement at a time, each behind its checks, from the live position.
 
     counts is {'tables', 'views', 'pipelines'} from the capture, layout the target layout,
-    open_session(guard) and guard enable the DETACH escalation of S1. check_lockout_pass=False
-    leaves out the Path B last pass check of S1; only the rehearsal, which does not rehearse the
-    lockout, passes it.
+    open_session(guard) and guard enable the DETACH escalation of S1.
     """
 
-    def __init__(self, session, names, journal, log, runner_session=None, counts=None, layout=None, open_session=None, guard=None,
-                 check_lockout_pass=True):
+    def __init__(self, session, names, journal, log, runner_session=None, counts=None, layout=None, open_session=None, guard=None):
         self.session = session
         self.names = names
         self.journal = journal
@@ -798,7 +718,6 @@ class SwitchMachine:
         self.layout = layout
         self.open_session = open_session
         self.guard = guard
-        self.check_lockout_pass = check_lockout_pass
 
     def position(self):
         """The current state name from the attachment views."""
@@ -845,17 +764,13 @@ class SwitchMachine:
             self.names.update(ownersql.record_names(record, self.journal.attachment(record)))
         return live
 
-    def _run(self, sql, label, refusable=False):
-        """Execute one statement and journal it; refusable=True returns False instead of raising when the server refused it as read only."""
+    def _run(self, sql, label):
+        """Execute one statement and journal it."""
         try:
             self.session.execute(sql)
         except KitError:
             raise
         except Exception as exc:  # noqa: BLE001 - a failed statement is reported with the observed position
-            if refusable and read_only_refusal(exc):
-                self.journal.event('switch_statement_refused', '%s: %s %s' % (label, type(exc).__name__, getattr(exc, 'args', ('',))[0]))
-                self.log('    refused %s (error %s); the fallback follows' % (label, getattr(exc, 'args', ('',))[0]))
-                return False
             self.journal.event('switch_statement_failed', '%s: %s %s' % (label, type(exc).__name__, getattr(exc, 'args', ('',))[0]))
             try:
                 where = self.position()
@@ -909,27 +824,21 @@ class SwitchMachine:
                        'out of the run' % (label, sid, role, record_text(recorded), listing_text(entries), listing_text(extra)))
 
     def s1_before(self):
-        """The S1 before-checks, reads only: source on its recorded STORAGE_ID with the attach type of the freeze path, no foreign
-        non-idle session, the S2 and S3 preconditions (preflight); on Path B no write privilege the lockout took held again
-        and, last, the last lockout pass check.
+        """The S1 before-checks, reads only: source READONLY on its recorded STORAGE_ID, no foreign non-idle session, the S2 and
+        S3 preconditions (preflight).
 
         handle_o10 runs these before it records the go decision, so a refusal here issues nothing and leaves the re-copy open
         (Journal.switch_began); s1 runs them again just before the DETACH.
         """
         n = self.names
-        readonly = n.get('freeze_mode', 'readonly') == 'readonly'
         self._expect('S1 before: source attached with the recorded STORAGE_ID', ATTACHED_SQL, (n['source'],), ownersql.Expect('column_equals', 'STORAGE_ID', n['source_sid']))
-        self._expect('S1 before: source attach type', ATTACHED_SQL, (n['source'],), ownersql.Expect('column_equals', 'ATTACH_TYPE', 'READONLY' if readonly else 'READWRITE'))
+        self._expect('S1 before: source attach type', ATTACHED_SQL, (n['source'],), ownersql.Expect('column_equals', 'ATTACH_TYPE', 'READONLY'))
         self._identify('S1 before: the source is the recorded record', n['source'], self._recorded('source'))
         self._expect('S1 before: no foreign non-idle session', SESSIONS_SQL, _sessions_params(n), ownersql.Expect('column_equals', 'n', 0))
         self.preflight()
-        if not readonly and self.check_lockout_pass:
-            for account, scope, sql, params in ownersql.withheld_checks(ownersql.withheld_privileges(self.journal), n['source']):
-                self._expect(withheld_label(account, scope), sql, params, ownersql.Expect('column_equals', 'n', 0))
-            self._last_pass_check()
 
     def s1(self, detach_kill=None):
-        """S1: detach the source after its checks (and the S2 and S3 preconditions); on Path B the last lockout pass check comes last."""
+        """S1: detach the source after its checks (and the S2 and S3 preconditions)."""
         n = self.names
         self.require('S1', NOT_STARTED)
         self.s1_before()
@@ -944,17 +853,6 @@ class SwitchMachine:
         self._expect('S1 after: no attached database named source', ATTACHED_SQL, (n['source'],), ownersql.Expect('no_rows'))
         self._identify('S1 after: the original record is detached with its ATTACH_SYNTAX recorded', n['source'], self._recorded('source'),
                        record='source', IS_DETACHED=1)
-
-    def _last_pass_check(self):
-        """S1 before on Path B: the last lockout pass in the journal was quiet within freeze.quiet_max_age_seconds (lockout.last_pass_problem)."""
-        from . import lockout
-        max_age = int(self.names.get('quiet_max_age_seconds', 60))
-        label = 'S1 before (Path B): the last lockout pass was quiet within %d s' % max_age
-        problem = lockout.last_pass_problem(self.journal, max_age)
-        self.journal.event('switch_check', '%s: %s' % (label, 'FAILED (%s)' % problem if problem else 'ok'))
-        if problem:
-            raise KitError('Switch refused at "%s": %s; nothing was issued' % (label, problem))
-        self.log('    check %s: ok' % label)
 
     def s2(self):
         """S2: attach the original storage read only under the retained name, then its after-checks."""
@@ -1110,8 +1008,7 @@ class SwitchMachine:
         if extra or missing:
             self.journal.event('switch_check', 'gate: FAILED (extra: %s; missing: %s)' % ('; '.join(extra) or 'none', ', '.join(missing) or 'none'))
             raise KitError('Switch gate refused: the workspace should hold two entries, the live record and the retained record. Extra: %s. '
-                           'Missing: %s. Inspect the records before any further statement; C3 (End state) carries the repair block for a switch '
-                           'made without S2b and S4' % ('; '.join(extra) or 'none', ', '.join(missing) or 'none'))
+                           'Missing: %s. Inspect the records before any further statement' % ('; '.join(extra) or 'none', ', '.join(missing) or 'none'))
         self.journal.event('switch_check', 'gate: ok (two entries, the live record and the retained record)')
         self.log('    check gate: ok (two entries, the live record and the retained record)')
 
@@ -1153,9 +1050,8 @@ class SwitchMachine:
         """Before R1: every planned table on the live name holds its journal target_count, and nothing can write to it.
 
         The counts run through the runner session (the owner session when the machine has no
-        runner). Through the owner session: no pipeline Running on the live name, none of the
-        write privileges the lockout took held again (the journal snapshot not given back yet),
-        and the S1 session query on the live name. These live checks refuse even when the journal
+        runner). Through the owner session: no pipeline Running on the live name and the S1
+        session query on the live name. These live checks refuse even when the journal
         does not know that O11 began (a hand or notebook O11). A planned table without a
         target_count cannot be proven. Any difference refuses with the list, before any
         statement; the result is journaled as rollback_proof or rollback_refused. Issues reads only.
@@ -1184,11 +1080,6 @@ class SwitchMachine:
         started = int(running[0]['n']) if running else 0
         if started:
             problems.append('%d pipeline%s Running on the live name' % (started, '' if started == 1 else 's'))
-        for account, scope, sql, params in ownersql.withheld_checks(ownersql.withheld_privileges(self.journal), n['source']):
-            held = _rows(self.session, sql, params)
-            back = int(held[0]['n']) if held else 0
-            if back:
-                problems.append('%s holds %d of the write privileges the lockout took on %s' % (account, back, scope))
         sessions = _rows(self.session, SESSIONS_SQL, _sessions_params(n))
         busy = int(sessions[0]['n']) if sessions else 0
         if busy:
@@ -1198,8 +1089,7 @@ class SwitchMachine:
             raise KitError('Rollback refused before R1: the zero-change proof failed on the live name %s, so the application or O11 may have '
                            'written to it since S3; reconcile first (a new freeze and a reconciliation), then decide. Differences: %s'
                            % (n['source'], '; '.join(problems)))
-        done = ('zero-change proof passed on %d tables; no pipeline Running, no lockout privilege back and no foreign non-idle session '
-                'on the live name' % len(table_counts))
+        done = 'zero-change proof passed on %d tables; no pipeline Running and no foreign non-idle session on the live name' % len(table_counts)
         self.journal.event('rollback_proof', done)
         self.log('    ' + done)
 
@@ -1229,7 +1119,7 @@ class SwitchMachine:
         return original_state(all_records(self.session, self.names['source']), self.names) == 'dropped'
 
     def rollback(self):
-        """R1, then R2a (before S2b ran) or R2b with R2c as the fallback (after S2b) from the live position; returns the position reached.
+        """R1, then R2a (before S2b ran) or R2b (after S2b) from the live position; returns the position reached.
 
         Refused once O11 started releasing writers or application writes were seen. From the
         switched position the zero-change proof runs first; behind S3 (source detached, retained
@@ -1273,95 +1163,13 @@ class SwitchMachine:
                            % (n['source'], record_text(self._recorded('source')), n['retained']))
         return self.position()
 
-    def repair_end_state(self):
-        """C3 repair for a switch made without S2b and S4 (an older kit): the post-switch sequence proven on October 27, 2026.
-
-        Detach the live name (behind its record check), attach the original record by its own
-        syntax, record and row check, DROP it, re-attach the live record by its own syntax, DROP
-        the replacement record behind its record check, then the gate. The live name is detached
-        for about 30 seconds on a 3 TB database (fact 34). Runs through the C3 owner guard.
-
-        Every part is decided from the live state, so a repair that stopped part way resumes: the
-        original attached under the live name continues at the proof, an original already dropped
-        is not attached again, a live record already detached is re-attached, and a replacement
-        already gone is not dropped again. The live name is detached only while the original
-        record still needs its attach by syntax. With the live record attached, the original
-        dropped and the replacement name free, there is nothing to repair: the repair refuses
-        with the listing before any statement.
-        """
-        n = self.names
-        live, original = self._recorded('live'), self._recorded('source')
-        if live is None or original is None:
-            raise KitError('C3 repair refused: the live record or the original record is not recorded in the journal; nothing was issued')
-        held = identify(self.session, n['source']) if _rows(self.session, ATTACHED_SQL, (n['source'],)) else None
-        dropped = self.original_dropped()
-        if held is not None and records_match(live, held) and dropped and not _rows(self.session, ATTACHED_SQL, (n['replacement'],)):
-            entries = listing(self.session, n)
-            self.journal.event('switch_check', 'repair: nothing to repair (%s)' % listing_text(entries))
-            raise KitError('C3 repair refused: nothing to repair, so nothing was issued. The live name holds the live record, the original record '
-                           'is dropped and no database is attached under the replacement name, so the extra entry is not one the repair removes. '
-                           'Find out who attached it. Entries: %s' % listing_text(entries))
-        if not dropped:
-            if held is not None and records_match(original, held):
-                self._identify('repair: the live name holds the original record READWRITE', n['source'], original, ACCESS='READWRITE', IS_DETACHED=0)
-                self.log('    the original record is attached read write under the live name; continuing the repair at the proof')
-            else:
-                if held is not None:
-                    self._identify('repair: the live name holds the recorded live record', n['source'], live, ACCESS='READWRITE')
-                    self._run('DETACH DATABASE %s' % ident(n['source']), 'repair DETACH live')
-                    self._expect('repair: no attached database named source', ATTACHED_SQL, (n['source'],), ownersql.Expect('no_rows'))
-                self._run(self._original_syntax('repair'), 'repair ATTACH original by its ATTACH_SYNTAX')
-                self._identify('repair: the original record is attached READWRITE under the live name', n['source'], original,
-                               ACCESS='READWRITE', IS_DETACHED=0)
-            try:
-                self.s2b_proof()
-            except KitError as exc:
-                raise KitError('C3 repair stopped at the proof, so the original record was not dropped: it stays attached read write under the live '
-                               'name and the live record stays detached. Reconcile, then rerun s2rebuild step C3, which continues at the proof. '
-                               'Differences: %s' % str(exc).split('Differences: ', 1)[-1]) from exc
-            self._run('DROP DATABASE %s' % ident(n['source']), 'repair DROP original record')
-            self._expect('repair: the original record is dropped', RECORD_STATE_SQL, (n['source'], n['source_sid']),
-                         ownersql.Expect('column_equals', 'IS_DROPPED', 1))
-            held = None
-        if held is None:
-            detached = self._identify('repair: the live record is detached with its ATTACH_SYNTAX', n['source'], live, IS_DETACHED=1)
-            syntax = str(detached.get('ATTACH_SYNTAX') or '').strip().rstrip(';')
-            if ' AT MILESTONE ' not in syntax:
-                raise KitError('C3 repair stopped: the detached live record %s shows no AT MILESTONE syntax; attach it by hand from the Portal'
-                               % record_text(detached))
-            self._run(syntax, 'repair ATTACH live record by its ATTACH_SYNTAX')
-            self._identify('repair: the live name holds the live record READWRITE again', n['source'], live, record='live', ACCESS='READWRITE', IS_DETACHED=0)
-        else:
-            self._identify('repair: the live name holds the recorded live record', n['source'], live, ACCESS='READWRITE')
-        self._small_table_check(n['source'], 1)
-        if _rows(self.session, ATTACHED_SQL, (n['replacement'],)):
-            self._identify('repair: the replacement name holds the recorded replacement record', n['replacement'], self._recorded('replacement'),
-                           ACCESS='READWRITE', ATTACH_TYPE='create')
-            self._run('DROP DATABASE %s' % ident(n['replacement']), 'repair DROP replacement')
-            self._expect('repair: the replacement record is dropped', RECORD_STATE_SQL, (n['replacement'], n['replacement_sid']),
-                         ownersql.Expect('column_equals', 'IS_DROPPED', 1))
-        self.gate()
-
     def _rollback_through_retained(self):
-        """R2b: a read-write branch of the retained copy under the live name; R2c when the server refuses it on the READ ONLY attachment."""
+        """R2b: a read-write branch of the retained copy under the live name."""
         n = self.names
         self._identify('R2b before: the retained name holds the recorded record READONLY', n['retained'], self._recorded('retained'), ACCESS='READONLY')
-        if self._run(retained_branch_sql(n), 'R2b ATTACH retained AS source (branch)', refusable=True):
-            how = 'R2b: a read-write pitr branch of the retained copy %s is attached under the live name %s; the retained copy stays attached read only'
-            how %= (n['retained'], n['source'])
-        else:
-            self._identify('R2c before: the retained name still holds the recorded record READONLY', n['retained'], self._recorded('retained'),
-                           ACCESS='READONLY')
-            self._run('DETACH DATABASE %s' % ident(n['retained']), 'R2c DETACH retained')
-            detached = self._identify('R2c: the retained record is detached with its ATTACH_SYNTAX', n['retained'], self._recorded('retained'), IS_DETACHED=1)
-            syntax = retained_resume_sql(n, detached.get('ATTACH_SYNTAX'))
-            if ownersql.placeholders(syntax):
-                raise KitError('Rollback stopped at R2c: the detached retained record %s shows no AT MILESTONE syntax; the live name is free and the '
-                               'retained name is detached. Attach the record by hand from its ATTACH_SYNTAX with AS %s' % (record_text(detached), n['source']))
-            self._run(syntax, 'R2c ATTACH retained record AS source by its ATTACH_SYNTAX')
-            how = ('R2c: the server refused a branch of the READ ONLY retained copy, so its record is attached read write under the live name %s as '
-                   'a resume record; the retained name %s is gone from the attached list (its record is detached) and the data is under the live '
-                   'name' % (n['source'], n['retained']))
+        self._run(retained_branch_sql(n), 'R2b ATTACH retained AS source (branch)')
+        how = 'R2b: a read-write pitr branch of the retained copy %s is attached under the live name %s; the retained copy stays attached read only'
+        how %= (n['retained'], n['source'])
         self._expect('R2 after: source attached READWRITE on the original storage', ATTACHED_SQL, (n['source'],),
                      ownersql.Expect('columns_equal', value={'STORAGE_ID': n['source_sid'], 'ATTACH_TYPE': 'READWRITE'}))
         # the record under the live name is new (a pitr or resume record of the retained copy): the rollback event carries it, and the journal's
@@ -1463,33 +1271,22 @@ def s0_checks(ctx, names, position=NOT_STARTED):
     O9 passed, then s0_journal_problems: O8 passed, freeze_time (step O3 --redo records it after
     a notebook or hand run), and every planned table verified after freeze_time and after its
     last chunk, at its current re-copy epoch; a table without a stamp refuses, it is never left
-    out. Both storage ids recorded. The time check uses the abort deadline (O1 record, else the
-    window) and applies only before S1, and so does the Path B check of the last lockout pass
-    (lockout_pass_problems), which S1 checks again. Reads the journal only.
+    out. Both storage ids recorded. Reads the journal only.
     """
-    from . import copy as copy_module
     journal = ctx.journal
     problems = []
     if journal.step_status('O9') != 'passed':
         problems.append('O9 has not passed')
     problems.extend(s0_journal_problems(journal))
-    problems.extend(lockout_pass_problems(journal, path_b_pass_age(names, position)))
     freeze_time = journal.get_meta('freeze_time')
     verified = [t['verified_at_utc'] for t in journal.tables() if t.get('verified_at_utc')]
     for key in ('source_sid', 'replacement_sid'):
         if not _known(names.get(key)):
             problems.append('%s is not recorded' % key)
-    deadline = copy_module.resolve_abort_at(journal, ctx.config)
-    remaining = None
-    if deadline is not None:
-        remaining = (deadline - utc_now()).total_seconds()
-        if position == NOT_STARTED and remaining < SWITCH_ALLOWANCE_SECONDS:
-            problems.append('less than the %d minute switch allowance remains before the abort deadline %s' % (SWITCH_ALLOWANCE_SECONDS // 60, iso(deadline)))
     if problems:
         raise KitError('S0 refused: ' + '; '.join(problems))
     return ['S0: O8 and O9 passed; every planned table verified after its last chunk at its re-copy epoch; oldest verified_at %s after '
             'freeze_time %s' % (min(verified), freeze_time),
-            'S0: time remaining before the abort deadline: %s' % (('%d min' % (remaining / 60)) if remaining is not None else 'no deadline recorded'),
             'S0: position %s; live name %s, retained %s, replacement %s' % (position, names['source'], names['retained'], names['replacement'])]
 
 
@@ -1507,8 +1304,8 @@ def record_replacement(ctx, session, refresh=False):
     """Record the replacement's attached record (identify) when the journal has none; returns the storage id or None.
 
     refresh=True (O5, right after it created or verified the replacement) also records the live record when the
-    journal holds another one: a replacement dropped and created again (an abandon, or a failed rehearsal whose
-    cleanup dropped it) leaves a stale record that O10 would refuse (live P5, October 28, 2026).
+    journal holds another one: a replacement dropped and created again (an abandon) leaves a stale record that O10
+    would refuse (October 28, 2026).
     """
     current = ctx.journal.attachment('replacement')
     if current and current.get('storage_id') and not refresh:
@@ -1521,42 +1318,18 @@ def record_replacement(ctx, session, refresh=False):
     return live['STORAGE_ID']
 
 
-def path_b_pass_age(names, position):
-    """freeze.quiet_max_age_seconds when S1 is still ahead on Path B (the last lockout pass decides it), else None."""
-    if names.get('freeze_mode', 'readonly') == 'readonly' or position != NOT_STARTED:
-        return None
-    return int(names.get('quiet_max_age_seconds', 60))
-
-
-def lockout_pass_problems(journal, max_age_seconds):
-    """[the Path B last lockout pass problem] while S1 is ahead (max_age_seconds from path_b_pass_age), else []. Reads the journal only.
-
-    The same check as SwitchMachine._last_pass_check, made in S0 and in the go transaction, so an
-    O10 that would refuse at S1 for a missing, stale or not quiet pass refuses before the go is
-    recorded and the re-copy stays open (Journal.switch_began). Behind S1 (a re-entry after the
-    DETACH, when the hold has ended) it does not apply.
-    """
-    if max_age_seconds is None:
-        return []
-    from . import lockout
-    problem = lockout.last_pass_problem(journal, max_age_seconds)
-    return ['S1 before (Path B): the last lockout pass was not quiet within %d s: %s' % (max_age_seconds, problem)] if problem else []
-
-
-def go_problems(journal, lockout_max_age_seconds=None):
+def go_problems(journal):
     """What refuses the go decision as it is recorded; Journal.record_go reads it in the transaction that writes switch_go.
 
     O6, O7 or O8 running (another process started it after S0), O9 not passed, then
-    s0_journal_problems, and on Path B before S1 the last lockout pass (lockout_pass_problems with
-    lockout_max_age_seconds from path_b_pass_age). So a re-copy marked, a fresh-table load or a
-    verification cleared while the operator typed the live name refuses the go with nothing
-    issued, and so does a lockout pass that went stale or found work meanwhile. Reads the journal only.
+    s0_journal_problems. So a re-copy marked, a fresh-table load or a verification cleared while
+    the operator typed the live name refuses the go with nothing issued. Reads the journal only.
     """
     problems = ['%s is running (another process started it after S0)' % step_id
                 for step_id in steps.AFTER_SWITCH_REFUSED if journal.step_status(step_id) == 'running']
     if journal.step_status('O9') != 'passed':
         problems.append('O9 has not passed')
-    return problems + s0_journal_problems(journal) + lockout_pass_problems(journal, lockout_max_age_seconds)
+    return problems + s0_journal_problems(journal)
 
 
 def handle_o10(step, ctx):
@@ -1569,7 +1342,7 @@ def handle_o10(step, ctx):
     waits for the typed name and switches. The go decision is recorded by Journal.record_go,
     which reads go_problems in the same transaction, so a re-copy that reached the journal while
     the operator typed refuses the go with nothing issued. Every refusal that issues nothing comes
-    before the go: S0 (on Path B with the last lockout pass), the S1 before-checks of the machine
+    before the go: S0, the S1 before-checks of the machine
     (s1_before, live reads) just before record_go, and go_problems inside it; so such a refusal
     leaves the re-copy open, and the machine checks S1 again before its DETACH.
     """
@@ -1589,7 +1362,7 @@ def _o10(step, ctx):
     names = ownersql.names_for(ctx)
     counts = ownersql.expected_counts(ctx)
     inputs = ownersql.block_inputs(ctx)
-    block = ownersql.block_for('O10', names, ctx.config, **inputs)  # the forward block, with the Path B privilege checks
+    block = ownersql.block_for('O10', names, ctx.config, **inputs)  # the forward block
     ownersql.guard_check_block(block, ctx)
     ownersql.print_block(block, ctx, ownersql.owner_sql_path(ctx, 'O10'))
     ownersql.print_block(ownersql.block_for('O10', names, ctx.config, rollback=True, **inputs), ctx, ownersql.owner_sql_path(ctx, 'O10', rollback=True))
@@ -1636,11 +1409,9 @@ def _o10(step, ctx):
                 machine.s1_before()
             elif not ctx.journal.switch_began():
                 ctx.journal.event('switch_observed', 'O10 read the position "%s" from the attachment views before the go' % position)
-        # S0's journal part again, in the transaction that records the go: the operator may have typed for minutes; on Path B the last
-        # lockout pass too while S1 is ahead
-        age = path_b_pass_age(names, position)
+        # S0's journal part again, in the transaction that records the go: the operator may have typed for minutes
         ctx.journal.record_go('go recorded for live name %s at position %s%s' % (names['source'], position, ' (--yes)' if ctx.yes else ' (typed)'),
-                              lambda journal: go_problems(journal, age))
+                              go_problems)
         machine.forward()
     finally:
         owner.close()

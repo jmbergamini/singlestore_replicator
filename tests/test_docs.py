@@ -3,14 +3,13 @@
 Author: John Bergamini
 """
 import importlib.util
-import io
 import re
 import tempfile
 import unittest
 from pathlib import Path
 
 from s2rebuild import cli, config, steps
-from tests.helpers import ROOT, run_cli
+from tests.helpers import ROOT
 
 DOCS = ROOT / 'docs'
 
@@ -39,23 +38,17 @@ def schema_keys(node=config.SCHEMA, prefix=''):
 
 
 def flag_table():
-    """{command: set of flags} from the docs-flags output."""
-    code, text = run_cli(['docs-flags'])
-    table = {}
-    for line in text.splitlines():
-        m = re.match(r'\| (\S+) \| `([^` ]+)', line)
-        if m:
-            table.setdefault(m.group(1), set()).add(m.group(2))
+    """{command: set of flags} from the parser; '(global)' holds the global flags."""
+    import argparse
+    parser = cli.build_parser()
+    table = {'(global)': {s for a in parser._actions for s in a.option_strings}}  # noqa: SLF001
+    subparsers = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction))  # noqa: SLF001
+    for name, sub in subparsers.choices.items():
+        table[name] = {s for a in sub._actions for s in a.option_strings}  # noqa: SLF001
     return table
 
 
 class DocsTests(unittest.TestCase):
-    def test_config_md_holds_the_docs_flags_output_exactly(self):
-        code, text = run_cli(['docs-flags'])
-        self.assertEqual(code, 0)
-        block = read('docs/CONFIG.md').split('<!-- docs-flags:start -->\n', 1)[1].split('\n<!-- docs-flags:end -->', 1)[0]
-        self.assertEqual(block.strip(), text.strip())
-
     def test_every_configuration_key_is_documented(self):
         documented = set(re.findall(r'^\| `([^`]+)` \|', read('docs/CONFIG.md'), re.M))
         missing = sorted(k for k in schema_keys() if k not in documented)
