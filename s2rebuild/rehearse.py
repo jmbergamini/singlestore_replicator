@@ -338,9 +338,11 @@ def kill_sigkill(spec, plans, journal, connector, log, copy_config, wait_seconds
         pid = proc.pid
 
         def alive():
+            """True while the spawned copy process runs."""
             return proc.is_alive()
 
         def reap():
+            """Wait for the spawned copy process to end."""
             proc.join()
     else:
         pid = os.fork()
@@ -352,10 +354,12 @@ def kill_sigkill(spec, plans, journal, connector, log, copy_config, wait_seconds
                 os._exit(0)
 
         def alive():
+            """True while the forked copy process runs."""
             done, _ = os.waitpid(pid, os.WNOHANG)
             return not done
 
         def reap():
+            """Wait for the forked copy process to end."""
             try:
                 os.waitpid(pid, 0)
             except ChildProcessError:
