@@ -461,7 +461,10 @@ class FakeCursor:
             row = next((r for r in db.routines_of(rdb) if r['ROUTINE_NAME'] == name and r['ROUTINE_TYPE'] in wanted), None)
             if row is None:
                 raise db.error(1305, kind=kind, name='%s.%s' % (rdb, name))
-            self.rows = [{kind.capitalize(): name, 'Create %s' % kind.capitalize(): routine_definition(row)}]
+            # the columns of engine 10.8.0: FUNCTION and PROCEDURE put sql_mode before the text, AGGREGATE does not
+            head = {kind.capitalize(): name} if kind == 'AGGREGATE' else {kind.capitalize(): name, 'sql_mode': 'STRICT_ALL_TABLES,NO_AUTO_CREATE_USER'}
+            self.rows = [dict(head, **{'Create %s' % kind.capitalize(): routine_definition(row), 'character_set_client': 'utf8mb4',
+                                       'collation_connection': 'utf8mb4_general_ci'})]
             return
         m = re.match(r"CREATE (?:OR REPLACE )?(?:DEFINER ?= ?(`[^`]*`|'[^']*')@(`[^`]*`|'[^']*') )?(FUNCTION|AGGREGATE|PROCEDURE) `([^`]+)`\.`([^`]+)` ?\((.*)$", s)
         if m:

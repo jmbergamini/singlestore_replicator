@@ -195,12 +195,20 @@ def _first_value(row):
 
 
 def _text(rows, what):
+    """The definition column of a SHOW CREATE row: 'Create Function', 'Create Procedure' or 'Create Aggregate' by name.
+
+    Engine 10.8.0 answers SHOW CREATE FUNCTION and PROCEDURE with sql_mode before the text
+    (Function, sql_mode, Create Function, character_set_client, collation_connection) and SHOW
+    CREATE AGGREGATE without it, so the column is found by its name, never by its position.
+    """
     if not rows:
         raise KitError('%s returned nothing; capture again with the owner profile' % what)
     row = rows[0]
     if isinstance(row, dict):
-        values = list(row.values())
-        return str(values[1] if len(values) > 1 else values[0])
+        key = next((k for k in row if str(k).lower().startswith('create ')), None)
+        if key is None or row[key] is None:
+            raise KitError('%s returned no definition column (columns: %s); capture again with the owner profile' % (what, ', '.join(map(str, row))))
+        return str(row[key])
     return str(row[1] if len(row) > 1 else row[0])
 
 
