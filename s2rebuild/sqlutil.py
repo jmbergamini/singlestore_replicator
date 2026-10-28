@@ -25,7 +25,7 @@ RUNNER_KINDS = frozenset({'CREATE DATABASE', 'CREATE TABLE', 'INSERT', 'DELETE',
 OWNER_KINDS = frozenset({'STOP PIPELINE', 'START PIPELINE', 'CREATE PIPELINE', 'ALTER PIPELINE',
                          'DROP PIPELINE', 'DETACH DATABASE', 'ATTACH DATABASE', 'GRANT', 'REVOKE',
                          'KILL CONNECTION', 'KILL QUERY', 'CREATE USER', 'DROP USER', 'DROP DATABASE', 'SET GLOBAL',
-                         'USE', 'CREATE FUNCTION', 'CREATE AGGREGATE', 'CREATE PROCEDURE'})
+                         'USE', 'CREATE FUNCTION', 'CREATE AGGREGATE', 'CREATE PROCEDURE', 'CREATE PROJECTION'})
 ALL_KINDS = READ_KINDS | RUNNER_KINDS | OWNER_KINDS
 # a routine text: CREATE [OR REPLACE] [DEFINER=...] FUNCTION | AGGREGATE | PROCEDURE `db`.`name`( ...; the body of a function or
 # procedure holds semicolons inside BEGIN ... END, the one place the kit accepts them (classify)
@@ -222,6 +222,14 @@ def classify(sql):
                + _QUAL + r'(?: |$)', text)
     if m:
         return Statement('CREATE VIEW', (m.group(1),), m.group(2), text)
+    # CREATE PROJECTION resolves its table against the current database (1046 without one, fact 45): the captured text names the
+    # table unqualified after a USE of the replacement; a FROM qualified with a database is a write to that database
+    m = _match(r'CREATE PROJECTION (?:IF NOT EXISTS )?' + _BT + r' ?\(', text)
+    if m:
+        frm = re.search(r'\bFROM\s+(?:' + _BT + r'\.)?' + _BT + r'\s*$', strip_literals(text), re.I)
+        if not frm:
+            raise GuardError('Refusing CREATE PROJECTION that does not end with FROM `table`')
+        return Statement('CREATE PROJECTION', (frm.group(1),) if frm.group(1) else (), m.group(1), text)
     # ALL runs the sync on every aggregator; without it only the aggregator of the session syncs
     m = _match(r'AGGREGATOR SYNC AUTO_INCREMENT ON ' + _QUAL + r'( ALL)?$', text)
     if m:

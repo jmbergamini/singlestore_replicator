@@ -412,8 +412,8 @@ class SampleDatabaseTests(unittest.TestCase):
         expected = [r for r in h.fake.rows(SRC, 't_single') if evaluate_predicate('CRC32(`id`) MOD 100 < 10', r)]
         self.assertEqual(multiset(h.fake.rows('sample_db', 't_single')), multiset(expected))
         self.assertTrue(0 < len(expected) < 700)
-        self.assertIn('sample sample_db built from %s at 10 percent: 4 tables (3 sampled by CRC32 of the key, 1 whole), 0 of 0 views, 0 of 0 routines; '
-                      'views and routines need the owner profile' % SRC, text)
+        self.assertIn('sample sample_db built from %s at 10 percent: 4 tables (3 sampled by CRC32 of the key, 1 whole), 0 of 0 views, 0 of 0 routines, '
+                      '0 of 0 projections; views and routines need the owner profile' % SRC, text)
         self.assertIn('    t_single: %d rows (sampled)' % len(expected), text)
         code, text = run_cli(['sample-database', SRC, 'sample_two', '--percent', '10', '--tables', 't_comp'] + base, env=h.env)
         self.assertEqual(code, EXIT_DONE, text)

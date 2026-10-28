@@ -475,13 +475,13 @@ def placeholders(text):
 
 
 def expected_counts(ctx):
-    """{'tables', 'views', 'pipelines', 'routines'} the live name must show after S3, from the newest capture; None without one.
+    """{'tables', 'views', 'pipelines', 'routines', 'projections'} the live name must show after S3, from the newest capture; None without one.
 
     The pipeline count is None when no pipeline capture exists (no owner profile yet); the
     routine count is the ROUTINES row count the O7 gate recorded for the replacement
-    (routines.expected_count), None when no gate recorded one.
+    (routines.expected_count), None when no gate recorded one; the projection count likewise (projections.expected_count).
     """
-    from . import copy as copy_module, pipelines, routines
+    from . import copy as copy_module, pipelines, projections, routines
     try:
         data = copy_module.load_plans(ctx)[0]
     except KitError:
@@ -489,7 +489,7 @@ def expected_counts(ctx):
     cap = pipelines.capture_for(ctx)
     return {'tables': len(data.get('tables') or []), 'views': len(data.get('views') or []),
             'pipelines': len(pipelines.expected_items(cap['items'])) if cap['exists'] else None,
-            'routines': routines.expected_count(ctx.journal)}
+            'routines': routines.expected_count(ctx.journal), 'projections': projections.expected_count(ctx.journal)}
 
 
 def block_inputs(ctx):

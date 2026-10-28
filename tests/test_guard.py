@@ -398,6 +398,7 @@ ALLOWANCES = {
     'transform.py': set(),
     'verify.py': set(),
     'postcopy.py': set(),
+    'projections.py': {'attach'},  # the docstring: ATTACH ... AS carries the projections to the live name (fact 45); no ATTACH statement
     'routines.py': {'pipeline'},  # the load target refusal (a pipeline INTO PROCEDURE whose procedure the replacement will not hold)
     'watch.py': {'pipeline', 'drop', 'truncate', 'grant'},     # PIPELINES state query, the write regex (DROP, TRUNCATE), grantee lookup
     'workspace.py': set(),  # the Management API read (P2) and the O1 workspace guard; no statement

@@ -76,9 +76,10 @@ TABLE_COUNT_SQL = "SELECT COUNT(*) AS n FROM information_schema.TABLES WHERE TAB
 VIEW_COUNT_SQL = 'SELECT COUNT(*) AS n FROM information_schema.VIEWS WHERE TABLE_SCHEMA = %s'
 PIPELINE_COUNT_SQL = 'SELECT COUNT(*) AS n FROM information_schema.PIPELINES WHERE DATABASE_NAME = %s'
 ROUTINE_COUNT_SQL = 'SELECT COUNT(*) AS n FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA = %s'
-# the S3 after-checks of the capture counts: (label, query, counts key); the routine count is the one the O7 gate recorded
+PROJECTION_COUNT_SQL = 'SELECT COUNT(*) AS n FROM information_schema.PROJECTIONS WHERE PROJECTION_SCHEMA = %s'
+# the S3 after-checks of the capture counts: (label, query, counts key); the routine and projection counts are the ones the O7 gate recorded
 COUNT_CHECKS = (('tables', TABLE_COUNT_SQL, 'tables'), ('views', VIEW_COUNT_SQL, 'views'), ('pipelines', PIPELINE_COUNT_SQL, 'pipelines'),
-                ('routines', ROUTINE_COUNT_SQL, 'routines'))
+                ('routines', ROUTINE_COUNT_SQL, 'routines'), ('projections', PROJECTION_COUNT_SQL, 'projections'))
 RUNNING_PIPELINES_SQL = "SELECT COUNT(*) AS n FROM information_schema.PIPELINES WHERE DATABASE_NAME = %s AND STATE = 'Running'"
 SWITCH_ALLOWANCE_SECONDS = 10 * 60
 

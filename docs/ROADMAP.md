@@ -12,7 +12,7 @@ Purpose: enhancements to pick up after release 1.0. Not in scope for the release
 | R3 | Performance test and a workers study: whether 16 to 32 workers raise throughput or the target partition count and storage writes set the limit | Needs the 1.0 baseline from the full run of the live ladder (I5); `copy.workers` accepts up to 32 and `estimate.scale_up_cap` gives no credit above the baseline until the test says more | M (test), S (code) |
 | R4 | Transform hook build-out: shard key, sort key, index add and drop, storage type, renames and exclusions | Decided per customer; the hook and config keys exist (`transform.py`, `databases[].target.transforms`) | L |
 | R5 | Range chunking on a sort-key prefix with segment elimination for multi-billion-row tables | Hash buckets scan the whole table per chunk; the sampled fingerprint of O8 already uses a sort-key range | L |
-| R6 | Projections: capture and recreate after the table is full | Not present in the test databases yet | M |
+| R6 | Projections: capture and recreate after the table is full | BUILT in I5 (`projections.py`) | M |
 | R7 | LINK objects: capture the definition with a credentials placeholder, recreate before O9 | Same handover model as pipelines | M |
 | R8 | Path B rework: run-level grant snapshot, global restores at the last O11, MV_PROCESSLIST sampling, hold loop inside `run`, rehearsal of Path B | Path A is the default; Path B stays single database; the rehearsal freezes with Path A | L |
 | R9 | Evidence validity as one design: every row records run id, storage ids, config hash, freeze time, epoch; one function invalidates dependents | The re-copy epoch, the configuration hash and the record checks cover the known cases | L |

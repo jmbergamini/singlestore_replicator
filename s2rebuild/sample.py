@@ -22,13 +22,13 @@ CREATE PROCEDURE; and the reads of the capture.
 import dataclasses
 
 from . import copy as copy_module
-from . import inventory, postcopy, routines
+from . import inventory, postcopy, projections, routines
 from .common import KitError
 from .sqlutil import Guard, RUNNER_KINDS, ident, owner_guard, qualified, read_guard
 
 PERCENT_MIN, PERCENT_MAX = 1, 100
 SAMPLED, WHOLE = 'sampled', 'whole'
-OWNER_KINDS = ('USE', 'CREATE VIEW', 'CREATE FUNCTION', 'CREATE AGGREGATE', 'CREATE PROCEDURE')
+OWNER_KINDS = ('USE', 'CREATE VIEW', 'CREATE FUNCTION', 'CREATE AGGREGATE', 'CREATE PROCEDURE', 'CREATE PROJECTION')
 
 
 def check_percent(percent):
@@ -176,8 +176,9 @@ def build(open_runner, open_owner, source, name, percent, config, log, tables=No
         runner.close()
     views = data.get('views') or []
     captured_routines = data.get('routines') or [] if data.get('routines_captured') else []
-    created_views, created_routines, ignored = [], [], []
-    if open_owner is not None and (views or captured_routines):
+    captured_projections = data.get('projections') or [] if data.get('projections_captured') else []
+    created_views, created_routines, created_projections, ignored = [], [], [], []
+    if open_owner is not None and (views or captured_routines or captured_projections):
         owner = open_owner(owner_sample_guard(name))
         try:
             if views:
@@ -187,6 +188,7 @@ def build(open_runner, open_owner, source, name, percent, config, log, tables=No
                 log('    routines ignored by %s in the sample: %s' % (routines.IGNORE_KEY, ', '.join(ignored)))
             if keep:
                 created_routines = routines.create(owner, name, keep, None, log, config.runner.user, step='sample')
+            created_projections = projections.create(owner, name, captured_projections, None, log, step='sample')
         finally:
             owner.close()
     elif views or captured_routines:
@@ -194,14 +196,17 @@ def build(open_runner, open_owner, source, name, percent, config, log, tables=No
     return {'source': source, 'name': name, 'percent': percent, 'tables': len(plans), 'rows': rows, 'sampled': sampled, 'whole': whole,
             'views': len(created_views), 'views_captured': len(views), 'routines': len(created_routines),
             'routines_captured': len(captured_routines), 'routines_ignored': ignored, 'read_only': read_only,
+            'projections': len(created_projections), 'projections_captured': len(captured_projections),
             'owner': open_owner is not None, 'layout': {'partitions': layout['NUM_PARTITIONS'], 'sub_partitions': layout['NUM_SUB_PARTITIONS']}}
 
 
 def summary_lines(summary):
     """The lines the command prints after build: the counts, then the rows per table."""
-    lines = ['sample %s built from %s at %d percent: %d tables (%d sampled by CRC32 of the key, %d whole), %d of %d views, %d of %d routines%s'
+    lines = ['sample %s built from %s at %d percent: %d tables (%d sampled by CRC32 of the key, %d whole), %d of %d views, %d of %d routines, '
+             '%d of %d projections%s'
              % (summary['name'], summary['source'], summary['percent'], summary['tables'], len(summary['sampled']), len(summary['whole']),
                 summary['views'], summary['views_captured'], summary['routines'], summary['routines_captured'],
+                summary.get('projections', 0), summary.get('projections_captured', 0),
                 '' if summary['owner'] else '; views and routines need the owner profile')]
     for name in sorted(summary['rows']):
         lines.append('    %s: %d rows (%s)' % (name, summary['rows'][name], SAMPLED if name in summary['sampled'] else WHOLE))

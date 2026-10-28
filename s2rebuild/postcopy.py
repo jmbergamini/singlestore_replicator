@@ -29,7 +29,7 @@ import json
 import re
 
 from . import copy as copy_module
-from . import estimate, inventory, ownersql, report_md, report_xlsx, routines, steps, verify
+from . import estimate, inventory, ownersql, projections, report_md, report_xlsx, routines, steps, verify
 from .common import EXIT_GATE, EXIT_INCOMPLETE, EXIT_MISMATCH, EXIT_REFUSED, KitError
 from .sqlutil import ident, qualified, read_guard, runner_guard, strip_literals, strip_quoted
 
@@ -410,7 +410,7 @@ def handle_o7(step, ctx):
     if named:
         return steps.Outcome(steps.REFUSED, 'view(s) %s name the source database %s in their definition; no view statement was issued. Edit each '
                              'definition in the capture so it names no database, then rerun O7' % (', '.join(named), ctx.db.source), EXIT_REFUSED)
-    refusal = routines.refuse_source_names(data, ctx.config, ctx.db, routines.O7_KINDS)
+    refusal = routines.refuse_source_names(data, ctx.config, ctx.db, routines.O7_KINDS) or projections.refuse(data)
     if refusal:
         return steps.Outcome(steps.REFUSED, refusal, EXIT_REFUSED)
     guard = runner_guard(ctx.db.replacement, 'runner O7')
@@ -419,6 +419,7 @@ def handle_o7(step, ctx):
         if ctx.dry_run:
             place_views(ctx, views, session)
             routines.place(ctx, data, routines.O7_KINDS, 'O7')
+            projections.place(ctx, data, 'O7')
             for t in data['tables']:
                 if (t.get('auto_increment') or {}).get('column'):
                     session.query(max_count_sql(ctx.db.replacement, t['name'], t['auto_increment']['column']))
@@ -467,11 +468,16 @@ def handle_o7(step, ctx):
             reopen_copy_step(ctx.journal, recopies, ctx.log)
         # the one counter pass, after the last re-copy round, so every counter follows the rows now in the replacement
         set_counters(session, ctx.db.replacement, data['tables'], ctx.journal, ctx.log)
+        # the projections last, each built once over its full table; the gate records the PROJECTIONS count for S3
+        outcome = projections.place(ctx, data, 'O7')
+        if outcome is not None:
+            return outcome
         if missing:
             return steps.Outcome(steps.PENDING, 'stale check 0 mismatches after %d re-copy round(s), counters set; view(s) %s not created: no owner '
                                  'profile. Run the O7 block in %s as the admin, then rerun O7 (s2rebuild step O7); the rerun finds the views and passes'
                                  % (recopies, ', '.join(missing), ownersql.owner_sql_path(ctx, 'O7')), EXIT_GATE)
-        return steps.Outcome(steps.PASSED, 'views created, stale check 0 mismatches after %d re-copy round(s), counters set' % recopies)
+        return steps.Outcome(steps.PASSED, 'views created, stale check 0 mismatches after %d re-copy round(s), counters set, %s' % (
+            recopies, projections.summary(data)))
     finally:
         session.close()
 

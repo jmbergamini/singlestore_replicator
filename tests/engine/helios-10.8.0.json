@@ -385,6 +385,14 @@
       "IS_SETTABLE_AT_STARTUP",
       "IS_SETTABLE_AT_RUNTIME",
       "IS_PER_SITE"
+    ],
+    "PROJECTIONS": [
+      "PROJECTION_SCHEMA",
+      "PROJECTION_NAME",
+      "BASE_TABLE_NAME",
+      "CREATE_TIME",
+      "CREATE_USER",
+      "STATUS"
     ]
   },
   "warnings": [

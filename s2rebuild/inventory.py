@@ -26,7 +26,7 @@ import re
 import time
 from pathlib import Path
 
-from . import estimate, routines, steps
+from . import estimate, projections, routines, steps
 from .common import KitError, iso, utc_now
 from .sqlutil import ident, qualified, strip_literals
 
@@ -438,13 +438,15 @@ def capture(session, db, config, owner_session=None, exact_counts=False, log=Non
     if owner_session is not None:
         captured = routines.capture(owner_session, name)
         routines_note = '%d routines captured with the owner profile' % len(captured)
+        captured_projections = projections.capture(owner_session, name)
     else:
-        captured, routines_note = [], ROUTINES_NOT_CAPTURED
+        captured, routines_note, captured_projections = [], ROUTINES_NOT_CAPTURED, []
     inventory = {
         'kit': 's2rebuild', 'version': 1, 'database': name, 'captured_utc': iso(now), 'step': step,
         'layout': {k: _int(v) for k, v in layout.items()}, 'attachment': attachment,
         'tables': tables, 'views': views, 'routines': captured,
         'routines_captured': owner_session is not None, 'routines_note': routines_note,
+        'projections': captured_projections, 'projections_captured': owner_session is not None,
         'accounts': _write_accounts(owner_session if owner_session is not None else session, name, protected),
         'sessions': _sessions(session, name, samples, sleep),
         'size_gib_total': round(sum(t['size_gib'] or 0.0 for t in tables), 3),
@@ -460,9 +462,9 @@ def capture(session, db, config, owner_session=None, exact_counts=False, log=Non
         inventory['pipelines'] = {'captured': False, 'items': [],
                                   'note': 'pipelines not captured: no owner profile; the O9 gate cannot pass without a capture'}
     if log is not None:
-        log('inventory of %s: %d tables (%d reference, counted exactly), %d views, %s, %d write-capable accounts, %s' % (
-            name, len(tables), sum(1 for t in tables if t['reference']), len(views), routines_note, len(inventory['accounts']),
-            inventory['pipelines']['note']))
+        log('inventory of %s: %d tables (%d reference, counted exactly), %d views, %s, %s, %d write-capable accounts, %s' % (
+            name, len(tables), sum(1 for t in tables if t['reference']), len(views), routines_note, projections.summary(inventory),
+            len(inventory['accounts']), inventory['pipelines']['note']))
     return inventory
 
 
@@ -481,6 +483,8 @@ def write(inventory, directory, plans=None):
     for r in inventory.get('routines') or []:
         if r.get('definition'):
             _write_private(directory / DEFINITIONS_DIR / routines.DEFINITIONS_SUBDIR / routines.file_name(r), r['definition'] + '\n')
+    for pr in inventory.get('projections') or []:
+        _write_private(directory / DEFINITIONS_DIR / projections.DEFINITIONS_SUBDIR / projections.file_name(pr), pr['definition'] + '\n')
     plans = plans if plans is not None else []
     by_name = {p.name: p for p in plans}
     with (directory / TABLES_CSV).open('w', newline='', encoding='utf8') as fh:

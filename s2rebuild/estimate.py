@@ -21,7 +21,7 @@ import sqlite3
 from pathlib import Path
 
 from .common import KitError, auto_table_limit, format_duration, iso, parse_utc, utc_now
-from . import routines
+from . import projections, routines
 from .journal import read_only_uri
 
 DEFAULT_SCAN_S_PER_ROW = 7.62e-8
@@ -673,6 +673,7 @@ def plan_sheet(config, db, run_id, inventory, est, fit, rehearsal=None, env=None
                                                      ' (Path B would revoke these on every database)' if config.freeze.mode == 'lockout' else ''))
     refusals = routines.pipeline_target_refusals(config, db, inventory or {})
     lines.append('Routines   %s' % '; '.join([routines.summary(config, db, inventory or {})] + ['REFUSED: ' + r for r in refusals]))
+    lines.append('Projections %s (created at O7)' % projections.summary(inventory or {}))
     lines.extend(workspace_module.plan_lines(workspace))
     lines.append('Rehearsal  %s' % (rehearsal or 'none recorded'))
     if config.closeout.retain_days < 90:

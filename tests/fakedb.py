@@ -64,6 +64,13 @@ error 1227 (refuse_other_definer); an aggregate whose INITIALIZE, ITERATE, MERGE
 function is missing is error 1305, as is a load target INTO PROCEDURE that does not exist; a
 body reading a table or view that does not exist is error 1146. A text that carries a
 WITH STATE RECORD(...) clause is stored as any other.
+
+Projections live in the content of their database too (projections_of(name)), so ATTACH ... AS
+carries them to the branch (fact 45). information_schema.PROJECTIONS lists them, a READ ONLY
+attachment included, with STATUS Sync; SHOW CREATE PROJECTION <name> FOR TABLE `db`.`table`
+answers the stored text, whose FROM names the table unqualified. CREATE PROJECTION without a
+current database is error 1046, as on Helios; on a table the current database does not hold it
+is 1146.
 """
 import datetime as dt
 import json
@@ -156,7 +163,8 @@ def copy_content(content):
     return {'layout': dict(content['layout']),
             'tables': {k: {'create': v['create'], 'rows': [dict(r) for r in v['rows']], 'auto_increment': v.get('auto_increment')}
                        for k, v in content['tables'].items()},
-            'views': dict(content['views']), 'routines': [dict(r) for r in content.get('routines', [])]}
+            'views': dict(content['views']), 'routines': [dict(r) for r in content.get('routines', [])],
+            'projections': [dict(r) for r in content.get('projections', [])]}
 
 
 ROUTINE_KINDS = ('FUNCTION', 'AGGREGATE', 'PROCEDURE')
@@ -459,6 +467,32 @@ class FakeCursor:
         if m:
             db.writes.append(s)
             self._create_routine(s, *m.groups())
+            return
+        if s.startswith('SELECT PROJECTION_NAME, BASE_TABLE_NAME, STATUS FROM information_schema.PROJECTIONS WHERE PROJECTION_SCHEMA = %s'):
+            self.rows = [{'PROJECTION_NAME': r['name'], 'BASE_TABLE_NAME': r['table'], 'STATUS': 'Sync'}
+                         for r in sorted(db.projections_of(args[0]), key=lambda r: (r['table'], r['name']))]
+            return
+        if s == 'SELECT COUNT(*) AS n FROM information_schema.PROJECTIONS WHERE PROJECTION_SCHEMA = %s':
+            self.rows = [{'n': len(db.projections_of(args[0]))}]
+            return
+        m = re.match(r'SHOW CREATE PROJECTION `([^`]+)` FOR TABLE `([^`]+)`\.`([^`]+)`$', s)
+        if m:
+            name, pdb, table = m.groups()
+            row = next((r for r in db.projections_of(pdb) if r['name'] == name and r['table'] == table), None)
+            if row is None:
+                raise FakeDisconnect(1146, "Projection '%s' doesn't exist" % name)
+            self.rows = [{'Projection': name, 'Create Projection': row['definition']}]
+            return
+        m = re.match(r'CREATE PROJECTION `([^`]+)` ?\(.*\bFROM `([^`]+)`$', s, re.S)
+        if m:
+            db.writes.append(s)
+            current = self.conn.current_db
+            if current is None:
+                raise FakeDisconnect(1046, 'No database selected')
+            content = db.databases.get(current)
+            if content is None or m.group(2) not in content['tables']:
+                raise FakeDisconnect(1146, "Table '%s.%s' doesn't exist" % (current, m.group(2)))
+            content.setdefault('projections', []).append({'name': m.group(1), 'table': m.group(2), 'definition': s})
             return
         if s == 'SELECT PRIVILEGE_TYPE FROM information_schema.USER_PRIVILEGES WHERE GRANTEE = %s':
             self.rows = [{'PRIVILEGE_TYPE': r['PRIVILEGE_TYPE']} for r in db.privileges if r['GRANTEE'] == args[0] and self._sees_grantee(r['GRANTEE'])]
@@ -1356,6 +1390,13 @@ class FakeDB:
         if content is None:
             return []
         return content.setdefault('routines', [])
+
+    def projections_of(self, name):
+        """The projection rows of a database's content ({'name', 'table', 'definition'}); empty for an unknown name."""
+        content = self.databases.get(name)
+        if content is None:
+            return []
+        return content.setdefault('projections', [])
 
     @property
     def routines(self):

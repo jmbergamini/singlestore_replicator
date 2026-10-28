@@ -40,7 +40,7 @@ Status per item: Yes (migrated since the first release), Built (new in the relea
 | Vector index | Yes | Carried by LIKE; set B proves it (I3) | |
 | AUTO_INCREMENT counter, sharded table | Yes | `AGGREGATOR SYNC AUTO_INCREMENT ... ALL`; ALTER is refused (1749) and skipped | |
 | AUTO_INCREMENT counter, reference or rowstore | Yes | ALTER to the larger of source counter and MAX+1, then sync | |
-| Projections | No | Not captured | Recreate after O10 on the live name; planned as roadmap item R6 |
+| Projections | Yes | Captured at P3 and O4 with the owner session, created at O7 over the full tables, gate on the definition, counted at S3 | Built in I5 (R6) |
 
 ## Views
 
