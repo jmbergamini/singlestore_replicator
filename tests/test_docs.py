@@ -57,7 +57,7 @@ class DocsTests(unittest.TestCase):
     def test_every_command_and_flag_in_the_documents_exists(self):
         flags = flag_table()
         known = set(cli.COMMAND_NAMES)
-        for name in ('README.md', 'docs/STEPS.md', 'docs/CONFIG.md', 'docs/CODE-GUIDE.md'):
+        for name in ('README.md', 'AGENTS.md', 'docs/STEPS.md', 'docs/CONFIG.md', 'docs/CODE-GUIDE.md'):
             for m in re.finditer(r'`s2rebuild ([a-z-]+)([^`]*)`', read(name)):
                 command, rest = m.group(1), m.group(2)
                 self.assertIn(command, known, '%s names an unknown command %s' % (name, command))

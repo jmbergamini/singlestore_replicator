@@ -146,6 +146,7 @@ What the Portal shows during the window: from O3 the source is listed as attache
 
 ## Documents
 
+- [AGENTS.md](AGENTS.md): the instructions for a coding agent that runs the kit for an operator. Agents that read `AGENTS.md` pick it up by themselves; for an agent that reads another file name, add a file of that name with one line that points to `AGENTS.md`.
 - [docs/STEPS.md](docs/STEPS.md): every step in full.
 - [docs/CONFIG.md](docs/CONFIG.md): every key, flag, variable and exit code.
 - [docs/COVERAGE.md](docs/COVERAGE.md): the coverage grid, what the kit migrates and what it does not.

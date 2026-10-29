@@ -11,7 +11,7 @@ from tests.helpers import ROOT
 
 # The kit's static tree as of this milestone. M5 widens the scan to the whole folder minus
 # customer/ and the patterns in customer/bundle-exclude.txt, once the history folders have moved.
-STATIC_PATHS = ['s2rebuild', 'tests', 'examples', 'docs', 'certs', 'notebooks', 'pyproject.toml', 'README.md', 'requirements.txt']
+STATIC_PATHS = ['s2rebuild', 'tests', 'examples', 'docs', 'certs', 'notebooks', 'pyproject.toml', 'README.md', 'AGENTS.md', 'requirements.txt']
 TEXT_SUFFIXES = {'.py', '.md', '.yaml', '.yml', '.toml', '.txt', '.sh', '.sql', '.json', '.mmd', '.svg', '.ipynb',
                  '.cfg', '.ini', '.pem', '.csv', ''}
 SKIP_DIRS = {'__pycache__', '.pytest_cache', 's2rebuild.egg-info'}
