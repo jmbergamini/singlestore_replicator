@@ -16,7 +16,8 @@ Read these first, in this order: `README.md`, `docs/STEPS.md` (every step: input
 6. Never delete the retained copy. Only the customer does that, after its retain-until date, with `s2rebuild cleanup --delete NAME`, typing the name at the prompt themselves.
 7. A gate that records a person's decision (P1, P4, the O1 go, an admin step run by hand) is recorded only with the operator's own words in `--note`. Never pass `--yes` to O10 or answer the typed-name prompt for the operator.
 8. Never edit the journal, the files under `customer/runs/`, or the captures. Edit `customer/config.yaml` only as the operator asks.
-9. Keep the Mac awake and on power. The kit starts `caffeinate -i` for every `s2rebuild run` and `s2rebuild step`; for the waits between commands, ask the operator to run `caffeinate -i` in a second terminal for the whole night.
+9. After the workspace is resumed, ask the operator to flush the Mac's resolver cache in their own terminal before P2 and O1: `sudo dscacheutil -flushcache && sudo killall -HUP mDNSResponder`. It needs their password; never ask for it or type it.
+10. Keep the Mac awake and on power. The kit starts `caffeinate -i` for every `s2rebuild run` and `s2rebuild step`; for the waits between commands, ask the operator to run `caffeinate -i` in a second terminal for the whole night.
 
 ## Setup
 
