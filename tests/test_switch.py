@@ -60,10 +60,18 @@ def machine_for(h, runner=True, **kw):
     return switch.SwitchMachine(owner, names, h.journal, h.log, reader, counts, h.db.layout, **kw), names
 
 
+COPIED_BEFORE_THE_STAMPS = '2026-10-31T00:00:00Z'
+
+
 def ready_for_s0(h):
-    """Mark O7 to O9 passed, record freeze_time, a matching count row per table at its re-copy epoch (as O8 does) and verified_at after it."""
+    """Mark O7 to O9 passed, record freeze_time, a matching count row per table at its re-copy epoch (as O8 does) and verified_at after it.
+
+    The harness copies at the wall clock, and the stamps below are fixed. Every finished chunk
+    is given a fixed end before them, so the result does not depend on the day the suite runs.
+    """
     for step_id in ('O7', 'O8', 'O9'):
         h.journal.step_end(step_id, 'passed', 'test')
+    h.journal.conn.execute('UPDATE chunks SET ended_utc = ? WHERE ended_utc IS NOT NULL', (COPIED_BEFORE_THE_STAMPS,))
     h.journal.set_meta('freeze_time', '2026-11-01T05:10:00Z')
     for t in h.journal.tables():
         h.journal.record_verification(t['table_name'], 'count', 'match', t['target_count'], t['target_count'])

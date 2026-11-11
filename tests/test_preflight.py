@@ -5,7 +5,7 @@ Author: John Bergamini
 import json
 import unittest
 
-from s2rebuild import steps
+from s2rebuild import report_xlsx, steps
 from s2rebuild.common import EXIT_DONE
 from tests.fakedb import FakeDisconnect, SimulatedCrash
 from tests.helpers import FAULT_POINTS, ROOT, crash_journal, run_cli, write_config
@@ -156,6 +156,34 @@ class ReportTests(unittest.TestCase):
         self.assertTrue((reports / 'final.xlsx').is_file())
         self.assertTrue((reports / 'run-report.md').is_file())
         self.assertEqual(steps.unmet_preconditions(steps.REGISTRY['C3'], h.journal), [])
+
+    def test_the_run_report_follows_c2_c3_and_c4(self):
+        """The report on disk shows C2 passed, never running, and is written again when C3 and C4 are gated, by hand or by account-sql.
+        A gate before C2 passed writes nothing, and a gate on another step leaves the report as it is."""
+        h = Harness(self)
+        self.assertEqual(p2(h).status, steps.PASSED, h.text())
+        self.ready(h)
+        report = h.tmp / 'runs' / h.run_id / SRC / 'reports' / 'run-report.md'
+        self.assertIsNone(report_xlsx.refresh_reports(h.ctx(), 'C3'), 'C2 has not passed')
+        self.assertFalse(report.exists())
+        self.assertEqual(h.step('C2', redo=True).status, steps.PASSED, h.text())
+        text = report.read_text(encoding='utf8')
+        self.assertIn('- C2: passed', text)
+        self.assertNotIn('- C2: running', text)
+        self.assertNotIn('- C3:', text)
+        self.assertIn('- Steps not passed: none', text)
+        h.journal.record_gate('C3', True, 'two entries, write on the retained name refused')
+        self.assertIsNone(report_xlsx.refresh_reports(h.ctx(), 'O11'), 'only C2 to C4 write the reports again')
+        self.assertNotIn('- C3:', report.read_text(encoding='utf8'))
+        self.assertEqual(report_xlsx.refresh_reports(h.ctx(), 'C3'), report)
+        self.assertIn('- C3: passed', report.read_text(encoding='utf8'))
+        base = ['--config', str(h.config_path), '--run', h.run_id]
+        code, out = run_cli(['gate', 'C4', '--pass', '--note', 'DROP USER done, zero privileges remain'] + base, env=h.env)
+        self.assertEqual(code, EXIT_DONE, out)
+        text = report.read_text(encoding='utf8')
+        for step_id in ('C2', 'C3', 'C4'):
+            self.assertIn('- %s: passed' % step_id, text)
+        self.assertIn('gate C4 pass: DROP USER done, zero privileges remain', text)
 
 
 if __name__ == '__main__':

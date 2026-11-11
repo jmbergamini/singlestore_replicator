@@ -565,6 +565,7 @@ def cmd_gate(args, env, out, state):
         steps.record_gate(inv.journals, step.id, bool(args.passed), args.note, evidence, override=args.override)
         log('gate %s recorded as %s for run %s, database(s) %s: %s%s' % (
             step.id, verdict, inv.run_id, targets, args.note, (' (evidence %s)' % evidence) if evidence else ''))
+        _refresh_reports(inv, step.id, log)
         return EXIT_DONE
     finally:
         inv.close()
@@ -1177,6 +1178,15 @@ def _record_c4(inv, results, log):
         inv.config.runner.user, observed.get('runner account still has privileges', 'not read'), observed.get('zero privileges remain', 'not read'))
     steps.record_gate(inv.journals, 'C4', True, note)
     log('gate C4 recorded as PASS for run %s, database(s) %s: %s' % (inv.run_id, ', '.join(inv.journals), note))
+    _refresh_reports(inv, 'C4', log)
+
+
+def _refresh_reports(inv, step_id, log):
+    """After a gate on C2, C3 or C4: write the final workbook and the run report again for every selected database (report_xlsx.refresh_reports)."""
+    if step_id not in report_xlsx.REPORT_STEPS:
+        return
+    for db in inv.databases:
+        report_xlsx.refresh_reports(_step_context(inv, db, log), step_id)
 
 
 def _runner_password(inv, db, owner, log):

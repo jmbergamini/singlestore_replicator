@@ -732,18 +732,56 @@ def record_retain_until(ctx):
     return until
 
 
+# The close-out steps after which both reports are written again (refresh_reports).
+REPORT_STEPS = ('C2', 'C3', 'C4')
+
+
+def _write_reports(ctx, data, plans):
+    """Write final.xlsx and run-report.md from the journal as it stands; returns both paths."""
+    from . import report_md
+    reports = ctx.config.runs_dir() / ctx.run_id / ctx.db.source / 'reports'
+    xlsx = write_final_workbook(reports / 'final.xlsx', data, plans, ctx.journal, ctx.config, ctx.db, ctx.run_id, ctx.options.get('env') or {})
+    md = report_md.write_run_report(reports / 'run-report.md', data, plans, ctx.journal, ctx.config, ctx.db, ctx.run_id)
+    return xlsx, md
+
+
 def handle_c2(step, ctx):
-    """C2 handler: retain_until_utc, then the final workbook and the Markdown run report."""
-    from . import copy as copy_module, report_md
+    """C2 handler: retain_until_utc, then the final workbook and the Markdown run report.
+
+    The handler writes both files while C2 is still running; run_step writes them again once the
+    result is journaled (refresh_reports), so the report on disk shows C2 passed.
+    """
+    from . import copy as copy_module
     data, plans, _ = copy_module.load_plans(ctx)
     reports = ctx.config.runs_dir() / ctx.run_id / ctx.db.source / 'reports'
     if ctx.dry_run:
         return steps.Outcome(steps.PASSED, 'dry run: final.xlsx and run-report.md would be written to %s' % reports)
     record_retain_until(ctx)
-    xlsx = write_final_workbook(reports / 'final.xlsx', data, plans, ctx.journal, ctx.config, ctx.db, ctx.run_id, ctx.options.get('env') or {})
-    md = report_md.write_run_report(reports / 'run-report.md', data, plans, ctx.journal, ctx.config, ctx.db, ctx.run_id)
+    xlsx, md = _write_reports(ctx, data, plans)
     ctx.log('final workbook %s and run report %s written' % (xlsx, md))
     return steps.Outcome(steps.PASSED, 'reports written')
+
+
+def refresh_reports(ctx, step_id):
+    """Write both reports again after C2, C3 or C4 ends or is gated, so they show the close-out as recorded.
+
+    C2 writes the reports while its own row still says running, and C3 and C4 come after it, so
+    without this the final report stops at "C2 running" and never shows C3 or C4. Nothing is
+    written in a dry run or before C2 has passed. The step is already journaled when this runs:
+    a failure here is logged with the command that writes the reports again and changes nothing
+    else. Returns the run report path, or None. Statements issued: none.
+    """
+    if step_id not in REPORT_STEPS or ctx.dry_run or ctx.journal.step_status('C2') != 'passed':
+        return None
+    from . import copy as copy_module
+    try:
+        data, plans, _ = copy_module.load_plans(ctx)
+        xlsx, md = _write_reports(ctx, data, plans)
+    except Exception as exc:  # noqa: BLE001 - the step result stands; the report command writes the files again
+        ctx.log('    the reports were not written again after %s (%s); run s2rebuild report%s' % (step_id, exc, steps.run_flag(ctx.run_id)))
+        return None
+    ctx.log('    final workbook %s and run report %s written again after %s' % (xlsx, md, step_id))
+    return md
 
 
 steps.register('C2', handle_c2)

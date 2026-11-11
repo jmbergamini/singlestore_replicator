@@ -6,6 +6,7 @@ import importlib.util
 import re
 import tempfile
 import unittest
+import zlib
 from pathlib import Path
 
 from s2rebuild import cli, config, steps
@@ -35,6 +36,15 @@ def schema_keys(node=config.SCHEMA, prefix=''):
             yield from schema_keys(value.schema, path + '.')
         else:
             yield path
+
+
+def pdf_streams(data):
+    """The streams of a guide PDF, decompressed, in file order: the flow diagram and every page.
+
+    Two zlib builds compress the same page to different bytes, so the committed guide is compared
+    by what its streams hold, not by the bytes of the file.
+    """
+    return [zlib.decompress(body) for body in re.findall(rb'\nstream\n(.*?)\nendstream', data, re.S)]
 
 
 def flag_table():
@@ -104,7 +114,9 @@ class DocsTests(unittest.TestCase):
         self.assertGreaterEqual(data.count(b'/Type /Page '), 4)
         self.assertIn(b'/Subtype /Image', data)
         self.assertIn(b'(SingleStore Database Rebuild Kit: step guide)', data)
-        self.assertEqual(data, (DOCS / 's2rebuild-guide.pdf').read_bytes(), 'rebuild the guide: python docs/build_pdf.py')
+        streams = pdf_streams(data)
+        self.assertGreaterEqual(len(streams), 5, 'the flow diagram and at least four pages')
+        self.assertEqual(streams, pdf_streams((DOCS / 's2rebuild-guide.pdf').read_bytes()), 'rebuild the guide: python docs/build_pdf.py')
 
 
 if __name__ == '__main__':

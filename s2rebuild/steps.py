@@ -637,6 +637,9 @@ def run_step(step, ctx, redo=False):
         recorded = {PASSED: 'passed', PENDING: 'pending', FAILED: 'failed', REFUSED: 'pending', STUB: 'pending',
                     INCOMPLETE: 'pending', MISMATCH: 'failed'}[outcome.status]
         journal.step_end(step.id, recorded, outcome.note)
+        if step.id in ('C2', 'C3', 'C4'):
+            from . import report_xlsx  # imported here: report_xlsx imports this module
+            report_xlsx.refresh_reports(ctx, step.id)
     return outcome
 
 

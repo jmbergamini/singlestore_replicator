@@ -86,7 +86,7 @@ Each table below lists a key with its type, default, range, the steps that read 
 | `copy.max_lock_waits` | integer | `10` | 1 and up | O6 | lock waits of one chunk in a run; then it fails with the fresh-table command |
 | `copy.max_consecutive_failures` | integer | `6` | 1 to 100 | O6 | the circuit breaker: this many chunk failures with no success between them (lock waits not counted) stop new chunks; the running ones finish. Then the pass runs one retry round: every chunk left, the failed ones last in their table and each no sooner than 20 minutes after its failure (Helios fact 12). A breaker in the retry round ends O6 INCOMPLETE (exit 2) with "chunks are failing in a row; nodes may be restarting, see MV_EVENTS; rerun with --retry-failed when the workspace is steady" |
 | `copy.progress_seconds` | integer | `60` | 1 and up | O6 | progress line interval |
-| `copy.slow_chunk_minutes` | integer | `30` | 1 and up | O6 | the progress line names every chunk running longer than this (`slow=table/bucket minutes`); the read timeout stays as it is |
+| `copy.slow_chunk_minutes` | integer | `30` | 1 and up | O6 | the progress line names every chunk running longer than this (`slow=table/bucket minutes`); set it above the normal chunk time of the largest table (a chunk of 135 M rows took 33 to 43 minutes in the 3 TB validation run); the read timeout stays as it is |
 
 ## verify
 

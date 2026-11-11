@@ -24,6 +24,9 @@ Purpose: enhancements to pick up after release 1.0. Not in scope for the release
 | R15 | Terminal dashboard (`watch --tui`) with Textual | R2 covers the need if the Streamlit view is built | S |
 | R16 | Multi-workspace runs and a system profile across workspaces | One workspace per config today | M |
 | R17 | `sample-database` as a standalone tool for customers to build test copies | Built for P5 in 1.0 (`s2rebuild sample-database SOURCE NAME --percent P`, with `--tables`); the remainder is the customer-facing options: pipelines, a target workspace, a size cap | S |
+| R18 | Slow-chunk flag against the median chunk time of the same table, not one fixed number of minutes | `copy.slow_chunk_minutes` set above the normal chunk time of the largest table covers it (STEPS, O6) | S |
+| R19 | An idle-workload decision recorded at P4, so C1 passes on a database with no application without waiting for a note | Only test runs meet it; `gate C1 --pass --override NOTE` records it today | S |
+| R20 | C4 deletes the Keychain item the kit created for the runner password | C4 prints the note to delete it; the account it opened is dropped | S |
 
 ## E1 Copy progress bar (O6), roadmap R1
 
