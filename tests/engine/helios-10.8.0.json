@@ -1,0 +1,543 @@
+{
+  "engine_version": "10.8.0",
+  "captured": "2026-10-28T00:28:56Z",
+  "seeded": null,
+  "views": {
+    "TABLES": [
+      "TABLE_CATALOG",
+      "TABLE_SCHEMA",
+      "TABLE_NAME",
+      "TABLE_TYPE",
+      "ENGINE",
+      "VERSION",
+      "ROW_FORMAT",
+      "TABLE_ROWS",
+      "AVG_ROW_LENGTH",
+      "DATA_LENGTH",
+      "MAX_DATA_LENGTH",
+      "INDEX_LENGTH",
+      "DATA_FREE",
+      "AUTO_INCREMENT",
+      "CREATE_TIME",
+      "UPDATE_TIME",
+      "CHECK_TIME",
+      "TABLE_COLLATION",
+      "CHECKSUM",
+      "CREATE_OPTIONS",
+      "TABLE_COMMENT",
+      "DISTRIBUTED",
+      "STORAGE_TYPE",
+      "ALTER_TIME",
+      "CREATE_USER",
+      "ALTER_USER",
+      "FLAGS"
+    ],
+    "COLUMNS": [
+      "TABLE_CATALOG",
+      "TABLE_SCHEMA",
+      "TABLE_NAME",
+      "COLUMN_NAME",
+      "ORDINAL_POSITION",
+      "COLUMN_DEFAULT",
+      "IS_NULLABLE",
+      "IS_SPARSE",
+      "DATA_TYPE",
+      "CHARACTER_MAXIMUM_LENGTH",
+      "CHARACTER_OCTET_LENGTH",
+      "NUMERIC_PRECISION",
+      "NUMERIC_SCALE",
+      "CHARACTER_SET_NAME",
+      "COLLATION_NAME",
+      "COLUMN_TYPE",
+      "COLUMN_KEY",
+      "EXTRA",
+      "PRIVILEGES",
+      "COLUMN_COMMENT",
+      "DATETIME_PRECISION",
+      "GENERATION_EXPRESSION"
+    ],
+    "STATISTICS": [
+      "TABLE_CATALOG",
+      "TABLE_SCHEMA",
+      "TABLE_NAME",
+      "NON_UNIQUE",
+      "INDEX_SCHEMA",
+      "INDEX_NAME",
+      "SEQ_IN_INDEX",
+      "COLUMN_NAME",
+      "COLLATION",
+      "CARDINALITY",
+      "SUB_PART",
+      "PACKED",
+      "NULLABLE",
+      "INDEX_TYPE",
+      "COMMENT",
+      "INDEX_COMMENT",
+      "INDEX_OPTIONS"
+    ],
+    "TABLE_STATISTICS": [
+      "DATABASE_NAME",
+      "TABLE_NAME",
+      "ORDINAL",
+      "HOST",
+      "PORT",
+      "NODE_TYPE",
+      "PARTITION_TYPE",
+      "ROWS",
+      "MEMORY_USE",
+      "STORAGE_TYPE",
+      "ROWS_IN_MEMORY",
+      "STORAGE_ID",
+      "COMPUTE_ID"
+    ],
+    "MV_COLUMNSTORE_FILES": [
+      "DATABASE_NAME",
+      "TABLE_NAME",
+      "FILE_TYPE",
+      "FILE",
+      "HOST",
+      "PORT",
+      "NODE_ID",
+      "PARTITION",
+      "SIZE",
+      "CREATION_TIME",
+      "LSN",
+      "TERM",
+      "CHECKSUM",
+      "STORAGE_ID",
+      "COMPUTE_ID",
+      "BLOB_COMPUTE_ID"
+    ],
+    "ROUTINES": [
+      "SPECIFIC_NAME",
+      "ROUTINE_CATALOG",
+      "ROUTINE_SCHEMA",
+      "ROUTINE_NAME",
+      "ROUTINE_TYPE",
+      "DATA_TYPE",
+      "CHARACTER_MAXIMUM_LENGTH",
+      "CHARACTER_OCTET_LENGTH",
+      "NUMERIC_PRECISION",
+      "NUMERIC_SCALE",
+      "CHARACTER_SET_NAME",
+      "COLLATION_NAME",
+      "DTD_IDENTIFIER",
+      "ROUTINE_BODY",
+      "ROUTINE_DEFINITION",
+      "EXTERNAL_NAME",
+      "EXTERNAL_LANGUAGE",
+      "PARAMETER_STYLE",
+      "IS_DETERMINISTIC",
+      "SQL_DATA_ACCESS",
+      "SQL_PATH",
+      "SECURITY_TYPE",
+      "CREATED",
+      "LAST_ALTERED",
+      "SQL_MODE",
+      "ROUTINE_COMMENT",
+      "DEFINER",
+      "CHARACTER_SET_CLIENT",
+      "COLLATION_CONNECTION",
+      "DATABASE_COLLATION",
+      "ROUTINE_LIFETIME",
+      "DATETIME_PRECISION",
+      "EXTERNAL_PROTOCOL_VERSION"
+    ],
+    "VIEWS": [
+      "TABLE_CATALOG",
+      "TABLE_SCHEMA",
+      "TABLE_NAME",
+      "VIEW_DEFINITION",
+      "CHECK_OPTION",
+      "IS_UPDATABLE",
+      "DEFINER",
+      "SECURITY_TYPE",
+      "CHARACTER_SET_CLIENT",
+      "COLLATION_CONNECTION",
+      "FLAGS"
+    ],
+    "USER_PRIVILEGES": [
+      "GRANTEE",
+      "TABLE_CATALOG",
+      "PRIVILEGE_TYPE",
+      "IS_GRANTABLE"
+    ],
+    "SCHEMA_PRIVILEGES": [
+      "GRANTEE",
+      "TABLE_CATALOG",
+      "TABLE_SCHEMA",
+      "PRIVILEGE_TYPE",
+      "IS_GRANTABLE"
+    ],
+    "TABLE_PRIVILEGES": [
+      "GRANTEE",
+      "TABLE_CATALOG",
+      "TABLE_SCHEMA",
+      "TABLE_NAME",
+      "PRIVILEGE_TYPE",
+      "IS_GRANTABLE"
+    ],
+    "PROCESSLIST": [
+      "ID",
+      "USER",
+      "HOST",
+      "DB",
+      "COMMAND",
+      "TIME",
+      "STATE",
+      "INFO",
+      "FUNCTION_NAME",
+      "RPC_INFO",
+      "PLAN_ID",
+      "TRANSACTION_STATE",
+      "ROW_LOCKS_HELD",
+      "PARTITION_LOCKS_HELD",
+      "EPOCH",
+      "LWPID",
+      "RESOURCE_POOL",
+      "DRAINING",
+      "STMT_VERSION",
+      "REASON_FOR_QUEUEING",
+      "DAC_CONNECTION",
+      "IP_ADDRESS"
+    ],
+    "MV_PROCESSLIST": [
+      "NODE_ID",
+      "ID",
+      "USER",
+      "HOST",
+      "DB",
+      "COMMAND",
+      "TIME",
+      "STATE",
+      "INFO",
+      "FUNCTION_NAME",
+      "RPC_INFO",
+      "PLAN_ID",
+      "TRANSACTION_STATE",
+      "ROW_LOCKS_HELD",
+      "PARTITION_LOCKS_HELD",
+      "EPOCH",
+      "LWPID",
+      "RESOURCE_POOL",
+      "DRAINING",
+      "STMT_VERSION",
+      "REASON_FOR_QUEUEING",
+      "DAC_CONNECTION",
+      "IP_ADDRESS"
+    ],
+    "PIPELINES": [
+      "DATABASE_NAME",
+      "PIPELINE_ID",
+      "PIPELINE_NAME",
+      "CONFIG_JSON",
+      "STATE",
+      "SKIPPED_BATCH_PARTITIONS",
+      "CREATE_TIME",
+      "ALTER_TIME",
+      "CREATE_USER",
+      "ALTER_USER"
+    ],
+    "PIPELINES_OFFSETS": [
+      "DATABASE_NAME",
+      "PIPELINE_NAME",
+      "SOURCE_TYPE",
+      "SOURCE_PARTITION_ID",
+      "EARLIEST_OFFSET",
+      "LATEST_OFFSET",
+      "LATEST_LOADED_OFFSET",
+      "LATEST_SUCCESSFUL_OFFSET",
+      "LATEST_EXPECTED_OFFSET",
+      "UPDATED_UNIX_TIMESTAMP",
+      "EXTRA_FIELDS"
+    ],
+    "PIPELINES_BATCHES_SUMMARY": [
+      "DATABASE_NAME",
+      "PIPELINE_NAME",
+      "BATCH_ID",
+      "ROWS_INSERTED",
+      "ROWS_UPDATED",
+      "ROWS_DELETED",
+      "BATCH_STATE",
+      "START_TIME",
+      "BATCH_TIME",
+      "ROWS_PER_SEC",
+      "ROWS_STREAMED",
+      "NUM_PARTITIONS",
+      "NUM_PARTITIONS_FINISHED",
+      "MB_STREAMED",
+      "MB_PER_SEC",
+      "EXTRACTOR_WAIT_TIME",
+      "TRANSFORM_WAIT_TIME",
+      "ANY_VALUE(SOURCE_OFFSETS_POLLED)"
+    ],
+    "PIPELINES_ERRORS": [
+      "DATABASE_NAME",
+      "PIPELINE_NAME",
+      "ERROR_UNIX_TIMESTAMP",
+      "ERROR_TYPE",
+      "ERROR_CODE",
+      "ERROR_MESSAGE",
+      "ERROR_KIND",
+      "STD_ERROR",
+      "LOAD_DATA_LINE",
+      "LOAD_DATA_LINE_NUMBER",
+      "BATCH_ID",
+      "ERROR_ID",
+      "BATCH_SOURCE_PARTITION_ID",
+      "BATCH_EARLIEST_OFFSET",
+      "BATCH_LATEST_OFFSET",
+      "HOST",
+      "PORT",
+      "PARTITION"
+    ],
+    "MV_CLOUD_ATTACHED_DATABASES": [
+      "DATABASE_NAME",
+      "SITE_NAME",
+      "ATTACH_TYPE",
+      "STORAGE_ID",
+      "COMPUTE_ID",
+      "ATTACH_SYNTAX",
+      "ATTACH_MEMO"
+    ],
+    "MV_CLOUD_BRANCHES": [
+      "ROW_NUMBER",
+      "STORAGE_ID",
+      "WORKSPACE_GROUP_ID",
+      "DATABASE_NAME",
+      "REGION",
+      "LATEST_COMPUTE_ID",
+      "ATTACH_TYPE",
+      "PREV_ROW_NUMBER",
+      "PREV_COMPUTE_ID",
+      "PREV_WORKSPACE_GROUP_ID",
+      "PREV_DATABASE_NAME",
+      "PREV_REGION",
+      "OLDEST_VERSION",
+      "END_VERSION",
+      "LATEST_VERSION_LOWER_BOUND",
+      "OLDEST_UNIX_TIMESTAMP",
+      "END_UNIX_TIMESTAMP",
+      "LATEST_UNIX_TIMESTAMP_LOWER_BOUND",
+      "LATEST_ATTACH_TIME",
+      "ATTACH_SOURCE_TIME",
+      "IS_DETACHED",
+      "IS_ATTACHED_TO_THIS_COMPUTE",
+      "IS_DROPPED",
+      "IS_ATTACHABLE",
+      "ATTACH_SYNTAX",
+      "ATTACH_MEMO",
+      "BRANCH_COMPUTE_HISTORY"
+    ],
+    "DISTRIBUTED_DATABASES": [
+      "DATABASE_ID",
+      "DATABASE_NAME",
+      "NUM_PARTITIONS",
+      "NUM_SUB_PARTITIONS",
+      "CLUSTER_ID",
+      "REMOTE_NAME",
+      "IS_SYNC",
+      "IS_SYNC_DURABILITY",
+      "IS_PAUSED",
+      "SITE_ID",
+      "IS_SYNC_DURABILITY_ON_REF_DB_ONLY",
+      "STORAGE_ID",
+      "COMPUTE_ID",
+      "SAFE_TS",
+      "LIMITS_TABLES",
+      "LIMITS_PIPELINES",
+      "LIMITS_SIZE",
+      "LIMITS_FUNCTIONS",
+      "LIMITS_AGGREGATES",
+      "LIMITS_LINKS",
+      "IS_DISTRIBUTION_TREE_WORKSPACE_AWARE",
+      "IS_CROSS_CLUSTER_DATABASE"
+    ],
+    "MV_NODES": [
+      "ID",
+      "IP_ADDR",
+      "PORT",
+      "EXTERNAL_HOST",
+      "EXTERNAL_PORT",
+      "TYPE",
+      "STATE",
+      "AVAILABILITY_GROUP",
+      "NUM_CPUS",
+      "MAX_MEMORY_MB",
+      "MAX_TABLE_MEMORY_MB",
+      "MEMORY_USED_MB",
+      "TABLE_MEMORY_USED_MB",
+      "TOTAL_DATA_DISK_MB",
+      "AVAILABLE_DATA_DISK_MB",
+      "UPTIME",
+      "VERSION"
+    ],
+    "MV_EVENTS": [
+      "ORIGIN_NODE_ID",
+      "EVENT_TIME",
+      "SEVERITY",
+      "EVENT_TYPE",
+      "DETAILS"
+    ],
+    "GLOBAL_VARIABLES": [
+      "VARIABLE_NAME",
+      "VARIABLE_VALUE",
+      "IS_SETTABLE_AT_STARTUP",
+      "IS_SETTABLE_AT_RUNTIME",
+      "IS_PER_SITE"
+    ],
+    "PROJECTIONS": [
+      "PROJECTION_SCHEMA",
+      "PROJECTION_NAME",
+      "BASE_TABLE_NAME",
+      "CREATE_TIME",
+      "CREATE_USER",
+      "STATUS"
+    ]
+  },
+  "warnings": [
+    "SHOW AGGREGATES listed nothing in the fixture database; its columns are not captured"
+  ],
+  "show_aggregates": {
+    "columns": null,
+    "note": "captured in the fixture database with --fixture-database NAME"
+  },
+  "password_variables": {
+    "names_known": [
+      "PASSWORD_EXPIRATION_MODE",
+      "PASSWORD_MAX_CONSEC_REPEAT_CHARS",
+      "PASSWORD_MAX_CONSEC_SEQUENTIAL_CHARS",
+      "PASSWORD_MIN_LENGTH",
+      "PASSWORD_MIN_LOWERCASE_CHARS",
+      "PASSWORD_MIN_NUMERIC_CHARS",
+      "PASSWORD_MIN_SPECIAL_CHARS",
+      "PASSWORD_MIN_UPPERCASE_CHARS"
+    ],
+    "values": {
+      "PASSWORD_EXPIRATION_MODE": "NO_ACCESS",
+      "PASSWORD_MIN_LENGTH": "14",
+      "PASSWORD_MIN_UPPERCASE_CHARS": "1",
+      "PASSWORD_MIN_LOWERCASE_CHARS": "1",
+      "PASSWORD_MIN_NUMERIC_CHARS": "1",
+      "PASSWORD_MIN_SPECIAL_CHARS": "1",
+      "PASSWORD_MAX_CONSEC_SEQUENTIAL_CHARS": "2",
+      "PASSWORD_MAX_CONSEC_REPEAT_CHARS": "3"
+    },
+    "note": "GLOBAL_VARIABLES PASSWORD_% holds the workspace password policy (fact 20); the values are per workspace"
+  },
+  "runner_versus_owner": {
+    "fixture_database": "<fixture database>",
+    "ROUTINES": {
+      "runner": 0,
+      "owner": 0
+    },
+    "PIPELINES": {
+      "runner": 0,
+      "owner": 0
+    },
+    "note": "facts 10 and 21: an account without routine or pipeline privileges sees no rows in ROUTINES or PIPELINES; the owner sees them all"
+  },
+  "attach": {
+    "types": [
+      "create",
+      "resume",
+      "pitr"
+    ],
+    "syntax_forms": {
+      "attached": "ATTACH DATABASE `<name>` STORAGEID <storage_id> COMPUTEID <compute_id>",
+      "detached": "ATTACH DATABASE `<name>` AT MILESTONE '<YYYY-MM-DD HH_MM_SS.ffffff>' STORAGEID <storage_id> COMPUTEID <compute_id>",
+      "dropped": "ATTACH DROPPED DATABASE `<name>` STORAGEID <storage_id> COMPUTEID <compute_id>"
+    },
+    "read_only_position": "READ ONLY follows the names and comes before AT MILESTONE, STORAGEID and COMPUTEID; after STORAGEID it is error 1064",
+    "storage_id_pattern": "^[0-9]+:[0-9]+$",
+    "compute_id_pattern": "^[0-9]+:[0-9]+$",
+    "note": "ATTACH ... AS from a detached record adds a resume row and leaves the old row detached; from an attached database it adds a pitr row with a new COMPUTE_ID and leaves the old row attached; a detached record re-attaches by its own ATTACH_SYNTAX; ROW_NUMBER is not stable between listings"
+  },
+  "errors": {
+    "1064": {
+      "when": "a wrong ATTACH form: a quoted STORAGEID, or READ ONLY after STORAGEID",
+      "message": "You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near 'READ ONLY' at line 1",
+      "source": "fake, from the live run of October 26, 2026"
+    },
+    "1144": {
+      "when": "CREATE USER with a password that misses the workspace password policy (PASSWORD_% variables)",
+      "message": "The password does not satisfy the password policy",
+      "source": "kit wording from fact 20; confirm the text live"
+    },
+    "1205": {
+      "when": "an INSERT or DELETE waits past lock_wait_timeout on a leaf table lock",
+      "message": "Lock wait timeout exceeded; try restarting transaction",
+      "source": "fake"
+    },
+    "1227": {
+      "when": "CREATE VIEW with a DEFINER other than the executing account",
+      "message": "Access denied; you need (at least one of) the SUPER privilege(s) for this operation",
+      "source": "fake, from the live run of October 27, 2026"
+    },
+    "1290": {
+      "when": "a write on a READ ONLY attachment (the O3 write probe expects it)",
+      "message": "The database is attached read only",
+      "source": "fake"
+    },
+    "1305": {
+      "when": "CREATE AGGREGATE naming a function that does not exist yet, a load target INTO PROCEDURE that does not exist, or SHOW CREATE of a routine the database does not hold (routines are created in dependency order)",
+      "message": "<kind> <name> does not exist",
+      "source": "kit wording from the MySQL number; confirm the number and text live"
+    },
+    "1836": {
+      "when": "a write on a READ ONLY attachment, the second number the server uses for it",
+      "message": "Running in read-only mode",
+      "source": "kit wording; freeze.READ_ONLY_ERRNOS accepts 1290 and 1836"
+    },
+    "1749": {
+      "when": "ALTER TABLE ... AUTO_INCREMENT = N on a sharded table",
+      "message": "Forwarding Error (node-master-0:3306): Feature 'ALTER TABLE...AUTO_INCREMENT=X for sharded tables' is not supported by SingleStore Distributed.",
+      "source": "fake, from the live run of October 27, 2026"
+    },
+    "1777": {
+      "when": "an INSERT into a reference table that reads a READ ONLY source",
+      "message": "Forwarding Error (node-master-0:3306): Partitions of <db> has no master instance. This is likely because the node or nodes that hold a copy of the partition are down.",
+      "source": "fake, from the live run of October 27, 2026"
+    },
+    "1997": {
+      "when": "a chunk in flight while autoscale replaces a node",
+      "message": "Transaction was already in its commit phase",
+      "source": "LESSONS fact 30 (work order appendix), wording from the log"
+    },
+    "2720": {
+      "when": "DROP DATABASE of a READ ONLY attachment; detach it and attach it read write first",
+      "message": "Cannot drop a database that is attached read only",
+      "source": "kit wording; the live text of October 27, 2026 reads \"is attached as a readonly database ... cannot be dropped. Please try DETACH DATABASE instead or DROP from the primary copy\""
+    },
+    "2719": {
+      "when": "an INSERT on a READ ONLY attachment (the retained copy); the write probe accepts it by its message (readonly)",
+      "message": "Leaf Error (<leaf>): Database `<db>` is not attached or is attached as a readonly database on workspace `<workspace>` and is unavailable for write operations",
+      "source": "live, I0b, October 28, 2026, engine 10.8.0"
+    },
+    "1008": {
+      "when": "DROP DATABASE of a detached record",
+      "message": "Forwarding Error (<master>): Can't drop database '<db>'; database doesn't exist",
+      "source": "live, I0b, October 28, 2026, engine 10.8.0"
+    },
+    "2003": {
+      "when": "the server is unreachable as a session opens",
+      "message": "Can't connect to MySQL server",
+      "source": "driver"
+    },
+    "2004": {
+      "when": "the client cannot create a socket",
+      "message": "Can't create TCP/IP socket",
+      "source": "driver"
+    },
+    "2006": {
+      "when": "the connection was closed by the server between two statements",
+      "message": "MySQL server has gone away",
+      "source": "driver"
+    },
+    "2013": {
+      "when": "the connection dropped during a statement (the kit cannot tell whether it was applied)",
+      "message": "Lost connection to MySQL server during query",
+      "source": "driver"
+    }
+  }
+}

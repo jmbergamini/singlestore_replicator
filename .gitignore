@@ -1,0 +1,12 @@
+# Customer content and run output never leave the machine.
+customer/
+dist/
+MANIFEST.json
+
+# Local environment and build output.
+.venv/
+*.egg-info/
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store

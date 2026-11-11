@@ -1,0 +1,599 @@
+{
+ "kit": "s2rebuild",
+ "version": 1,
+ "database": "example_orders_db",
+ "captured_utc": "2026-10-20T12:00:00Z",
+ "step": "P3",
+ "layout": {
+  "NUM_PARTITIONS": 16,
+  "NUM_SUB_PARTITIONS": 0,
+  "IS_SYNC": 1,
+  "IS_SYNC_DURABILITY": 0,
+  "IS_SYNC_DURABILITY_ON_REF_DB_ONLY": 1
+ },
+ "attachment": {
+  "DATABASE_NAME": "example_orders_db",
+  "ATTACH_TYPE": "READWRITE",
+  "STORAGE_ID": "storage-example-0001",
+  "COMPUTE_ID": "compute-example-0001",
+  "ATTACH_SYNTAX": null
+ },
+ "tables": [
+  {
+   "name": "orders",
+   "columns": [
+    {
+     "name": "id",
+     "ordinal": 1,
+     "data_type": "bigint",
+     "column_type": "bigint(20)",
+     "nullable": false,
+     "default": null,
+     "extra": "",
+     "generation_expression": ""
+    },
+    {
+     "name": "customer_id",
+     "ordinal": 2,
+     "data_type": "bigint",
+     "column_type": "bigint(20)",
+     "nullable": false,
+     "default": null,
+     "extra": "",
+     "generation_expression": ""
+    },
+    {
+     "name": "status",
+     "ordinal": 3,
+     "data_type": "varchar",
+     "column_type": "varchar(20)",
+     "nullable": true,
+     "default": null,
+     "extra": "",
+     "generation_expression": ""
+    },
+    {
+     "name": "amount_cents",
+     "ordinal": 4,
+     "data_type": "bigint",
+     "column_type": "bigint(20)",
+     "nullable": true,
+     "default": null,
+     "extra": "",
+     "generation_expression": ""
+    },
+    {
+     "name": "created_at",
+     "ordinal": 5,
+     "data_type": "datetime",
+     "column_type": "datetime(6)",
+     "nullable": true,
+     "default": null,
+     "extra": "",
+     "generation_expression": ""
+    },
+    {
+     "name": "updated_at",
+     "ordinal": 6,
+     "data_type": "datetime",
+     "column_type": "datetime(6)",
+     "nullable": true,
+     "default": null,
+     "extra": "",
+     "generation_expression": ""
+    }
+   ],
+   "keys": [
+    {
+     "name": "PRIMARY",
+     "unique": true,
+     "type": "COLUMNSTORE HASH",
+     "columns": [
+      "id"
+     ]
+    },
+    {
+     "name": "__SHARDKEY",
+     "unique": false,
+     "type": "SHARD",
+     "columns": [
+      "id"
+     ]
+    },
+    {
+     "name": "__UNORDERED",
+     "unique": false,
+     "type": "COLUMNSTORE",
+     "columns": [
+      "created_at"
+     ]
+    }
+   ],
+   "definition": "CREATE TABLE `orders` (\n  `id` bigint(20) NOT NULL,\n  `customer_id` bigint(20) NOT NULL,\n  `status` varchar(20) CHARACTER SET utf8mb4 DEFAULT NULL,\n  `amount_cents` bigint(20) DEFAULT NULL,\n  `created_at` datetime(6) DEFAULT NULL,\n  `updated_at` datetime(6) DEFAULT NULL,\n  PRIMARY KEY (`id`),\n  SHARD KEY (`id`),\n  SORT KEY (`created_at`)\n) AUTOSTATS_SAMPLING=ON",
+   "storage_type": "columnstore",
+   "auto_increment": null,
+   "est_rows": 25000000,
+   "exact_rows": null,
+   "size_gib": 12.5,
+   "computed_columns": []
+  },
+  {
+   "name": "order_items",
+   "columns": [
+    {
+     "name": "order_id",
+     "ordinal": 1,
+     "data_type": "bigint",
+     "column_type": "bigint(20)",
+     "nullable": false,
+     "default": null,
+     "extra": "",
+     "generation_expression": ""
+    },
+    {
+     "name": "line_no",
+     "ordinal": 2,
+     "data_type": "int",
+     "column_type": "int(11)",
+     "nullable": false,
+     "default": null,
+     "extra": "",
+     "generation_expression": ""
+    },
+    {
+     "name": "sku",
+     "ordinal": 3,
+     "data_type": "varchar",
+     "column_type": "varchar(40)",
+     "nullable": true,
+     "default": null,
+     "extra": "",
+     "generation_expression": ""
+    },
+    {
+     "name": "qty",
+     "ordinal": 4,
+     "data_type": "int",
+     "column_type": "int(11)",
+     "nullable": true,
+     "default": null,
+     "extra": "",
+     "generation_expression": ""
+    },
+    {
+     "name": "price_cents",
+     "ordinal": 5,
+     "data_type": "bigint",
+     "column_type": "bigint(20)",
+     "nullable": true,
+     "default": null,
+     "extra": "",
+     "generation_expression": ""
+    },
+    {
+     "name": "_modified_time",
+     "ordinal": 6,
+     "data_type": "datetime",
+     "column_type": "datetime(6)",
+     "nullable": true,
+     "default": null,
+     "extra": "",
+     "generation_expression": ""
+    }
+   ],
+   "keys": [
+    {
+     "name": "PRIMARY",
+     "unique": true,
+     "type": "COLUMNSTORE HASH",
+     "columns": [
+      "order_id",
+      "line_no"
+     ]
+    },
+    {
+     "name": "__SHARDKEY",
+     "unique": false,
+     "type": "SHARD",
+     "columns": [
+      "order_id"
+     ]
+    },
+    {
+     "name": "__UNORDERED",
+     "unique": false,
+     "type": "COLUMNSTORE",
+     "columns": [
+      "order_id",
+      "line_no"
+     ]
+    }
+   ],
+   "definition": "CREATE TABLE `order_items` (\n  `order_id` bigint(20) NOT NULL,\n  `line_no` int(11) NOT NULL,\n  `sku` varchar(40) DEFAULT NULL,\n  `qty` int(11) DEFAULT NULL,\n  `price_cents` bigint(20) DEFAULT NULL,\n  `_modified_time` datetime(6) DEFAULT NULL,\n  PRIMARY KEY (`order_id`,`line_no`),\n  SHARD KEY (`order_id`),\n  SORT KEY (`order_id`,`line_no`)\n)",
+   "storage_type": "columnstore",
+   "auto_increment": null,
+   "est_rows": 600000000,
+   "exact_rows": null,
+   "size_gib": 180.25,
+   "computed_columns": []
+  },
+  {
+   "name": "events",
+   "columns": [
+    {
+     "name": "event_date",
+     "ordinal": 1,
+     "data_type": "date",
+     "column_type": "date",
+     "nullable": true,
+     "default": null,
+     "extra": "",
+     "generation_expression": ""
+    },
+    {
+     "name": "kind",
+     "ordinal": 2,
+     "data_type": "varchar",
+     "column_type": "varchar(50)",
+     "nullable": true,
+     "default": null,
+     "extra": "",
+     "generation_expression": ""
+    },
+    {
+     "name": "payload",
+     "ordinal": 3,
+     "data_type": "json",
+     "column_type": "json",
+     "nullable": true,
+     "default": null,
+     "extra": "",
+     "generation_expression": ""
+    },
+    {
+     "name": "value",
+     "ordinal": 4,
+     "data_type": "double",
+     "column_type": "double",
+     "nullable": true,
+     "default": null,
+     "extra": "",
+     "generation_expression": ""
+    }
+   ],
+   "keys": [
+    {
+     "name": "__SHARDKEY",
+     "unique": false,
+     "type": "SHARD",
+     "columns": [
+      "kind"
+     ]
+    },
+    {
+     "name": "__UNORDERED",
+     "unique": false,
+     "type": "COLUMNSTORE",
+     "columns": [
+      "event_date"
+     ]
+    }
+   ],
+   "definition": "CREATE TABLE `events` (\n  `event_date` date DEFAULT NULL,\n  `kind` varchar(50) DEFAULT NULL,\n  `payload` JSON COLLATE utf8mb4_bin,\n  `value` double DEFAULT NULL,\n  SHARD KEY (`kind`),\n  SORT KEY (`event_date`)\n)",
+   "storage_type": "columnstore",
+   "auto_increment": null,
+   "est_rows": 12000000,
+   "exact_rows": null,
+   "size_gib": 3.0,
+   "computed_columns": []
+  },
+  {
+   "name": "customers",
+   "columns": [
+    {
+     "name": "id",
+     "ordinal": 1,
+     "data_type": "bigint",
+     "column_type": "bigint(20)",
+     "nullable": false,
+     "default": null,
+     "extra": "auto_increment",
+     "generation_expression": ""
+    },
+    {
+     "name": "email",
+     "ordinal": 2,
+     "data_type": "varchar",
+     "column_type": "varchar(128)",
+     "nullable": false,
+     "default": null,
+     "extra": "",
+     "generation_expression": ""
+    },
+    {
+     "name": "name",
+     "ordinal": 3,
+     "data_type": "varchar",
+     "column_type": "varchar(200)",
+     "nullable": true,
+     "default": null,
+     "extra": "",
+     "generation_expression": ""
+    },
+    {
+     "name": "created_at",
+     "ordinal": 4,
+     "data_type": "datetime",
+     "column_type": "datetime(6)",
+     "nullable": true,
+     "default": null,
+     "extra": "",
+     "generation_expression": ""
+    }
+   ],
+   "keys": [
+    {
+     "name": "PRIMARY",
+     "unique": true,
+     "type": "COLUMNSTORE HASH",
+     "columns": [
+      "id"
+     ]
+    },
+    {
+     "name": "email",
+     "unique": true,
+     "type": "COLUMNSTORE HASH",
+     "columns": [
+      "email"
+     ]
+    },
+    {
+     "name": "__SHARDKEY",
+     "unique": false,
+     "type": "SHARD",
+     "columns": [
+      "id"
+     ]
+    },
+    {
+     "name": "__UNORDERED",
+     "unique": false,
+     "type": "COLUMNSTORE",
+     "columns": [
+      "id"
+     ]
+    }
+   ],
+   "definition": "CREATE TABLE `customers` (\n  `id` bigint(20) NOT NULL AUTO_INCREMENT,\n  `email` varchar(128) NOT NULL,\n  `name` varchar(200) DEFAULT NULL,\n  `created_at` datetime(6) DEFAULT NULL,\n  PRIMARY KEY (`id`),\n  UNIQUE KEY `email` (`email`) USING HASH,\n  SHARD KEY (`id`),\n  SORT KEY (`id`)\n) AUTO_INCREMENT=4503599627370497",
+   "storage_type": "columnstore",
+   "auto_increment": {
+    "column": "id",
+    "counter": 4503599627370497
+   },
+   "est_rows": 2000000,
+   "exact_rows": null,
+   "size_gib": 0.75,
+   "computed_columns": []
+  },
+  {
+   "name": "totals",
+   "columns": [
+    {
+     "name": "day",
+     "ordinal": 1,
+     "data_type": "date",
+     "column_type": "date",
+     "nullable": false,
+     "default": null,
+     "extra": "",
+     "generation_expression": ""
+    },
+    {
+     "name": "orders",
+     "ordinal": 2,
+     "data_type": "int",
+     "column_type": "int(11)",
+     "nullable": true,
+     "default": null,
+     "extra": "",
+     "generation_expression": ""
+    },
+    {
+     "name": "cents",
+     "ordinal": 3,
+     "data_type": "bigint",
+     "column_type": "bigint(20)",
+     "nullable": true,
+     "default": null,
+     "extra": "",
+     "generation_expression": ""
+    },
+    {
+     "name": "dollars",
+     "ordinal": 4,
+     "data_type": "decimal",
+     "column_type": "decimal(20,2)",
+     "nullable": true,
+     "default": null,
+     "extra": "computed",
+     "generation_expression": "`cents` / 100"
+    }
+   ],
+   "keys": [
+    {
+     "name": "PRIMARY",
+     "unique": true,
+     "type": "BTREE",
+     "columns": [
+      "day"
+     ]
+    }
+   ],
+   "definition": "CREATE TABLE `totals` (\n  `day` date NOT NULL,\n  `orders` int(11) DEFAULT NULL,\n  `cents` bigint(20) DEFAULT NULL,\n  `dollars` as `cents` / 100 PERSISTED decimal(20,2),\n  PRIMARY KEY (`day`)\n)",
+   "storage_type": "rowstore",
+   "auto_increment": null,
+   "est_rows": 3650,
+   "exact_rows": null,
+   "size_gib": 0.001,
+   "computed_columns": [
+    "dollars"
+   ]
+  },
+  {
+   "name": "empty_table",
+   "columns": [
+    {
+     "name": "p",
+     "ordinal": 1,
+     "data_type": "varchar",
+     "column_type": "varchar(10)",
+     "nullable": true,
+     "default": null,
+     "extra": "",
+     "generation_expression": ""
+    }
+   ],
+   "keys": [],
+   "definition": "CREATE TABLE `empty_table` (\n  `p` varchar(10) DEFAULT NULL\n)",
+   "storage_type": "rowstore",
+   "auto_increment": null,
+   "est_rows": 0,
+   "exact_rows": null,
+   "size_gib": 0.0,
+   "computed_columns": []
+  }
+ ],
+ "views": [
+  {
+   "name": "order_totals",
+   "definition": "CREATE DEFINER=`app_user`@`%` VIEW `order_totals` AS SELECT `customer_id`, SUM(`amount_cents`) AS `cents` FROM `orders` GROUP BY `customer_id`",
+   "definer": "`app_user`@`%`"
+  }
+ ],
+ "routines": [
+  {
+   "name": "nightly_rollup",
+   "kind": "procedure",
+   "type": "PROCEDURE",
+   "definer": null,
+   "definition": "CREATE PROCEDURE `nightly_rollup`() AS\nBEGIN\n  INSERT INTO `totals` SELECT `customer_id`, SUM(`amount`) FROM `orders` GROUP BY `customer_id`;\nEND"
+  },
+  {
+   "name": "tax_rate",
+   "kind": "function",
+   "type": "FUNCTION",
+   "definer": "`app`@`%`",
+   "definition": "CREATE DEFINER=`app`@`%` FUNCTION `tax_rate`(a INT) RETURNS INT AS\nBEGIN\n  RETURN 1;\nEND"
+  }
+ ],
+ "routines_captured": true,
+ "routines_note": "2 routines captured with the owner profile",
+ "accounts": [
+  {
+   "grantee": "'app_user'@'%'",
+   "user": "app_user",
+   "privileges": [
+    "DELETE",
+    "INSERT",
+    "UPDATE"
+   ],
+   "scopes": [
+    "global"
+   ]
+  },
+  {
+   "grantee": "'retention_job'@'%'",
+   "user": "retention_job",
+   "privileges": [
+    "DELETE"
+   ],
+   "scopes": [
+    "database"
+   ]
+  }
+ ],
+ "sessions": [
+  {
+   "user": "app_user",
+   "host": "app-host-1",
+   "samples_seen": 3,
+   "statement_kinds": [
+    "INSERT",
+    "SELECT"
+   ]
+  }
+ ],
+ "size_gib_total": 196.501,
+ "est_rows_total": 639003650,
+ "pipelines": {
+  "captured": true,
+  "note": "2 pipelines captured with the owner profile",
+  "items": [
+   {
+    "name": "orders_stream",
+    "state": "Running",
+    "definition": "CREATE PIPELINE `orders_stream` AS LOAD DATA KAFKA 'broker-1:9092,broker-2:9092/orders' CONFIG '{\"sasl.mechanism\": \"PLAIN\"}' CREDENTIALS '<<CREDENTIALS>>' BATCH_INTERVAL 2500 REPLACE INTO TABLE `orders` FORMAT JSON",
+    "alter_statements": [
+     "ALTER PIPELINE `orders_stream` SET OFFSETS '{\"0\": 48000, \"1\": 47500}'"
+    ],
+    "redaction_marker": false,
+    "app_managed": false,
+    "source_type": "KAFKA",
+    "source_location": "broker-1:9092,broker-2:9092/orders",
+    "target": "table orders",
+    "batch_interval": 2500,
+    "duplicate_handling": "REPLACE",
+    "offsets": [
+     {
+      "partition": "0",
+      "earliest": 1000,
+      "latest": 48010,
+      "loaded": 48000,
+      "successful": 48000
+     },
+     {
+      "partition": "1",
+      "earliest": 900,
+      "latest": 47502,
+      "loaded": 47500,
+      "successful": 47500
+     }
+    ],
+    "last_batch_time": "2026-10-20 11:59:58",
+    "rows_24h": 1250000,
+    "errors_24h": 0,
+    "last_error": null
+   },
+   {
+    "name": "imports",
+    "state": "Stopped",
+    "definition": "CREATE PIPELINE `imports` AS LOAD DATA S3 'example-bucket/imports/' CONFIG '{\"region\": \"us-west-2\"}' CREDENTIALS '<<CREDENTIALS>>' INTO TABLE `events` FORMAT CSV",
+    "alter_statements": [],
+    "redaction_marker": false,
+    "app_managed": true,
+    "source_type": "S3",
+    "source_location": "example-bucket/imports/",
+    "target": "table events",
+    "batch_interval": null,
+    "duplicate_handling": "INSERT",
+    "offsets": [
+     {
+      "partition": "imports/2026-10-19.csv",
+      "earliest": 0,
+      "latest": 1,
+      "loaded": 1,
+      "successful": 1
+     }
+    ],
+    "last_batch_time": "2026-10-19 03:00:00",
+    "rows_24h": 0,
+    "errors_24h": 1,
+    "last_error": {
+     "time": "2026-10-19 03:00:05",
+     "message": "example parse error on line 12"
+    }
+   }
+  ]
+ }
+}

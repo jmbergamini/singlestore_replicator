@@ -1,0 +1,26 @@
+# Offline fixture for the tests and for `s2rebuild run --dry-run`. Placeholder names only.
+kit: s2rebuild
+version: 1
+customer: "Example Customer"
+workspace:
+  host: svc-example-dml.svc.singlestore.com
+  port: 3306
+  ca_file: certs/singlestore_bundle.pem
+  compute_size: S-16
+connections:
+  runner:
+    user: s2rebuild_runner
+    password_env: S2REBUILD_RUNNER_PASSWORD
+databases:
+  - source: example_orders_db
+    replacement: example_orders_db_rebuild_20261101
+    retained: example_orders_db_retained_20261101
+    layout: { partitions: 32, sub_partitions: 512 }
+    tables:
+      big_events: { concurrency: 1, chunk_rows: 50000000 }
+window:
+  start: 2026-11-01T05:00:00Z
+  end: 2026-11-01T13:00:00Z
+objects:
+  routines:
+    ignore: [nightly_rollup]

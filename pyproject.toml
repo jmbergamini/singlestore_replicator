@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "s2rebuild"
+version = "1.0.0"
+description = "SingleStore Database Rebuild Kit: rebuild a Helios database into a new partition layout and switch it over inside one outage window"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "John Bergamini" }]
+dependencies = [
+  "PyMySQL>=1.1,<2",
+  "PyYAML>=6,<7",
+  "openpyxl>=3.1,<4",
+]
+
+[project.scripts]
+s2rebuild = "s2rebuild.cli:main"
+
+[tool.setuptools]
+packages = ["s2rebuild"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
