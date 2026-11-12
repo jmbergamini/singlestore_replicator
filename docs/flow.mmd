@@ -24,7 +24,7 @@ flowchart LR
     C1[C1 Verify after release] --> C2[C2 Report<br/>retain-until date recorded]
     C2 --> C3[C3 End state<br/>two entries]
     C3 --> C4[C4 Remove migration account]
-    C4 -.->|optional, after retain-until| C5[C5 Delete the retained original<br/>later, by the customer (s2rebuild cleanup)]
+    C4 -.->|optional, after retain-until| C5["C5 Delete the retained original<br/>later, by the customer (s2rebuild cleanup)"]
   end
   P4 --> O1
   O11 --> C1
