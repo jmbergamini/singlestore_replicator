@@ -1,6 +1,6 @@
 # SingleStore Database Rebuild Kit
 
-Author: John Bergamini. Version 1.0.0. Proprietary; see [LICENSE](LICENSE).
+Author: John Bergamini. Version 1.0.0. MIT License; see [LICENSE](LICENSE).
 
 The kit rebuilds a SingleStore Helios database into a new partition layout and cuts it over under its original name inside one outage window. The first outage step makes the source read only. Everything after that is a copy, a verification and a switch, each behind a gate, each restartable from a terminal. A run ends with two entries on the workspace: the live database in its new layout, and the original kept read only under a retained name until the customer deletes it.
 
